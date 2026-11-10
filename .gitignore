@@ -1,0 +1,17 @@
+node_modules/
+.node/
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+
+# Generated OSM scene snapshots.
+artifacts/osm-scene/
+
+# Manuscript working directory (not part of the tool release).
+cleaned_manuscript/
