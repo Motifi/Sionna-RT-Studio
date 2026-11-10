@@ -49,6 +49,10 @@ jobs:
       - name: Show recent native Python crash events
         if: failure()
         run: |
+          $report = Join-Path $env:RUNNER_TEMP 'studio-acceptance'
+          if (Test-Path -LiteralPath $report) {
+            Get-ChildItem -LiteralPath $report -Filter 'studio.log' -Recurse | Get-Content -Tail 100
+          }
           $since = (Get-Date).AddMinutes(-15)
           Get-WinEvent -FilterHashtable @{ LogName = 'Application'; Id = 1000; StartTime = $since } -ErrorAction SilentlyContinue |
             Where-Object { $_.Message -match '(?i)python\.exe' } | Select-Object -First 3 -ExpandProperty Message

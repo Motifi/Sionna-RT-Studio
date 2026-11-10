@@ -153,7 +153,9 @@ def verify_run(origin, folder, config, time_seconds, rx_positions):
 
 
 def wait_ready(child, folder, token):
-    deadline = time.monotonic() + 180
+    timeout = 60 if token else 180
+    deadline = time.monotonic() + timeout
+    last_error = None
     while time.monotonic() < deadline:
         if token:
             port_file = folder / "server-port.txt"
@@ -162,8 +164,8 @@ def wait_ready(child, folder, token):
                 try:
                     request(origin, "/_desktop-ready", token=token, timeout=2)
                     return {"origin": origin, "backendPid": child.pid}
-                except (URLError, TimeoutError, ConnectionError):
-                    pass
+                except (URLError, TimeoutError, ConnectionError) as exc:
+                    last_error = exc
         else:
             error = folder / "desktop-error.json"
             ready = folder / "desktop-ready.json"
@@ -177,7 +179,8 @@ def wait_ready(child, folder, token):
         if child.poll() is not None:
             raise RuntimeError(f"Studio exited before readiness (exit code {child.returncode}). Check studio.log.")
         time.sleep(0.1)
-    raise TimeoutError("Studio did not start within 180 seconds. Check studio.log.")
+    detail = f" Last readiness response: {last_error}." if last_error else ""
+    raise TimeoutError(f"Studio did not start within {timeout} seconds. Check studio.log.{detail}")
 
 
 def stop(child, folder, origin):
@@ -243,7 +246,11 @@ def main():
                 env.pop("PYTHONHOME", None)
                 env.pop("PYTHONPATH", None)
                 log = stack.enter_context((folder / "studio.log").open("wb"))
-                child = subprocess.Popen([sys.executable, "-B", "-u", "-m", "desktop.studio_server", "0"],
+                trace_startup = (
+                    "import faulthandler, runpy; faulthandler.dump_traceback_later(45); "
+                    "runpy.run_module('desktop.studio_server', run_name='__main__', alter_sys=True)"
+                )
+                child = subprocess.Popen([sys.executable, "-B", "-u", "-X", "faulthandler", "-c", trace_startup, "0"],
                                          cwd=args.runtime.resolve(), env=env, stdin=subprocess.PIPE,
                                          stdout=log, stderr=subprocess.STDOUT)
             else:

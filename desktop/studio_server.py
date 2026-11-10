@@ -47,13 +47,13 @@ def run(listener, port, token):
         from backend.main import app
 
         @app.get("/_desktop-ready", include_in_schema=False)
-        def ready(studio_token: str = Header(default="")):
+        async def ready(studio_token: str = Header(default="")):
             valid = secrets.compare_digest(studio_token.encode(), token.encode())
             return Response(status_code=204 if valid else 404)
 
         app.mount("/", StaticFiles(directory=Path(__file__).with_name("site"), html=True))
         app.add_middleware(LocalOrigin, host=f"127.0.0.1:{port}")
-        server = uvicorn.Server(uvicorn.Config(app, log_level="warning", timeout_graceful_shutdown=2))
+        server = uvicorn.Server(uvicorn.Config(app, log_level="info", access_log=False, timeout_graceful_shutdown=2))
         if not stopping.is_set():
             server.run(sockets=[listener])
     finally:
