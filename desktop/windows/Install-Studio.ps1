@@ -182,7 +182,15 @@ try {
     $solverPython = Join-Path $venv 'Scripts\python.exe'
     Invoke-CheckedCommand $solverPython @('-I', '-m', 'pip', 'install', '--disable-pip-version-check', '--no-index', '--find-links', $wheels, '-r', $requirements)
     Invoke-CheckedCommand $solverPython @('-I', '-m', 'pip', 'check')
-    Invoke-CheckedCommand $solverPython @('-I', '-c', 'import mitsuba, drjit, numpy, mapbox_earcut')
+    Write-Host 'Checking native Python libraries...'
+    $nativeProbe = @'
+import importlib
+for name in ('drjit', 'mitsuba', 'numpy', 'mapbox_earcut'):
+    print(f'Loading {name}...', flush=True)
+    importlib.import_module(name)
+print('Native Python libraries loaded.', flush=True)
+'@
+    Invoke-CheckedCommand $solverPython @('-I', '-X', 'faulthandler', '-u', '-c', $nativeProbe)
     Set-Content -LiteralPath (Join-Path $InstallDirectory $markerName) -Value 'Sionna RT Studio for Windows x64' -Encoding ASCII
     Rename-Item -LiteralPath "$exe.staged" -NewName $exeName
     $installed = $true
