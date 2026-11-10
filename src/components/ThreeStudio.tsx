@@ -1110,6 +1110,29 @@ export function ThreeStudio({
       prev = { ...c };
     };
 
+    let followingTx = false;
+    const updateCamera = () => {
+      const current = stateRef.current;
+      const shouldFollowTx = current.cameraMode === 'lockTx';
+      if (shouldFollowTx && !followingTx) {
+        controls.saveState();
+      } else if (!shouldFollowTx && followingTx) {
+        // Clear any momentum from the tracking view before restoring the free view.
+        const damping = controls.enableDamping;
+        controls.enableDamping = false;
+        controls.update();
+        controls.reset();
+        controls.enableDamping = damping;
+      }
+      followingTx = shouldFollowTx;
+
+      if (shouldFollowTx) {
+        const txPos = enuToThree({ ...current.tx.enu, z: current.tx.height });
+        controls.target.lerp(txPos, 0.1);
+      }
+      controls.update();
+    };
+
     const animate = () => {
       animationFrameId = requestAnimationFrame(animate);
 
@@ -1125,15 +1148,7 @@ export function ThreeStudio({
       }
 
       watchAndRedraw();
-
-      // Camera dynamic lock mode
-      const current = stateRef.current;
-      if (current.cameraMode === 'lockTx') {
-        const txPos = enuToThree({ ...current.tx.enu, z: current.tx.height });
-        controls.target.lerp(txPos, 0.1);
-      }
-
-      controls.update();
+      updateCamera();
       renderer.render(scene, camera);
     };
 
@@ -1144,8 +1159,8 @@ export function ThreeStudio({
     // Retina/HiDPI viewport exports at its native pixel resolution.
     captureScreenshotRef.current = () => {
       setScreenshotStatus('saving');
-      controls.update();
       watchAndRedraw();
+      updateCamera();
       renderer.render(scene, camera);
       renderer.domElement.toBlob((blob) => {
         if (!blob) {
@@ -1358,8 +1373,13 @@ export function ThreeStudio({
             </button>
 
             <button
-              title={t('Camera steering tracking toggle', '切换相机跟踪模式')}
-              onClick={() => setCameraMode(cameraMode === 'orbit' ? 'lockTx' : 'orbit')}
+              type="button"
+              id="btn-camera-mode"
+              aria-pressed={cameraMode === 'lockTx'}
+              title={cameraMode === 'lockTx'
+                ? t('Restore the previous free view', '恢复跟踪前的自由视角')
+                : t('Track the selected transmitter', '跟踪所选发射端')}
+              onClick={() => setCameraMode(mode => mode === 'orbit' ? 'lockTx' : 'orbit')}
               className={cn(
                 "p-1.5 border hover:text-slate-900 hover:bg-slate-50 rounded duration-150 cursor-pointer flex items-center gap-1 text-[12px] font-bold ",
                 cameraMode === 'lockTx' ? "border-[#cc785c]/40 bg-[#cc785c]/10 text-[#cc785c]" : "border-slate-200 bg-white text-slate-600"
