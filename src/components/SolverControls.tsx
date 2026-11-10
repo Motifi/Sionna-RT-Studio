@@ -42,7 +42,12 @@ export function SolverControls({
   setSolverOptions,
 }: SolverControlsProps) {
   const { t } = useI18n();
-  const { powerDbm: txPower, height: txHeight, beamsteeringAzimuth: beamsteeringAz } = tx;
+  const {
+    powerDbm: txPower,
+    height: txHeight,
+    beamsteeringAzimuth: beamsteeringAz,
+    beamsteeringElevation: beamsteeringEl,
+  } = tx;
   const { height: rxHeight } = rx;
   const [txAntH, txAntV] = tx.antennaArraySize;
   const [rxAntH, rxAntV] = rx.antennaArraySize;
@@ -402,6 +407,26 @@ export function SolverControls({
               value={beamsteeringAz}
               onChange={(e) => setBeamsteeringAz(parseInt(e.target.value, 10))}
             />
+          </div>
+
+          <div className="flex flex-col gap-1">
+            <label htmlFor="slider-beam-elevation" className="text-[12px] text-slate-600 font-bold">
+              {t('Beam Elevation', '波束俯仰角')} {beamsteeringEl}°
+            </label>
+            <input
+              type="range"
+              id="slider-beam-elevation"
+              min="-90"
+              max="90"
+              step="1"
+              className="accent-[#cc785c] cursor-ew-resize"
+              value={beamsteeringEl}
+              aria-describedby="beam-elevation-guide"
+              onChange={(event) => onTxUpdate({ ...tx, beamsteeringElevation: Number(event.target.value) })}
+            />
+            <span id="beam-elevation-guide" className="text-[11px] text-slate-600">
+              {t('0° horizontal · negative down · positive up', '0° 水平，负值朝下，正值朝上')}
+            </span>
           </div>
 
           <div className="flex flex-col gap-1">
