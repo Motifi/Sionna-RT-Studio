@@ -44,6 +44,18 @@ class RuntimeEnvTests(unittest.TestCase):
                 self.assertEqual(configure_drjit_llvm_path(), str(library))
                 self.assertEqual(os.environ["DRJIT_LIBLLVM_PATH"], str(library))
 
+    def test_prepares_configured_windows_dll_before_drjit_import(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            library = Path(temp_dir, "LLVM-C.dll").resolve()
+            library.touch()
+            with (
+                patch.dict(os.environ, {"DRJIT_LIBLLVM_PATH": str(library)}, clear=True),
+                patch("backend.runtime_env.platform.system", return_value="Windows"),
+                patch("backend.runtime_env._keep_windows_llvm_loaded") as keep_loaded,
+            ):
+                self.assertEqual(configure_drjit_llvm_path(), str(library))
+                keep_loaded.assert_called_once_with(library)
+
 
 if __name__ == "__main__":
     unittest.main()

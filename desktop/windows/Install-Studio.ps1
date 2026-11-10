@@ -185,12 +185,17 @@ try {
     Write-Host 'Checking native Python libraries...'
     $nativeProbe = @'
 import importlib
+import sys
+sys.path.insert(0, sys.argv[1])
+from backend.runtime_env import configure_drjit_llvm_path
+configure_drjit_llvm_path()
 for name in ('drjit', 'mitsuba', 'numpy', 'mapbox_earcut'):
     print(f'Loading {name}...', flush=True)
     importlib.import_module(name)
 print('Native Python libraries loaded.', flush=True)
 '@
-    Invoke-CheckedCommand $solverPython @('-I', '-X', 'faulthandler', '-u', '-c', $nativeProbe)
+    $installedRuntime = Join-Path $InstallDirectory 'runtime'
+    Invoke-CheckedCommand $solverPython @('-I', '-X', 'faulthandler', '-u', '-c', $nativeProbe, $installedRuntime)
     Set-Content -LiteralPath (Join-Path $InstallDirectory $markerName) -Value 'Sionna RT Studio for Windows x64' -Encoding ASCII
     Rename-Item -LiteralPath "$exe.staged" -NewName $exeName
     $installed = $true
