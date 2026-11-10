@@ -10,6 +10,7 @@ import {
   ChannelMetrics,
   CoverageMetric,
   DEFAULT_SOLVER_OPTIONS,
+  ENUVector,
   MaterialConfig,
   MobilityCombineMode,
   PropagationPath,
@@ -111,6 +112,60 @@ export interface MobilityResponse {
   handover?: HandoverAnalysis | null; // present when ≥ 2 Tx were solved
 }
 
+export type CsiRunMode = 'static' | 'trajectory';
+
+export interface CsiRunRequest extends CIRExportOptions {
+  mode: CsiRunMode;
+  txs: Transmitter[];
+  rxs: Receiver[];
+  buildings: BuildingFootprint[];
+  freqGhz: number;
+  systemBandwidthMhz?: number;
+  noiseFigureDb?: number;
+  maxDepth: number;
+  options: SolverOptions;
+  materials: MaterialConfig[];
+  waypoints?: ENUVector[];
+  timeSeconds?: number[];
+  speedKmh?: number;
+  combineMode?: MobilityCombineMode;
+  handover?: HandoverConfig;
+}
+
+export interface CsiRun {
+  runId: string;
+  mode: CsiRunMode;
+  txIds: string[];
+  rxIds: string[];
+  txNames: string[];
+  rxNames: string[];
+  timeSeconds: number[];
+  rxPositions: number[][][];
+  frequenciesHz: number[];
+  shape: number[];
+  carrierFrequencyGhz: number;
+  numSubcarriers: number;
+  subcarrierSpacing: number;
+  normalizeDelays: boolean;
+  systemBandwidthMhz?: number;
+  noiseFigureDb?: number;
+  links: { txId: string; rxId: string; metrics: ChannelMetrics }[];
+  steps?: MobilityStep[];
+  handover?: HandoverAnalysis | null;
+  execution?: MobilityExecution;
+}
+
+export interface CsiSelection {
+  txId: string;
+  rxId: string;
+  sampleIndex: number;
+}
+
+export interface CsiLinkPreview extends SolveResponse {
+  frequenciesHz: number[];
+  magnitudeDb: (number | null)[];
+}
+
 // Turn a failed Response into a readable message. FastAPI's `detail` is a string
 // for our HTTPExceptions but an ARRAY of {loc,msg,type} objects for 422 request
 // validation errors — JSON.stringify'ing that array is what produced the old
@@ -170,6 +225,32 @@ async function postForBlob(
     const m = cd.match(/filename="?([^"]+)"?/);
     return { blob, filename: m ? m[1] : fallbackName };
   });
+}
+
+export function createCsiRun(input: CsiRunRequest): Promise<CsiRun> {
+  return postJson('/api/csi-runs', input);
+}
+
+export function inspectCsiLink(runId: string, selection: CsiSelection): Promise<CsiLinkPreview> {
+  const query = new URLSearchParams({
+    sampleIndex: String(selection.sampleIndex),
+    txId: selection.txId,
+    rxId: selection.rxId,
+  });
+  return withRequestTimeout(POLL_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(`/api/csi-runs/${encodeURIComponent(runId)}/preview?${query}`, { signal });
+    if (!res.ok) throw new Error(await errorDetail(res));
+    return await res.json() as CsiLinkPreview;
+  });
+}
+
+export function exportCsiRun(
+  runId: string,
+  fronthaulMbpsByTxId: Record<string, number | null>,
+): Promise<{ blob: Blob; filename: string }> {
+  return postForBlob(`/api/csi-runs/${encodeURIComponent(runId)}/export`, {
+    fronthaulMbpsByTxId,
+  }, 'sionna_rt_studio_csi.zip');
 }
 
 export async function checkBackend(): Promise<boolean> {

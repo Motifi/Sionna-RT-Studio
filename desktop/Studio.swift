@@ -21,6 +21,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
     private var smokeStarted = false
     private var smokeResult: [String: Any]?
     private var smokeProject: URL?
+    private var smokeCsi: URL?
     private var downloads: [ObjectIdentifier: (stage: URL, destination: URL)] = [:]
 
     override init() {
@@ -101,6 +102,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
         stopServer()
         if let logURL { try? fileManager.removeItem(at: logURL) }
         if let smokeProject { try? fileManager.removeItem(at: smokeProject) }
+        if let smokeCsi { try? fileManager.removeItem(at: smokeCsi) }
         for entry in downloads.values { try? fileManager.removeItem(at: entry.stage) }
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "studioLocale")
     }
@@ -318,8 +320,8 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
 
     func download(_ download: WKDownload, decideDestinationUsing response: URLResponse,
                   suggestedFilename: String, completionHandler: @escaping @MainActor (URL?) -> Void) {
-        if let smokeProject {
-            stageDownload(download, destination: smokeProject, completionHandler: completionHandler)
+        if let smokeDestination = suggestedFilename.lowercased().hasSuffix(".zip") ? smokeCsi : smokeProject {
+            stageDownload(download, destination: smokeDestination, completionHandler: completionHandler)
             return
         }
         let panel = NSSavePanel()
@@ -354,14 +356,22 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
             } else {
                 try fileManager.moveItem(at: source, to: entry.destination)
             }
-            if entry.destination == smokeProject, var result = smokeResult {
+            if (entry.destination == smokeProject || entry.destination == smokeCsi), var result = smokeResult {
                 let data = try Data(contentsOf: entry.destination)
-                let project = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-                let exported = project?["format"] as? String == "SionnaRTStudio Project"
-                result["projectExport"] = exported
-                if !exported { result["ok"] = false }
-                try? fileManager.removeItem(at: entry.stage)
-                finishSmoke(result)
+                if entry.destination == smokeCsi {
+                    let exported = data.starts(with: [0x50, 0x4b, 0x03, 0x04]) &&
+                        data.range(of: Data("csi.npz".utf8)) != nil && data.range(of: Data("manifest.json".utf8)) != nil
+                    result["csiExport"] = exported
+                } else {
+                    let project = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    result["projectExport"] = project?["format"] as? String == "SionnaRTStudio Project" &&
+                        project?["schemaVersion"] as? Int == 2
+                }
+                smokeResult = result
+                if let projectExport = result["projectExport"] as? Bool, let csiExport = result["csiExport"] as? Bool {
+                    result["ok"] = result["ok"] as? Bool == true && projectExport && csiExport
+                    finishSmoke(result)
+                }
             }
         } catch {
             showSaveError(error)
@@ -391,20 +401,35 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
         smokeStarted = true
         let check = """
             async function waitFor(check, label = 'expected state') {
-              for (let attempt = 0; attempt < 100; attempt++) {
+              for (let attempt = 0; attempt < 300; attempt++) {
                 const result = check();
                 if (result) return result;
                 await new Promise(resolve => setTimeout(resolve, 100));
               }
               throw new Error('Studio UI did not reach: ' + label);
             }
+            const navFor = id => document.querySelector('#nav-btn-' + id);
+            const go = async id => {
+              navFor(id).click();
+              await waitFor(() => navFor(id).getAttribute('aria-current') === 'page', id + ' workspace');
+            };
+            const project = () => JSON.parse(localStorage.getItem('sionna-rt-studio.project.v1'));
+            const setNumber = async (selector, value) => {
+              const input = await waitFor(() => document.querySelector(selector), selector);
+              input.focus();
+              Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, String(value));
+              input.dispatchEvent(new Event('input', {bubbles: true}));
+              input.dispatchEvent(new Event('change', {bubbles: true}));
+              await new Promise(resolve => setTimeout(resolve, 100));
+              input.blur();
+            };
             const select = await waitFor(() => document.querySelector('select[data-studio-language]'));
-            const nav = await waitFor(() => document.querySelector('#nav-btn-3d_scene'));
+            const nav = await waitFor(() => navFor('scene'), 'Scene navigation');
             const initial = select.value;
             const alternate = initial === 'zh' ? 'en' : 'zh';
-            const labels = {zh: '三维场景', en: '3D scene'};
+            const labels = {zh: '场景', en: 'Scene'};
             const waitForLanguage = language => waitFor(() =>
-              document.documentElement.lang.startsWith(language) && nav.textContent.trim() === labels[language]);
+              document.documentElement.lang.startsWith(language) && nav.textContent.trim().endsWith(labels[language]));
             const setLanguage = value => {
               select.value = value;
               select.dispatchEvent(new Event('change', {bubbles: true}));
@@ -418,8 +443,36 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
               const scene = document.querySelector('#canvas-3d');
               return scene?.getContext('webgl2') && scene;
             }, '3D canvas');
+            const starter = await waitFor(project, 'starter project');
+            const legacy = structuredClone(starter);
+            const oldRxId = legacy.state.devices.activeRxId;
+            const anchor = legacy.state.scene.anchor;
+            legacy.schemaVersion = 1;
+            legacy.state.devices.transmitters[0].beamsteeringAzimuth = 37;
+            legacy.state.devices.transmitters[0].beamsteeringElevation = -12;
+            delete legacy.state.devices.fronthaulMbpsByTxId;
+            delete legacy.state.csi;
+            delete legacy.state.display.workspace;
+            legacy.state.display.activeNavTab = '3d_scene';
+            delete legacy.state.mobility.trajectoriesByRxId;
+            legacy.state.mobility.trajectoryPoints = [0, 2].map(x => ({
+              lat: anchor.latitude, lon: anchor.longitude, enu: {x, y: 0, z: 0},
+            }));
+            await go('export');
+            const legacyInput = document.querySelector('#export-suite-panel input[type=file]');
+            const transfer = new DataTransfer();
+            transfer.items.add(new File([JSON.stringify(legacy)], 'legacy-project.json', {type: 'application/json'}));
+            legacyInput.files = transfer.files;
+            legacyInput.dispatchEvent(new Event('change', {bubbles: true}));
+            await waitFor(() => navFor('planning').getAttribute('aria-current') === 'page' &&
+              project()?.schemaVersion === 2 &&
+              project().state.devices.transmitters[0].beamsteeringAzimuth === 37 &&
+              project().state.devices.transmitters[0].beamsteeringElevation === -12 &&
+              project().state.mobility.trajectoriesByRxId[oldRxId]?.length === 2 &&
+              project().state.scene.buildings.length === starter.state.scene.buildings.length, 'legacy project migration');
+            if (document.querySelector('#canvas-3d') !== canvas) throw new Error('Workspace change replaced the 3D canvas');
             const receivers = () => [...document.querySelectorAll('[data-device-type="rx"] [data-device-id]')];
-            const savedDevices = () => JSON.parse(localStorage.getItem('sionna-rt-studio.project.v1'))?.state.devices;
+            const savedDevices = () => project()?.state.devices;
             const clickScene = (x, y) => {
               const rect = canvas.getBoundingClientRect();
               canvas.dispatchEvent(new MouseEvent('click', {bubbles: true,
@@ -474,23 +527,130 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
             clickScene(0.38, 0.66);
             await waitFor(() => transmitters().length === txCount + 1, 'new transmitter');
             document.querySelector('#btn-finish-placement').click();
+            const apId = await waitFor(() => savedDevices()?.transmitters.length === txCount + 1 && savedDevices().activeTxId,
+              'active AP');
+            await setNumber('#input-ap-fronthaul', 25);
+            await waitFor(() => savedDevices()?.fronthaulMbpsByTxId[apId] === 25, 'fronthaul 25 Mbps');
+
+            await go('scene');
             const samples = document.querySelector('#select-path-samples');
             samples.value = '10000';
             samples.dispatchEvent(new Event('change', {bubbles: true}));
-            await waitFor(() => JSON.parse(localStorage.getItem('sionna-rt-studio.project.v1'))?.state.solver.options.pathSamplesPerSource === 10000,
-              'quick ray sampling');
+            await setNumber('#input-csi-subcarriers', 8);
+            await waitFor(() => project()?.state.solver.options.pathSamplesPerSource === 10000 &&
+              project()?.state.csi.numSubcarriers === 8, 'quick CSI sampling');
+
+            const runRequests = [];
+            const completedRuns = [];
+            const originalFetch = window.fetch.bind(window);
+            window.fetch = async (input, options) => {
+              const isRun = new URL(input instanceof Request ? input.url : input, location.href).pathname === '/api/csi-runs';
+              if (isRun) runRequests.push(JSON.parse(options.body));
+              const response = await originalFetch(input, options);
+              if (isRun && response.ok) completedRuns.push(await response.clone().json());
+              return response;
+            };
+            const run = async mode => {
+              const before = completedRuns.length;
+              const button = await waitFor(() => {
+                const button = document.querySelector('#btn-run-csi-' + mode);
+                return button && !button.disabled && button;
+              }, mode + ' CSI run button');
+              button.click();
+              return await waitFor(() => completedRuns.length > before && completedRuns[before], mode + ' CSI run');
+            };
+            const extractZip = async (result, fronthaulMbps) => {
+              const response = await originalFetch('/api/csi-runs/' + result.runId + '/export', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({fronthaulMbpsByTxId: {[apId]: fronthaulMbps}}),
+              });
+              if (!response.ok) throw new Error('CSI export failed: ' + await response.text());
+              const buffer = await response.arrayBuffer();
+              const view = new DataView(buffer);
+              const bytes = new Uint8Array(buffer);
+              const decoder = new TextDecoder();
+              const entries = new Map();
+              for (let offset = 0; offset + 30 <= buffer.byteLength && view.getUint32(offset, true) === 0x04034b50;) {
+                const length = view.getUint32(offset + 18, true);
+                const nameLength = view.getUint16(offset + 26, true);
+                const start = offset + 30 + nameLength + view.getUint16(offset + 28, true);
+                const name = decoder.decode(bytes.subarray(offset + 30, offset + 30 + nameLength));
+                entries.set(name, bytes.subarray(start, start + length));
+                offset = start + length;
+              }
+              const manifest = JSON.parse(decoder.decode(entries.get('manifest.json')));
+              const npz = entries.get('csi.npz');
+              if (!npz?.length || manifest.runId !== result.runId || manifest.fronthaulMbpsByTxId[apId] !== fronthaulMbps ||
+                  JSON.stringify(manifest.shape) !== JSON.stringify(result.shape)) {
+                throw new Error('CSI ZIP did not match the run or current fronthaul');
+              }
+              return {manifest, hash: Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', npz))).join(',')};
+            };
+
+            await go('preview');
             const pairs = (txCount + 1) * (count + 2);
-            const matrixButtons = () => [...document.querySelectorAll('#link-matrix td button')];
-            const quickSolve = await waitFor(() => {
-              const button = document.querySelector('#btn-quick-solve-matrix');
-              return button && !button.disabled && button;
-            }, 'solve all links');
-            quickSolve.click();
+            const staticRun = await run('static');
+            if (staticRun.shape[0] !== 1 || staticRun.shape[1] !== 3 || staticRun.shape[3] !== 2 || staticRun.shape[5] !== 8) {
+              throw new Error('Unexpected static tensor shape ' + JSON.stringify(staticRun.shape));
+            }
+            const matrixButtons = () => [...document.querySelectorAll('#csi-link-matrix td button')];
             const otherPair = await waitFor(() => matrixButtons().length === pairs &&
               matrixButtons().find(button => button.getAttribute('aria-pressed') === 'false'), 'complete link matrix');
             otherPair.click();
             await waitFor(() => matrixButtons().length === pairs && otherPair.getAttribute('aria-pressed') === 'true',
               'matrix retained after selecting a different link');
+            const beforeFronthaul = await extractZip(staticRun, 25);
+            await go('planning');
+            await setNumber('#input-ap-fronthaul', 0);
+            await waitFor(() => savedDevices()?.fronthaulMbpsByTxId[apId] === 0, 'explicit zero fronthaul');
+            await go('export');
+            if (document.querySelector('#btn-export-csi-run').disabled) throw new Error('Fronthaul edit invalidated CSI');
+            const afterFronthaul = await extractZip(staticRun, 0);
+            if (runRequests.length !== 1 || beforeFronthaul.hash !== afterFronthaul.hash) {
+              throw new Error('Export or fronthaul edit changed computed CSI');
+            }
+            await go('scene');
+            await setNumber('#input-csi-subcarriers', 9);
+            await waitFor(() => project()?.state.csi.numSubcarriers === 9, 'changed CSI input');
+            await go('export');
+            if (!document.querySelector('#btn-export-csi-run').disabled) throw new Error('Stale CSI remained exportable');
+
+            await go('planning');
+            const plannedRx = savedDevices().activeRxId;
+            const draw = document.querySelector('#btn-draw-3d-mobility-path');
+            draw.click();
+            await waitFor(() => draw.getAttribute('aria-pressed') === 'true', 'draw mode');
+            clickScene(0.42, 0.68);
+            await waitFor(() => project()?.state.mobility.trajectoriesByRxId[plannedRx]?.length === 1, 'first control point');
+            clickScene(0.62, 0.67);
+            const track = await waitFor(() => {
+              const points = project()?.state.mobility.trajectoriesByRxId[plannedRx];
+              return points?.length === 2 && points;
+            }, 'second control point');
+            await go('preview');
+            if (document.querySelector('#btn-draw-3d-mobility-path')) throw new Error('Draw controls remained visible in Preview');
+            const trajectoryRun = await run('trajectory');
+            const trajectorySamples = trajectoryRun.timeSeconds.length;
+            if (trajectorySamples < 2 || trajectorySamples > 100 || trajectoryRun.shape[0] !== trajectorySamples ||
+                trajectoryRun.shape[1] !== 1 || trajectoryRun.shape[3] !== 2 || trajectoryRun.shape[5] !== 9 ||
+                trajectoryRun.rxIds[0] !== plannedRx || trajectoryRun.rxPositions.length !== trajectorySamples) {
+              throw new Error('Unexpected trajectory result scope');
+            }
+            const timeline = await waitFor(() => document.querySelector('#input-csi-time'), 'CSI timeline');
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(timeline, '1');
+            timeline.dispatchEvent(new Event('input', {bubbles: true}));
+            timeline.dispatchEvent(new Event('change', {bubbles: true}));
+            await waitFor(() => document.querySelector('output[for=input-csi-time]')?.textContent ===
+              trajectoryRun.timeSeconds[1].toFixed(3) + ' s', 'seek trajectory sample');
+            const {manifest: motionManifest} = await extractZip(trajectoryRun, 0);
+            if (JSON.stringify(motionManifest.timeSeconds) !== JSON.stringify(trajectoryRun.timeSeconds) ||
+                JSON.stringify(motionManifest.rxPositions) !== JSON.stringify(trajectoryRun.rxPositions) ||
+                JSON.stringify(track) !== JSON.stringify(project().state.mobility.trajectoriesByRxId[plannedRx])) {
+              throw new Error('Exported times/positions or source control points changed');
+            }
+            if (runRequests.length !== 2 || document.querySelector('#canvas-3d') !== canvas) {
+              throw new Error('Workspace navigation recomputed CSI or replaced the canvas');
+            }
             const health = await (await fetch('/api/health')).json();
             const result = await fetch('/api/solve', {
               method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -509,7 +669,10 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
                     webgl2: Boolean(canvas), initialLanguage: initial, alternateLanguage: alternate,
                     pageTitle: document.title, tracedPaths: solve.metrics.numPaths,
                     receivedPowerDbm: solve.metrics.totalRxPowerDbm, placedReceivers: count + 2,
-                    movedSelectedReceiver: true, placementEscape: true, solvedMatrixPairs: pairs};
+                    movedSelectedReceiver: true, placementEscape: true, solvedMatrixPairs: pairs,
+                    legacyProjectMigrated: true, staticCsiShape: staticRun.shape,
+                    trajectoryCsiShape: trajectoryRun.shape, csiReusedWithFronthaul: true,
+                    staleCsiBlocked: true, sameCanvasAcrossWorkspaces: true};
             """
         Task { [self] in
             do {
@@ -520,19 +683,21 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
                 }
                 smokeResult = checked
                 smokeProject = fileManager.temporaryDirectory.appendingPathComponent("studio-smoke-\(UUID().uuidString).json")
+                smokeCsi = fileManager.temporaryDirectory.appendingPathComponent("studio-smoke-\(UUID().uuidString).zip")
                 let export = """
                     document.querySelector('#nav-btn-export').click();
                     for (let attempt = 0; attempt < 40; attempt++) {
-                      const button = document.querySelector('#btn-export-project');
-                      if (button) { button.click(); return; }
+                      const project = document.querySelector('#btn-export-project');
+                      const csi = document.querySelector('#btn-export-csi-run');
+                      if (project && csi && !csi.disabled) { project.click(); csi.click(); return; }
                       await new Promise(resolve => setTimeout(resolve, 100));
                     }
-                    throw new Error('Project export button did not appear');
+                    throw new Error('Project and CSI export buttons did not become available');
                     """
                 _ = try await webView.callAsyncJavaScript(export, arguments: [:], in: nil, contentWorld: .page)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
                     guard let self, self.smokeResult != nil else { return }
-                    self.finishSmoke(["ok": false, "error": "Native project download did not finish"])
+                    self.finishSmoke(["ok": false, "error": "Native project or CSI download did not finish"])
                 }
             } catch {
                 let detail = (error as NSError).userInfo["WKJavaScriptExceptionMessage"] as? String

@@ -431,30 +431,15 @@ def _solve_at(
                         tx_pos, rx_pos, power_dbm, tx_id=tx_id)
 
 
-def _solve_batched(
+def _trace_batched(
     scene,
     tx_specs: list[_TxSpec],
     rx_positions: list[list[float]],
     rx_velocities: list[list[float]],
-    n_tx_ant: int,
     max_depth: int = MAX_DEPTH,
     opts: SolverOptions | None = None,
-) -> list[list[tuple[list[PropagationPath], float]]]:
-    """Ray-trace every (waypoint, transmitter) pair in a SINGLE PathSolver dispatch.
-
-    Sionna computes paths independently per (rx, tx) pair, so adding every
-    transmitter AND every waypoint-receiver to the scene and solving once yields
-    the same per-pair paths as calling ``_solve_at`` for each — but with one GPU
-    launch instead of N×M (the mobility speed-up, now spanning all transmitters).
-
-    With ``synthetic_array`` the geometric tensors carry explicit rx/tx axes:
-    valid/tau/doppler/angles are ``(num_rx, num_tx, num_paths)``, interactions
-    ``(depth, num_rx, num_tx, num_paths)``, vertices ``(…, 3)``, and the
-    coefficients a are ``(num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths)``.
-
-    Returns ``results[rx_index][tx_index] = (paths, max|Doppler|)`` — one entry
-    per transmitter for each receiver, both in input order.
-    """
+):
+    """Trace each receiver (or trajectory sample) against every transmitter once."""
     from sionna.rt import Receiver as RtReceiver
 
     _clear_devices(scene)
@@ -468,8 +453,16 @@ def _solve_batched(
             pass
         scene.add(rx_dev)
 
-    paths = _trace_paths(scene, max_depth, opts)
+    return _trace_paths(scene, max_depth, opts)
 
+
+def _summarize_batched(
+    paths,
+    tx_specs: list[_TxSpec],
+    rx_positions: list[list[float]],
+    n_tx_ant: int,
+) -> list[list[tuple[list[PropagationPath], float]]]:
+    """Reduce native synthetic-array Paths to [rx][tx] rays and max Doppler."""
     valid = to_numpy(paths.valid).astype(bool)     # (num_rx, num_tx, num_paths)
     num_rx = valid.shape[0]
     num_tx = valid.shape[1]
@@ -520,6 +513,19 @@ def _solve_batched(
                                        tx_id=spec.id))
         results.append(per_tx)
     return results
+
+
+def _solve_batched(
+    scene,
+    tx_specs: list[_TxSpec],
+    rx_positions: list[list[float]],
+    rx_velocities: list[list[float]],
+    n_tx_ant: int,
+    max_depth: int = MAX_DEPTH,
+    opts: SolverOptions | None = None,
+) -> list[list[tuple[list[PropagationPath], float]]]:
+    paths = _trace_batched(scene, tx_specs, rx_positions, rx_velocities, max_depth, opts)
+    return _summarize_batched(paths, tx_specs, rx_positions, n_tx_ant)
 
 
 def solve_link(req: SolveRequest) -> tuple[list[PropagationPath], ChannelMetrics]:
@@ -909,6 +915,37 @@ def _mobility_step(
     )
 
 
+def _resolve_tx_specs(txs: list[Transmitter], buildings: list[BuildingFootprint]) -> list[_TxSpec]:
+    specs = []
+    for tx in txs:
+        pos = [float(tx.enu.x), float(tx.enu.y), _device_z(tx.enu, tx.height, buildings)]
+        beam = _beam_target(pos, tx.beamsteeringAzimuth, tx.beamsteeringElevation)
+        specs.append(_TxSpec(pos=pos, beam=beam, power_dbm=float(tx.powerDbm),
+                             id=tx.id, name=tx.name))
+    return specs
+
+
+def _mobility_kinematics(
+    waypoints: list[ENUVector], rx_height: float, buildings: list[BuildingFootprint], speed_ms: float,
+) -> tuple[list[list[float]], list[list[float]]]:
+    """Resolve antenna position and horizontal velocity for each trajectory sample."""
+    positions: list[list[float]] = []
+    velocities: list[list[float]] = []
+    for i, wp in enumerate(waypoints):
+        positions.append([float(wp.x), float(wp.y), _device_z(wp, rx_height, buildings)])
+        neighbor = waypoints[i + 1] if i + 1 < len(waypoints) else waypoints[i - 1] if i else None
+        velocity = [0.0, 0.0, 0.0]
+        if neighbor is not None:
+            dx, dy = float(neighbor.x) - float(wp.x), float(neighbor.y) - float(wp.y)
+            norm = math.hypot(dx, dy)
+            if i + 1 == len(waypoints):
+                dx, dy = -dx, -dy  # keep heading direction on the last point
+            if norm > 1e-6:
+                velocity = [dx / norm * speed_ms, dy / norm * speed_ms, 0.0]
+        velocities.append(velocity)
+    return positions, velocities
+
+
 def solve_mobility(req) -> tuple[list, dict, "HandoverAnalysis | None"]:
     """Best-server mobility: ray-trace EVERY transmitter to each Rx waypoint.
 
@@ -939,33 +976,10 @@ def solve_mobility(req) -> tuple[list, dict, "HandoverAnalysis | None"]:
     n_tx_ant = _set_tx_array(scene, txs[0].antennaArraySize, req.options)
     _set_rx_array(scene, req.rx.antennaArraySize, req.options)
 
-    # Resolve each transmitter once (scene position, steered beam target, power).
-    tx_specs: list[_TxSpec] = []
-    for t in txs:
-        pos = [float(t.enu.x), float(t.enu.y), _device_z(t.enu, t.height, req.buildings)]
-        beam = _beam_target(pos, t.beamsteeringAzimuth, t.beamsteeringElevation)
-        tx_specs.append(_TxSpec(pos=pos, beam=beam, power_dbm=float(t.powerDbm),
-                                id=t.id, name=t.name))
-
+    tx_specs = _resolve_tx_specs(txs, req.buildings)
     speed_ms = float(req.speedKmh) / 3.6
     wps = req.waypoints
-    # Per-waypoint Rx position + velocity (heading toward the next waypoint; the
-    # last waypoint reuses the previous heading), shared by both solve paths.
-    rx_positions: list[list[float]] = []
-    velocities: list[list[float]] = []
-    for i, wp in enumerate(wps):
-        rx_positions.append([float(wp.x), float(wp.y),
-                             _device_z(wp, req.rx.height, req.buildings)])
-        nxt = wps[i + 1] if i + 1 < len(wps) else wps[i - 1] if i > 0 else None
-        velocity = [0.0, 0.0, 0.0]
-        if nxt is not None:
-            dx, dy = float(nxt.x) - float(wp.x), float(nxt.y) - float(wp.y)
-            norm = math.hypot(dx, dy)
-            if i + 1 >= len(wps):
-                dx, dy = -dx, -dy  # keep heading direction on the last point
-            if norm > 1e-6:
-                velocity = [dx / norm * speed_ms, dy / norm * speed_ms, 0.0]
-        velocities.append(velocity)
+    rx_positions, velocities = _mobility_kinematics(wps, req.rx.height, req.buildings, speed_ms)
 
     # Fast path: one GPU dispatch for all (waypoint, Tx) pairs. Defensive fallback
     # to per-(waypoint, Tx) solves if the batched extraction misbehaves.
@@ -1018,7 +1032,8 @@ def solve_mobility(req) -> tuple[list, dict, "HandoverAnalysis | None"]:
 
 
 def _handover_analysis(req, steps: list, tx_specs: list[_TxSpec],
-                       rx_positions: list[list[float]], speed_ms: float):
+                       rx_positions: list[list[float]], speed_ms: float,
+                       *, time_seconds: list[float] | None = None):
     """A3 hysteresis/TTT association over the solved per-Tx RSS series.
 
     Post-processing only (no GPU): meaningful with ≥ 2 transmitters, else None.
@@ -1030,8 +1045,10 @@ def _handover_analysis(req, steps: list, tx_specs: list[_TxSpec],
         return None
     cfg = getattr(req, "handover", None) or HandoverConfig()
     rss = [[m.receivedPowerDbm for m in s.perTx] for s in steps]
+    durations = (step_durations(rx_positions, speed_ms) if time_seconds is None else
+                 [0.0, *(end - start for start, end in zip(time_seconds, time_seconds[1:]))])
     result = a3_association(
-        rss, step_durations(rx_positions, speed_ms),
+        rss, durations,
         hysteresis_db=float(cfg.hysteresisDb),
         ttt_s=float(cfg.timeToTriggerMs) / 1000.0,
         ping_pong_window_s=float(cfg.pingPongWindowS),

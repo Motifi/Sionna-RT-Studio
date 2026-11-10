@@ -20,6 +20,7 @@ interface MapSelectorProps {
   rxs?: Receiver[];
   onTxUpdate: (tx: Transmitter) => void;
   onRxUpdate: (rx: Receiver) => void;
+  editableDevices?: boolean;
   onDownloadOSM: (bounds: L.LatLngBounds) => void;
   onResetProject: () => void;
   isLoading: boolean;
@@ -61,6 +62,7 @@ export function MapSelector({
   rxs,
   onTxUpdate,
   onRxUpdate,
+  editableDevices = true,
   onDownloadOSM,
   onResetProject,
   isLoading,
@@ -136,9 +138,8 @@ export function MapSelector({
     }).addTo(map);
     bboxRectRef.current = rect;
 
-    // Spawn labeled, draggable markers for the active Tx / Rx.
-    const mTx = L.marker([tx.latitude, tx.longitude], { icon: deviceIcon(tx.name, '#cc785c', true), draggable: true }).addTo(map);
-    const mRx = L.marker([rx.latitude, rx.longitude], { icon: deviceIcon(rx.name, '#4a727e', true), draggable: true }).addTo(map);
+    const mTx = L.marker([tx.latitude, tx.longitude], { icon: deviceIcon(tx.name, '#cc785c', true), draggable: editableDevices }).addTo(map);
+    const mRx = L.marker([rx.latitude, rx.longitude], { icon: deviceIcon(rx.name, '#4a727e', true), draggable: editableDevices }).addTo(map);
     
     markerTxRef.current = mTx;
     markerRxRef.current = mRx;
@@ -187,6 +188,13 @@ export function MapSelector({
       mapRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    for (const marker of [markerTxRef.current, markerRxRef.current]) {
+      if (editableDevices) marker?.dragging?.enable();
+      else marker?.dragging?.disable();
+    }
+  }, [editableDevices]);
 
   useEffect(() => {
     const controls = [
@@ -382,12 +390,14 @@ export function MapSelector({
           <span className="eyebrow whitespace-nowrap">{t('Bounding Extent:', '区域范围：')}</span>
           <span className="font-semibold text-slate-900 ml-auto whitespace-nowrap">{boxSizeM} m × {boxSizeM} m ({((boxSizeM / 1000) ** 2).toFixed(2)} km²)</span>
         </div>
-        <div className="flex flex-wrap justify-between items-baseline gap-x-3 font-mono text-[13px]">
-          <span className="eyebrow whitespace-nowrap">{t('3D Mobility Path:', '三维移动轨迹：')}</span>
-          <span className="font-semibold text-slate-900 ml-auto whitespace-nowrap">
-            {t(`${trajectoryPoints.length} waypoint${trajectoryPoints.length === 1 ? '' : 's'}`, `${trajectoryPoints.length} 个轨迹点`)}
-          </span>
-        </div>
+        {editableDevices && (
+          <div className="flex flex-wrap justify-between items-baseline gap-x-3 font-mono text-[13px]">
+            <span className="eyebrow whitespace-nowrap">{t('3D Mobility Path', '三维移动轨迹')}</span>
+            <span className="font-semibold text-slate-900 ml-auto whitespace-nowrap">
+              {t(`${trajectoryPoints.length} waypoint${trajectoryPoints.length === 1 ? '' : 's'}`, `${trajectoryPoints.length} 个轨迹点`)}
+            </span>
+          </div>
+        )}
 
         {/* Selection size — choose how big a chunk of the map to capture */}
         <div className="flex flex-col gap-1 pt-1">
@@ -435,12 +445,14 @@ export function MapSelector({
           </button>
         </div>
 
-        {isLoading && (
-          <div className="mt-2 p-2.5 bg-[#ebe7dc] text-[#cc785c] text-[12px] font-mono border border-[#e3e0d6] rounded flex flex-col gap-1.5 animate-pulse">
+        {(isLoading || downloadProgress) && (
+          <div role="status" className="mt-2 p-2.5 bg-[#ebe7dc] text-[#a95840] text-[12px] font-mono border border-[#e3e0d6] rounded flex flex-col gap-1.5">
             <span>{downloadProgress || t('Retrieving structures footprint from Overpass...', '正在从 Overpass 获取地物轮廓…')}</span>
-            <div className="w-full bg-[#f5f3ec] h-1 rounded overflow-hidden">
-              <span className="block h-full bg-[#cc785c] animate-pulse" style={{ width: '40%' }} />
-            </div>
+            {isLoading && (
+              <div aria-hidden="true" className="w-full bg-[#f5f3ec] h-1 rounded overflow-hidden">
+                <span className="block h-full bg-[#cc785c] animate-pulse" style={{ width: '40%' }} />
+              </div>
+            )}
           </div>
         )}
       </div>

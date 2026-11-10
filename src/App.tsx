@@ -4,16 +4,17 @@
  */
 
 import React, { useState, useEffect, useRef } from 'react';
-import { BookOpen } from 'lucide-react';
-import { GeoAnchor, Transmitter, Receiver, BuildingFootprint, PropagationPath, RadioMapGrid, ChannelMetrics, MatrixCell, SolverOptions, DEFAULT_SOLVER_OPTIONS, MaterialConfig, CoverageMetric, MobilityCombineMode, defaultMaterialConfig } from './types';
+import { GeoAnchor, Transmitter, Receiver, BuildingFootprint, PropagationPath, RadioMapGrid, ChannelMetrics, MatrixCell, SolverOptions, DEFAULT_SOLVER_OPTIONS, MaterialConfig, CoverageMetric, MobilityCombineMode, TrajectoryPoint, defaultMaterialConfig } from './types';
 import { ColormapName } from './lib/colormaps';
 import { ThreeStudio } from './components/ThreeStudio';
 import { TopNav } from './components/TopNav';
+import { WorkflowNav } from './components/WorkflowNav';
 import { MapSelector } from './components/MapSelector';
 import { SolverControls } from './components/SolverControls';
 import { LinkPanel } from './components/LinkPanel';
 import { CoveragePanel } from './components/CoveragePanel';
-import { TrajectoryPanel } from './components/TrajectoryPanel';
+import { PlanningControls } from './components/PlanningControls';
+import { CsiPreviewPanel } from './components/CsiPreviewPanel';
 import { GeographyPanel } from './components/GeographyPanel';
 import { AnalysisPanel } from './components/AnalysisPanel';
 import { ExportPanel } from './components/ExportPanel';
@@ -25,14 +26,17 @@ import {
   enuToLatLon,
   fetchOSMBuildings,
 } from './utils';
-import { solveLink, solveRadioMap, solveMobility, checkBackend, MobilityExecution, MobilityStep, HandoverAnalysis, HandoverConfig } from './api';
+import { solveLink, solveRadioMap, checkBackend, createCsiRun, inspectCsiLink } from './api';
+import type { CsiRun, CsiRunMode, CsiSelection, CsiLinkPreview, HandoverConfig } from './api';
 import {
   clearAutosavedProject,
   loadAutosavedProject,
   parseProjectDocument,
   saveAutosavedProject,
   StudioProjectState,
+  DEFAULT_CSI_SETTINGS,
 } from './project';
+import type { StudioWorkspace } from './project';
 
 const EMPTY_METRICS: ChannelMetrics = {
   totalRxPowerDbm: -200,
@@ -44,19 +48,34 @@ const EMPTY_METRICS: ChannelMetrics = {
   strongestPathType: 'None',
 };
 
-const metricsFromMobilityStep = (step: MobilityStep): ChannelMetrics => {
-  const strongestPath = step.paths[0];
+const EMPTY_TRACK: TrajectoryPoint[] = [];
+const EMPTY_PATHS: PropagationPath[] = [];
 
-  return {
-    totalRxPowerDbm: step.receivedPowerDbm,
-    losStatus: step.losStatus,
-    numPaths: step.numPaths,
-    rmsDelaySpreadNs: step.rmsDelaySpreadNs,
-    rmsDelaySpreadValid: step.rmsDelaySpreadValid,
-    strongestPathPowerDbm: strongestPath?.receivedPowerDbm ?? -200,
-    strongestPathType: strongestPath?.type ?? 'None',
-  };
-};
+function sampleTrajectory(points: TrajectoryPoint[], intervalMs: number, speedKmh: number) {
+  const arc = [0];
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1].enu;
+    const b = points[i].enu;
+    arc.push(arc[i - 1] + Math.hypot(b.x - a.x, b.y - a.y));
+  }
+  const length = arc[arc.length - 1];
+  const speed = speedKmh / 3.6;
+  if (length < 1e-6 || speed <= 0 || intervalMs <= 0) return { waypoints: [], timeSeconds: [] };
+  const segments = Math.min(99, Math.max(1, Math.ceil(length / Math.max(speed * intervalMs / 1000, 0.05))));
+  const waypoints: ENUVector[] = [];
+  const timeSeconds: number[] = [];
+  let edge = 1;
+  for (let i = 0; i <= segments; i++) {
+    const distance = length * i / segments;
+    while (edge < arc.length - 1 && arc[edge] < distance) edge++;
+    const fraction = (distance - arc[edge - 1]) / Math.max(arc[edge] - arc[edge - 1], 1e-9);
+    const a = points[edge - 1].enu;
+    const b = points[edge].enu;
+    waypoints.push({ x: a.x + fraction * (b.x - a.x), y: a.y + fraction * (b.y - a.y), z: a.z + fraction * (b.z - a.z) });
+    timeSeconds.push(distance / speed);
+  }
+  return { waypoints, timeSeconds };
+}
 
 const INITIAL_ANCHOR: GeoAnchor = {
   latitude: 38.9226,
@@ -195,6 +214,7 @@ export default function App() {
   const [anchor, setAnchor] = useState<GeoAnchor>(
     () => AUTOSAVED_PROJECT?.scene.anchor ?? INITIAL_ANCHOR,
   );
+  const [mapAnchor, setMapAnchor] = useState(anchor);
 
   // ── Multiple transmitters & receivers ───────────────────────────────────
   // The arrays hold every device; `activeTxId`/`activeRxId` mark the one the
@@ -231,6 +251,9 @@ export default function App() {
   const [activeRxId, setActiveRxId] = useState(
     () => AUTOSAVED_PROJECT?.devices.activeRxId ?? 'rx_1',
   );
+  const [fronthaulMbpsByTxId, setFronthaul] = useState<Record<string, number | null>>(
+    () => AUTOSAVED_PROJECT?.devices.fronthaulMbpsByTxId ?? {},
+  );
 
   const tx = txs.find((t) => t.id === activeTxId) ?? txs[0];
   const rx = rxs.find((r) => r.id === activeRxId) ?? rxs[0];
@@ -249,6 +272,7 @@ export default function App() {
   const [solverOptions, setSolverOptions] = useState<SolverOptions>(
     () => AUTOSAVED_PROJECT?.solver.options ?? DEFAULT_SOLVER_OPTIONS,
   );
+  const [csiSettings, setCsiSettings] = useState(() => AUTOSAVED_PROJECT?.csi ?? DEFAULT_CSI_SETTINGS);
 
   // Radio map display (colormap + manual range), like sionna-rt-gui's map panel.
   const [rmColormap, setRmColormap] = useState<ColormapName>(
@@ -264,9 +288,8 @@ export default function App() {
     () => AUTOSAVED_PROJECT?.display.radioMapVmax ?? -50,
   );
 
-  // Top navigation view (3D SCENE / GEOGRAPHY / ANALYSIS / EXPORT)
-  const [activeNavTab, setActiveNavTab] = useState<'3d_scene' | 'geography' | 'analysis' | 'export'>(
-    () => AUTOSAVED_PROJECT?.display.activeNavTab ?? '3d_scene',
+  const [workspace, setWorkspace] = useState<StudioWorkspace>(
+    () => AUTOSAVED_PROJECT?.display.workspace ?? 'scene',
   );
 
   // Active Studio Modes
@@ -324,14 +347,16 @@ export default function App() {
 
   // GIS Data Fetcher States
   const [gisLoading, setGisLoading] = useState(false);
+  const gisRequest = useRef(0);
   const [downloadMessage, setDownloadProgress] = useState<LocalizedText>(['', '']);
   const downloadProgress = t(...downloadMessage);
 
   // Trajectory points state
-  const [trajectoryPoints, setTrajectoryPoints] = useState<
-    { lat: number; lon: number; enu: { x: number; y: number; z: number } }[]
-  >(() => AUTOSAVED_PROJECT?.mobility.trajectoryPoints ?? []);
-  const [activeMobilityStep, setActiveMobilityStep] = useState<MobilityStep | null>(null);
+  const [trajectoriesByRxId, setTrajectories] = useState<Record<string, TrajectoryPoint[]>>(
+    () => AUTOSAVED_PROJECT?.mobility.trajectoriesByRxId ?? {},
+  );
+  const trajectoryPoints = Object.hasOwn(trajectoriesByRxId, rx.id) ? trajectoriesByRxId[rx.id] : EMPTY_TRACK;
+  const setTrajectoryPoints = (points: TrajectoryPoint[]) => setTrajectories(prev => ({ ...prev, [rx.id]: points }));
 
   // PROPAGATION LINK PHYSICS SOLVER — real Sionna RT on the backend, run on demand.
   const [paths, setPaths] = useState<PropagationPath[]>([]);
@@ -362,6 +387,7 @@ export default function App() {
   // Pairs; false once the user focuses a single pair (cell click / Solve Link),
   // so a fresh single-link solve isn't drowned out by every pair's rays.
   const [matrixRaysVisible, setMatrixRaysVisible] = useState(false);
+  const [previewSource, setPreviewSource] = useState<'csi' | 'legacy'>('csi');
   const sceneRevision = useRef(0);
   const activePair = useRef({ txId: activeTxId, rxId: activeRxId });
   activePair.current = { txId: activeTxId, rxId: activeRxId };
@@ -371,9 +397,6 @@ export default function App() {
     setPaths([]);
     setMetrics(EMPTY_METRICS);
     setMatrix({});
-    setRadioMap(null);
-    setMobilitySteps([]);
-    setActiveMobilityStep(null);
     setMatrixRaysVisible(false);
   }, [
     buildings,
@@ -392,6 +415,7 @@ export default function App() {
     const revision = sceneRevision.current;
     setSolving(true);
     setSolveError(null);
+    setPreviewSource('legacy');
     try {
       const res = await solveLink(tx, rx, buildings, freqGhz, maxDepth, solverOptions, materialList);
       if (revision !== sceneRevision.current || activePair.current.txId !== tx.id || activePair.current.rxId !== rx.id) return;
@@ -413,6 +437,7 @@ export default function App() {
     const revision = sceneRevision.current;
     setMatrixLoading(true);
     setSolveError(null);
+    setPreviewSource('legacy');
     const next: Record<string, MatrixCell> = {};
     const total = txs.length * rxs.length;
     let done = 0;
@@ -453,19 +478,9 @@ export default function App() {
 
   // Selecting a matrix cell focuses that Tx→Rx pair and shows its multipath.
   const handleSelectPair = (txId: string, rxId: string) => {
+    setPreviewSource('legacy');
     setActiveTxId(txId);
     setActiveRxId(rxId);
-    if (activeMode === 'playback') {
-      if (rxId !== activeRxId) {
-        setMobilitySteps([]);
-        setActiveMobilityStep(null);
-        setMobilityExecution(null);
-        setMobilityHandover(null);
-        setPaths([]);
-        setMetrics(EMPTY_METRICS);
-      }
-      return;
-    }
     const cell = matrix[`${txId}|${rxId}`];
     if (!cell && txId === activeTxId && rxId === activeRxId) return;
     setPaths(cell?.paths ?? []);
@@ -475,7 +490,7 @@ export default function App() {
 
   // ── Device list management (add / remove / select) ──────────────────────
   const startPlacement = (mode: 'add-tx' | 'add-rx') => {
-    setActiveNavTab('3d_scene');
+    setWorkspace('planning');
     setPlacementMode(mode);
   };
 
@@ -501,12 +516,14 @@ export default function App() {
     if (txs.length <= 1) return;
     const remaining = txs.filter((t) => t.id !== id);
     setTxs(remaining);
+    setFronthaul(prev => Object.fromEntries(Object.entries(prev).filter(([key]) => key !== id)));
     if (activeTxId === id) setActiveTxId(remaining[0].id);
   };
   const removeRx = (id: string) => {
     if (rxs.length <= 1) return;
     const remaining = rxs.filter((r) => r.id !== id);
     setRxs(remaining);
+    setTrajectories(prev => Object.fromEntries(Object.entries(prev).filter(([key]) => key !== id)));
     if (activeRxId === id) setActiveRxId(remaining[0].id);
   };
 
@@ -520,21 +537,26 @@ export default function App() {
 
   const handleAnchorChange = (nextAnchor: GeoAnchor) => {
     setAnchor(nextAnchor);
+    setMapAnchor(nextAnchor);
     setTxs(prev => prev.map(device => positionDevice(device, device.enu, nextAnchor)));
     setRxs(prev => prev.map(device => positionDevice(device, device.enu, nextAnchor)));
-    setTrajectoryPoints(prev => prev.map(point => ({ ...point, ...enuToLatLon(point.enu, nextAnchor) })));
+    setTrajectories((prev: Record<string, TrajectoryPoint[]>) => Object.fromEntries(Object.entries(prev).map(([id, points]) => [
+      id, points.map(point => ({ ...point, ...enuToLatLon(point.enu, nextAnchor) })),
+    ])));
   };
 
-  const solveAllFromDevices = () => {
-    setPlacementMode('none');
-    setActiveNavTab('3d_scene');
-    setActiveMode('link');
-    requestAnimationFrame(() => document.getElementById('link-matrix')?.scrollIntoView({ block: 'nearest' }));
-    void handleSolveMatrix();
+  const useStarterScene = () => {
+    gisRequest.current++;
+    setGisLoading(false);
+    setDownloadProgress(['', '']);
+    handleAnchorChange(INITIAL_ANCHOR);
+    setBuildings(PRELOADED_BUILDINGS);
   };
 
   // OVERPASS GIS DOWNLOAD PIPELINE
   const handleDownloadOSM = async (bounds: L.LatLngBounds) => {
+    const request = ++gisRequest.current;
+    const selectedAnchor = mapAnchor;
     setGisLoading(true);
     setDownloadProgress(['Sending the area query to Overpass…', '正在向 Overpass 查询所选区域…']);
     try {
@@ -547,32 +569,29 @@ export default function App() {
       // message comes after the network is done, so a stalled mirror can never
       // look like slow XML compilation again.
       const loadedBuildings = await fetchOSMBuildings(
-        south, west, north, east, anchor, setDownloadProgress,
+        south, west, north, east, selectedAnchor, message => {
+          if (request === gisRequest.current) setDownloadProgress(message);
+        },
       );
-      setDownloadProgress(['Preparing the building geometry…', '正在准备建筑几何…']);
+      if (request !== gisRequest.current) return;
 
       if (loadedBuildings.length === 0) {
         setDownloadProgress(['No buildings found in this area. Keeping the current scene.', '所选区域未找到建筑，保留当前场景。']);
-        setTimeout(() => setGisLoading(false), 2000);
         return;
       }
 
+      handleAnchorChange(selectedAnchor);
       setBuildings(loadedBuildings);
       setDownloadProgress([`Imported ${loadedBuildings.length} map features.`, `已导入 ${loadedBuildings.length} 个地图要素。`]);
-      setTimeout(() => setGisLoading(false), 1500);
     } catch (e: any) {
+      if (request !== gisRequest.current) return;
       const detail = e instanceof Error ? ` (${e.message})` : '';
       setDownloadProgress([`Map download failed${detail}`, `地图下载失败${detail}`]);
-      setTimeout(() => setGisLoading(false), 3000);
+    } finally {
+      if (request === gisRequest.current) setGisLoading(false);
     }
   };
 
-  // MOBILITY — real Sionna link solve at each Rx waypoint (incl. Doppler).
-  const [mobilitySteps, setMobilitySteps] = useState<MobilityStep[]>([]);
-  const [mobilityLoading, setMobilityLoading] = useState(false);
-  const [mobilityMessage, setMobilityProgress] = useState<LocalizedText>(['', '']);
-  const mobilityProgress = t(...mobilityMessage);
-  const [mobilityExecution, setMobilityExecution] = useState<MobilityExecution | null>(null);
   // How multiple transmitters collapse into each waypoint's KPIs (best-server vs
   // total power); the rays drawn are the union of all Tx in either case.
   const [mobilityCombineMode, setMobilityCombineMode] = useState<MobilityCombineMode>(
@@ -589,7 +608,6 @@ export default function App() {
   const [mobilityIntervalMs, setMobilityIntervalMs] = useState(
     () => AUTOSAVED_PROJECT?.mobility.intervalMs ?? 100,
   );
-  const [mobilityHandover, setMobilityHandover] = useState<HandoverAnalysis | null>(null);
   const [autosaveStatus, setAutosaveStatus] = useState<'saving' | 'saved' | 'error'>('saving');
   const resettingRef = useRef(false);
 
@@ -600,7 +618,9 @@ export default function App() {
       receivers: rxs,
       activeTxId,
       activeRxId,
+      fronthaulMbpsByTxId,
     },
+    csi: csiSettings,
     solver: {
       carrierFrequencyGhz: freqGhz,
       maxDepth,
@@ -617,14 +637,14 @@ export default function App() {
       seed: radioMapSeed,
     },
     mobility: {
-      trajectoryPoints,
+      trajectoriesByRxId,
       combineMode: mobilityCombineMode,
       handover: handoverConfig,
       speedKmh: mobilitySpeedKmh,
       intervalMs: mobilityIntervalMs,
     },
     display: {
-      activeNavTab,
+      workspace,
       activeMode,
       showOutlines,
       showRaysOnHeatmap,
@@ -634,11 +654,11 @@ export default function App() {
       radioMapVmax: rmVmax,
     },
   }), [
-    anchor, buildings, txs, rxs, activeTxId, activeRxId, freqGhz, maxDepth,
+    anchor, buildings, txs, rxs, activeTxId, activeRxId, fronthaulMbpsByTxId, csiSettings, freqGhz, maxDepth,
     solverOptions, materialConfigs, coverageMetric, coverageBandwidthMhz,
     coverageNoiseFigureDb, coverageHeight, coverageRes, coverageSamplesPerTx,
-    radioMapSeed, trajectoryPoints, mobilityCombineMode, handoverConfig,
-    mobilitySpeedKmh, mobilityIntervalMs, activeNavTab, activeMode, showOutlines,
+    radioMapSeed, trajectoriesByRxId, mobilityCombineMode, handoverConfig,
+    mobilitySpeedKmh, mobilityIntervalMs, workspace, activeMode, showOutlines,
     showRaysOnHeatmap, rmColormap, rmAutoRange, rmVmin, rmVmax,
   ]);
 
@@ -682,12 +702,24 @@ export default function App() {
 
   const handleImportProject = (text: string) => {
     const imported = parseProjectDocument(text).state;
+    csiRequest.current++;
+    setCsiRunning(null);
+    setCsiResult(null);
+    setCsiSelection(null);
+    setCsiIssue(null);
+    setPreviewSource('csi');
+    gisRequest.current++;
+    setGisLoading(false);
+    setDownloadProgress(['', '']);
     setAnchor(imported.scene.anchor);
+    setMapAnchor(imported.scene.anchor);
     setBuildings(imported.scene.buildings);
     setTxs(imported.devices.transmitters);
     setRxs(imported.devices.receivers);
     setActiveTxId(imported.devices.activeTxId);
     setActiveRxId(imported.devices.activeRxId);
+    setFronthaul(imported.devices.fronthaulMbpsByTxId);
+    setCsiSettings(imported.csi);
     setFreqGhz(imported.solver.carrierFrequencyGhz);
     setMaxDepth(imported.solver.maxDepth);
     setSolverOptions(imported.solver.options);
@@ -699,12 +731,12 @@ export default function App() {
     setCoverageRes(imported.coverage.gridStepM);
     setCoverageSamplesPerTx(imported.coverage.samplesPerTx);
     setRadioMapSeed(imported.coverage.seed);
-    setTrajectoryPoints(imported.mobility.trajectoryPoints);
+    setTrajectories(imported.mobility.trajectoriesByRxId);
     setMobilityCombineMode(imported.mobility.combineMode);
     setHandoverConfig(imported.mobility.handover);
     setMobilitySpeedKmh(imported.mobility.speedKmh);
     setMobilityIntervalMs(imported.mobility.intervalMs);
-    setActiveNavTab(imported.display.activeNavTab);
+    setWorkspace(imported.display.workspace);
     setActiveMode(imported.display.activeMode);
     setShowOutlines(imported.display.showOutlines);
     setShowRaysOnHeatmap(imported.display.showRaysOnHeatmap);
@@ -719,116 +751,121 @@ export default function App() {
     setMatrix({});
     setMatrixRaysVisible(false);
     setRadioMap(null);
-    setMobilitySteps([]);
-    setActiveMobilityStep(null);
-    setMobilityExecution(null);
-    setMobilityHandover(null);
     setSolveError(null);
   };
 
-  // Each sample is a full GPU ray trace, so cap the trajectory resolution.
-  const MAX_MOBILITY_STEPS = 100;
+  const [csiResult, setCsiResult] = useState<{ run: CsiRun; key: string } | null>(null);
+  const [csiRunning, setCsiRunning] = useState<CsiRunMode | null>(null);
+  const [csiIssue, setCsiIssue] = useState<LocalizedText | null>(null);
+  const [csiSelection, setCsiSelection] = useState<CsiSelection | null>(null);
+  const [csiLink, setCsiLink] = useState<CsiLinkPreview | null>(null);
+  const [csiLinkLoading, setCsiLinkLoading] = useState(false);
+  const [csiLinkError, setCsiLinkError] = useState('');
+  const csiRequest = useRef(0);
 
-  const sampleMobilityPath = (intervalMs: number, speedKmh: number) => {
-    if (trajectoryPoints.length < 2) return trajectoryPoints;
-    const speedMs = Math.max(speedKmh / 3.6, 0.1);
-    const stepMeters = Math.max(speedMs * (intervalMs / 1000), 0.05);
-
-    // Cumulative arc length along the drawn polyline.
-    const cum = [0];
-    for (let i = 1; i < trajectoryPoints.length; i++) {
-      const a = trajectoryPoints[i - 1].enu;
-      const b = trajectoryPoints[i].enu;
-      cum.push(cum[i - 1] + Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z));
-    }
-    const total = cum[cum.length - 1];
-    if (total < 1e-6) return [trajectoryPoints[0]];
-
-    const numSegments = Math.min(
-      Math.max(Math.ceil(total / stepMeters), 1),
-      MAX_MOBILITY_STEPS - 1,
-    );
-    const sampled: typeof trajectoryPoints = [];
-    let seg = 1;
-    for (let s = 0; s <= numSegments; s++) {
-      const d = (s / numSegments) * total;
-      while (seg < cum.length - 1 && cum[seg] < d) seg++;
-      const t = (d - cum[seg - 1]) / Math.max(cum[seg] - cum[seg - 1], 1e-9);
-      const a = trajectoryPoints[seg - 1];
-      const b = trajectoryPoints[seg];
-      sampled.push({
-        lat: a.lat + (b.lat - a.lat) * t,
-        lon: a.lon + (b.lon - a.lon) * t,
-        enu: {
-          x: a.enu.x + (b.enu.x - a.enu.x) * t,
-          y: a.enu.y + (b.enu.y - a.enu.y) * t,
-          z: a.enu.z + (b.enu.z - a.enu.z) * t,
-        },
-      });
-    }
-    return sampled;
-  };
-
-  const handleRunMobility = async (speedKmh: number, intervalMs: number) => {
-    if (trajectoryPoints.length < 2) {
-      setSolveError(['Draw at least two mobility waypoints in the 3D scene.', '请在三维场景中绘制至少两个轨迹点。']);
-      return;
-    }
-    const revision = sceneRevision.current;
-    setMobilityLoading(true);
-    setSolveError(null);
-    try {
-      setActiveMobilityStep(null);
-      setMobilitySteps([]);
-      setMobilityExecution(null);
-      setMobilityHandover(null);
-      const sampledPath = sampleMobilityPath(intervalMs, speedKmh);
-      setTrajectoryPoints(sampledPath);
-      const waypoints = sampledPath.map((p) => ({ x: p.enu.x, y: p.enu.y, z: p.enu.z }));
-
-      // One API request preserves the backend's one-PathSolver-dispatch fast
-      // path over all Tx × waypoints and makes the browser workflow identical
-      // to the benchmarked workflow. The response exposes any serial fallback.
-      setMobilityProgress([
-        `Tracing ${txs.length} transmitters × ${waypoints.length} positions…`,
-        `正在追踪 ${txs.length} 个发射端 × ${waypoints.length} 个位置…`,
+  const csiGrid = React.useMemo(() => ({
+    numSubcarriers: csiSettings.numSubcarriers,
+    subcarrierSpacing: csiSettings.subcarrierSpacingKhz * 1000,
+    normalizeDelays: csiSettings.normalizeDelays,
+  }), [csiSettings]);
+  const csiCommon = React.useMemo(() => ({
+    txs, buildings, freqGhz, maxDepth, options: solverOptions, materials: materialList,
+    systemBandwidthMhz: coverageBandwidthMhz, noiseFigureDb: coverageNoiseFigureDb, ...csiGrid,
+  }), [txs, buildings, freqGhz, maxDepth, solverOptions, materialList, coverageBandwidthMhz, coverageNoiseFigureDb, csiGrid]);
+  const sharedCsiKey = React.useMemo(() => JSON.stringify([anchor, csiCommon]), [anchor, csiCommon]);
+  const keyForCsi = (mode: CsiRunMode, rxId: string) => mode === 'static'
+    ? sharedCsiKey + JSON.stringify(rxs)
+    : sharedCsiKey + JSON.stringify([
+        rxs.find(device => device.id === rxId),
+        Object.hasOwn(trajectoriesByRxId, rxId) ? trajectoriesByRxId[rxId] : EMPTY_TRACK,
+        mobilitySpeedKmh, mobilityIntervalMs, mobilityCombineMode, handoverConfig,
       ]);
-      const res = await solveMobility(
-        txs, rx, buildings, waypoints,
-        freqGhz, speedKmh, maxDepth, solverOptions, materialList, mobilityCombineMode,
-        'auto', handoverConfig,
-      );
-      if (revision !== sceneRevision.current || activePair.current.rxId !== rx.id) return;
-      const all = res.steps.map((step, index) => ({ ...step, index }));
-      setMobilityExecution(res.execution);
-      setMobilityHandover(res.handover ?? null);
+  const currentCsiKey = useRef(keyForCsi);
+  currentCsiKey.current = keyForCsi;
+  const csiRun = csiResult?.run ?? null;
+  const csiStale = !!csiResult && csiResult.key !== keyForCsi(csiResult.run.mode, csiResult.run.rxIds[0]);
+  const currentRunId = csiStale ? null : csiRun?.runId;
 
-      setMobilitySteps(all);
-      if (all[0]) {
-        handleMobilityStepSelect(all[0]);
+  useEffect(() => {
+    setCsiLink(null);
+    setCsiLinkError('');
+    setCsiLinkLoading(false);
+    if (!currentRunId || !csiSelection) return;
+    let current = true;
+    setCsiLinkLoading(true);
+    inspectCsiLink(currentRunId, csiSelection).then(
+      link => { if (current) setCsiLink(link); },
+      error => { if (current) setCsiLinkError(error instanceof Error ? error.message : String(error)); },
+    ).finally(() => { if (current) setCsiLinkLoading(false); });
+    return () => { current = false; };
+  }, [currentRunId, csiSelection]);
+
+  const sameArrays = (devices: (Receiver | Transmitter)[]) =>
+    devices.every(device => device.antennaArraySize.every((value, i) => value === devices[0].antennaArraySize[i]));
+  const unavailableReason = !backendOnline ? t('Solver is offline.', '求解器离线。') : undefined;
+  const txArrayReason = sameArrays(txs) ? undefined : t(
+    'This CSI tensor needs matching AP array sizes. Static mixed-array CIR is available in advanced export.',
+    '统一 CSI 张量要求各 AP 阵列等尺寸。静态混合阵列可使用高级导出中的逐链路 CIR。',
+  );
+  const staticDisabledReason = unavailableReason ?? txArrayReason ?? (sameArrays(rxs) ? undefined : t(
+    'This CSI tensor needs matching UE array sizes. Use the advanced per-link CIR export for mixed arrays.',
+    '统一 CSI 张量要求各 UE 阵列等尺寸。混合阵列可使用高级逐链路 CIR 导出。',
+  ));
+  const route = React.useMemo(
+    () => sampleTrajectory(trajectoryPoints, mobilityIntervalMs, mobilitySpeedKmh),
+    [trajectoryPoints, mobilityIntervalMs, mobilitySpeedKmh],
+  );
+  const trajectoryDisabledReason = unavailableReason ?? txArrayReason ?? (route.waypoints.length < 2
+    ? t('Draw a nonzero trajectory for the selected UE in Planning.', '请先在规划页为所选 UE 绘制一条有长度的轨迹。') : undefined);
+
+  const handleCsiRun = async (mode: CsiRunMode) => {
+    if (csiRunning || (mode === 'static' ? staticDisabledReason : trajectoryDisabledReason)) return;
+    const request = ++csiRequest.current;
+    const key = keyForCsi(mode, rx.id);
+    setCsiRunning(mode);
+    setCsiIssue(null);
+    setActiveMode('link');
+    try {
+      const run = await createCsiRun({
+        ...csiCommon, mode, rxs: mode === 'static' ? rxs : [rx],
+        ...(mode === 'trajectory' ? {
+          ...route, speedKmh: mobilitySpeedKmh, combineMode: mobilityCombineMode, handover: handoverConfig,
+        } : {}),
+      });
+      if (request !== csiRequest.current) return;
+      if (key !== currentCsiKey.current(mode, rx.id)) {
+        setCsiIssue(['Inputs changed during tracing. Run CSI again with the current settings.', '追踪期间输入已改变，请使用当前配置重新计算 CSI。']);
+        return;
       }
-      setBackendOnline(true);
-    } catch (err: any) {
-      console.error(err);
-      const detail = err instanceof Error ? ` (${err.message})` : '';
-      setSolveError([`Mobility solve failed${detail}`, `移动轨迹求解失败${detail}`]);
-      checkBackend().then(setBackendOnline);
+      setCsiResult({ run, key });
+      setPreviewSource('csi');
+      setCsiSelection({ txId: run.txIds.includes(tx.id) ? tx.id : run.txIds[0], rxId: run.rxIds.includes(rx.id) ? rx.id : run.rxIds[0], sampleIndex: 0 });
+    } catch (error) {
+      if (request !== csiRequest.current) return;
+      const detail = error instanceof Error ? error.message : String(error);
+      setCsiIssue([`CSI calculation failed (${detail})`, `CSI 计算失败（${detail}）`]);
     } finally {
-      setMobilityLoading(false);
-      setMobilityProgress(['', '']);
+      if (request === csiRequest.current) setCsiRunning(null);
     }
   };
 
+  const coverageInputs = React.useMemo(() => ({
+    txs, buildings, anchor, freqGhz, maxDepth, solverOptions, materialList,
+    coverageMetric, coverageBandwidthMhz, coverageNoiseFigureDb, coverageHeight, coverageRes,
+    coverageSamplesPerTx, radioMapSeed,
+  }), [
+    txs, buildings, anchor, freqGhz, maxDepth, solverOptions, materialList,
+    coverageMetric, coverageBandwidthMhz, coverageNoiseFigureDb, coverageHeight, coverageRes,
+    coverageSamplesPerTx, radioMapSeed,
+  ]);
+  const currentCoverageInputs = useRef(coverageInputs);
+  currentCoverageInputs.current = coverageInputs;
+  useEffect(() => { setRadioMap(null); }, [coverageInputs]);
 
-  const handleMobilityStepSelect = (step: MobilityStep) => {
-    setActiveMobilityStep(step);
-    setPaths(step.paths);
-    setMetrics(metricsFromMobilityStep(step));
-  };
-
-  // COVERAGE HEATMAP — real Sionna RadioMapSolver, best-server across all Tx.
+  // Coverage uses RadioMapSolver and the strongest server across all Tx.
   const handleRunHeatmap = async (resolution: number, height: number, samplesPerTx: number, seed: number) => {
     setLoadingHeatmap(true);
+    setSolveError(null);
     try {
       const grid = await solveRadioMap(
         txs, buildings, freqGhz, resolution, height, maxDepth, solverOptions, materialList,
@@ -840,9 +877,11 @@ export default function App() {
           seed,
         },
       );
+      if (coverageInputs !== currentCoverageInputs.current) return;
       setRadioMap(grid);
       setBackendOnline(true);
     } catch (err: any) {
+      if (coverageInputs !== currentCoverageInputs.current) return;
       console.error(err);
       const detail = err instanceof Error ? ` (${err.message})` : '';
       setSolveError([`Coverage map failed${detail}`, `覆盖图求解失败${detail}`]);
@@ -852,249 +891,202 @@ export default function App() {
     }
   };
 
+  const openWorkspace = (next: StudioWorkspace) => {
+    setPlacementMode('none');
+    setWorkspace(next);
+  };
+  const previewing = workspace === 'preview';
+  const showingCsi = previewSource === 'csi' && !!csiRun;
+  const showingCsiSelection = previewing && showingCsi && currentRunId && csiSelection;
+  const trajectoryView = showingCsiSelection && activeMode !== 'heatmap' && csiRun?.mode === 'trajectory';
+  const previewPosition = trajectoryView && csiSelection
+    ? csiRun?.rxPositions[csiSelection.sampleIndex]?.[0] : undefined;
+  const viewedTx = showingCsiSelection ? txs.find(device => device.id === showingCsiSelection.txId) ?? tx : tx;
+  const viewedRx = showingCsiSelection ? rxs.find(device => device.id === showingCsiSelection.rxId) ?? rx : rx;
+  const previewPaths = showingCsi ? (csiStale ? EMPTY_PATHS : csiLink?.paths ?? EMPTY_PATHS) : paths;
+  const shownPaths = previewing ? previewPaths : EMPTY_PATHS;
+  const rfControls = {
+    tx, rx, onTxUpdate: handleTxUpdate, onRxUpdate: handleRxUpdate, freqGhz, setFreqGhz,
+    maxDepth, setMaxDepth, solverOptions, setSolverOptions,
+  };
+  const exportDevices = txs.map(device => [device.id, Object.hasOwn(fronthaulMbpsByTxId, device.id)
+    ? fronthaulMbpsByTxId[device.id] : null] as const);
+  const currentFronthaul = Object.fromEntries(exportDevices);
+  const nextButton = 'btn-signal cursor-pointer rounded px-3 py-2 text-sm font-semibold';
+
   return (
-    <div id="sionna-rt-studio-app-frame" className="min-h-screen lg:h-screen lg:overflow-hidden text-[var(--text-hi)] flex flex-col font-sans">
-      <TopNav
-        activeTab={activeNavTab}
-        onSelect={(tab) => {
-          setActiveNavTab(tab);
-          if (tab !== '3d_scene') setPlacementMode('none');
-        }}
-        backendOnline={backendOnline}
-      />
-
-      {/* Main container Grid body */}
-      <main className="flex-1 lg:min-h-0 p-6 grid grid-cols-1 lg:grid-cols-[430px_minmax(0,1fr)] gap-6 w-full">
-        {/* Left column GIS mapping & parameter adjustments (4/12, 3/12 on wide screens) */}
-        <div className="flex flex-col gap-6 animate-rise lg:min-h-0 lg:overflow-y-auto lg:pr-1">
-          <DevicePanel
-            txs={txs}
-            rxs={rxs}
-            activeTxId={activeTxId}
-            activeRxId={activeRxId}
-            onSelectTx={(id) => handleSelectPair(id, activeRxId)}
-            onSelectRx={(id) => handleSelectPair(activeTxId, id)}
-            onAddTx={() => startPlacement('add-tx')}
-            onAddRx={() => startPlacement('add-rx')}
-            onRemoveTx={removeTx}
-            onRemoveRx={removeRx}
-            onSolveAll={solveAllFromDevices}
-            solveAllDisabled={!backendOnline || matrixLoading || solving || mobilityLoading || loadingHeatmap}
-            solvingAll={matrixLoading}
-          />
-
-          <MapSelector
-            anchor={anchor}
-            setAnchor={handleAnchorChange}
-            tx={tx}
-            rx={rx}
-            txs={txs}
-            rxs={rxs}
-            onTxUpdate={handleTxUpdate}
-            onRxUpdate={handleRxUpdate}
-            onDownloadOSM={handleDownloadOSM}
-            onResetProject={handleResetProject}
-            isLoading={gisLoading}
-            downloadProgress={downloadProgress}
-            trajectoryPoints={trajectoryPoints}
-          />
-
-          <SolverControls
-            tx={tx}
-            rx={rx}
-            onTxUpdate={handleTxUpdate}
-            onRxUpdate={handleRxUpdate}
-            activeMode={activeMode}
-            setActiveMode={setActiveMode}
-            freqGhz={freqGhz}
-            setFreqGhz={setFreqGhz}
-            maxDepth={maxDepth}
-            setMaxDepth={setMaxDepth}
-            solverOptions={solverOptions}
-            setSolverOptions={setSolverOptions}
-          />
-
-          {activeMode === 'link' && (
-            <LinkPanel
-              txs={txs}
-              rxs={rxs}
-              activeTxId={activeTxId}
-              activeRxId={activeRxId}
-              matrix={matrix}
-              matrixLoading={matrixLoading}
-              matrixProgress={matrixProgress}
-              onSolveMatrix={handleSolveMatrix}
-              onSelectPair={handleSelectPair}
-              paths={paths}
-              metrics={metrics}
-              onSolve={handleSolve}
-              solving={solving}
-              solveError={solveError}
-              backendOnline={backendOnline}
-            />
-          )}
-
-          {activeMode === 'heatmap' && (
-            <CoveragePanel
-              txCount={txs.length}
-              backendOnline={backendOnline}
-              onRunHeatmap={handleRunHeatmap}
-              heatmapLoading={loadingHeatmap}
-              radioMap={radioMap}
-              coverageMetric={coverageMetric}
-              setCoverageMetric={setCoverageMetric}
-              coverageBandwidthMhz={coverageBandwidthMhz}
-              setCoverageBandwidthMhz={setCoverageBandwidthMhz}
-              coverageNoiseFigureDb={coverageNoiseFigureDb}
-              setCoverageNoiseFigureDb={setCoverageNoiseFigureDb}
-              coverageHeight={coverageHeight}
-              setCoverageHeight={setCoverageHeight}
-              coverageRes={coverageRes}
-              setCoverageRes={setCoverageRes}
-              samplesPerTx={coverageSamplesPerTx}
-              setSamplesPerTx={setCoverageSamplesPerTx}
-              radioMapSeed={radioMapSeed}
-              setRadioMapSeed={setRadioMapSeed}
-              showRaysOnHeatmap={showRaysOnHeatmap}
-              setShowRaysOnHeatmap={setShowRaysOnHeatmap}
-              rmColormap={rmColormap}
-              setRmColormap={setRmColormap}
-              rmAutoRange={rmAutoRange}
-              setRmAutoRange={setRmAutoRange}
-              rmVmin={rmVmin}
-              setRmVmin={setRmVmin}
-              rmVmax={rmVmax}
-              setRmVmax={setRmVmax}
-              solveError={solveError}
-            />
-          )}
-
-          {activeMode === 'playback' && (
-            <TrajectoryPanel
-              txs={txs}
-              tx={tx}
-              rx={rx}
-              anchor={anchor}
-              trajectoryPoints={trajectoryPoints}
-              setTrajectoryPoints={setTrajectoryPoints}
-              mobilitySteps={mobilitySteps}
-              mobilityLoading={mobilityLoading}
-              mobilityProgress={mobilityProgress}
-              mobilityExecution={mobilityExecution}
-              onRunMobility={handleRunMobility}
-              onMobilityStepSelect={handleMobilityStepSelect}
-              mobilitySpeedKmh={mobilitySpeedKmh}
-              setMobilitySpeedKmh={setMobilitySpeedKmh}
-              mobilityIntervalMs={mobilityIntervalMs}
-              setMobilityIntervalMs={setMobilityIntervalMs}
-              mobilityCombineMode={mobilityCombineMode}
-              setMobilityCombineMode={setMobilityCombineMode}
-              handoverConfig={handoverConfig}
-              setHandoverConfig={setHandoverConfig}
-              mobilityHandover={mobilityHandover}
-              solveError={solveError}
-              backendOnline={backendOnline}
-            />
-          )}
-        </div>
-
-        {/* Center/Right columns visualization viewport (8/12, 9/12 on wide screens) — content swaps with the top nav */}
-        <div className="flex flex-col gap-6 animate-rise lg:min-h-0 lg:overflow-y-auto lg:pr-1" style={{ animationDelay: '0.08s' }}>
-          {/* Main 3D WebGL Canvas */}
-          {activeNavTab === '3d_scene' && (
-            <ThreeStudio
-              buildings={buildings}
-              anchor={anchor}
-              tx={tx}
-              rx={rx}
-              txs={txs}
-              rxs={rxs}
-              activeTxId={activeTxId}
-              activeRxId={activeRxId}
-              paths={paths}
-              matrixPaths={matrixPaths}
-              showRaysOnHeatmap={showRaysOnHeatmap}
-              radioMap={radioMap}
-              rmColormap={rmColormap}
-              rmAutoRange={rmAutoRange}
-              rmVmin={rmVmin}
-              rmVmax={rmVmax}
-              onPlaceDevice={placeDevice}
-              activeMode={activeMode}
-              placementMode={placementMode}
-              setPlacementMode={setPlacementMode}
-              showOutlines={showOutlines}
-              setShowOutlines={setShowOutlines}
-              mobilityRxPosition={activeMobilityStep?.rxPosition ?? null}
-              trajectoryPoints={trajectoryPoints}
-              setTrajectoryPoints={setTrajectoryPoints}
-            />
-          )}
-
-          {activeNavTab === 'geography' && (
-            <GeographyPanel
-              buildings={buildings}
-              anchor={anchor}
-              materialIds={materialIds}
-              materialConfigs={materialList}
-              onMaterialChange={updateMaterial}
-            />
-          )}
-
-          {activeNavTab === 'analysis' && (
-            <AnalysisPanel
-              tx={tx}
-              rx={rx}
-              paths={paths}
-              metrics={metrics}
-              freqGhz={freqGhz}
-              radioMap={radioMap}
-              buildings={buildings}
-              maxDepth={maxDepth}
-              solverOptions={solverOptions}
-              materials={materialList}
-              backendOnline={backendOnline}
-            />
-          )}
-
-          {activeNavTab === 'export' && (
-            <ExportPanel
-              buildings={buildings}
-              anchor={anchor}
-              paths={paths}
-              txs={txs}
-              rxs={rxs}
-              tx={tx}
-              rx={rx}
-              freqGhz={freqGhz}
-              maxDepth={maxDepth}
-              solverOptions={solverOptions}
-              radioMap={radioMap}
-              materials={materialList}
-              projectState={projectState}
-              autosaveStatus={autosaveStatus}
-              onImportProject={handleImportProject}
-              onResetProject={handleResetProject}
-            />
-          )}
-
-          {/* User tips documentation helper */}
-          <div className="panel p-4 text-[14px] flex gap-3.5 text-slate-300">
-            <div className="grid place-items-center w-9 h-9 shrink-0 bg-[var(--ink-750)] border border-[var(--line)] text-[var(--accent)] rounded-lg h-fit">
-              <BookOpen className="w-4 h-4" />
-            </div>
-            <div className="flex flex-col gap-1.5">
-              <h4 className="eyebrow">{t('Propagation Studio · Quick Start', '传播实验台 · 快速入门')}</h4>
-              <p className="leading-relaxed text-[var(--text-mid)]">
-                {t(
-                  'Use Add AP or Add UE and click the scene to place devices. Press Esc or click Done when finished. Use Solve all links in Scene devices to compare every AP–UE pair.',
-                  '点「新增 AP」或「新增 UE」，再在场景中连续布点。按 Esc 或点「完成」结束。用「场景设备」里的「计算所有链路」查看每一对 AP–UE 的结果。',
-                )}
-              </p>
-            </div>
+    <div id="sionna-rt-studio-app-frame" className="min-h-screen md:h-screen md:overflow-hidden text-[var(--text-hi)] flex flex-col font-sans">
+      <TopNav backendOnline={backendOnline} />
+      <main className={`flex-1 md:min-h-0 grid grid-cols-1 gap-4 p-4 w-full ${workspace === 'export' ? '' : 'md:grid-cols-[minmax(290px,37%)_minmax(0,1fr)] lg:grid-cols-[400px_minmax(0,1fr)]'}`}>
+        <aside hidden={workspace === 'export'} className="min-w-0 md:min-h-0 md:overflow-y-auto md:pr-1">
+          <div className="flex flex-col gap-4">
+            {workspace === 'scene' && <>
+              <div className="panel p-4 flex flex-wrap items-center justify-between gap-2">
+                <h1 className="panel-title">{t('Scene setup', '仿真场景')}</h1>
+                <button type="button" className={nextButton} onClick={() => openWorkspace('planning')}>
+                  {t('Continue to Planning', '下一步 · 规划')}
+                </button>
+                <button id="btn-use-starter-scene" type="button" className="text-sm text-[var(--accent-deep)] cursor-pointer underline underline-offset-2" onClick={useStarterScene}>
+                  {t('Use the built-in street scene', '使用内置街区')}
+                </button>
+              </div>
+              <MapSelector
+                anchor={mapAnchor} setAnchor={setMapAnchor}
+                tx={tx} rx={rx} txs={txs} rxs={rxs}
+                onTxUpdate={handleTxUpdate} onRxUpdate={handleRxUpdate}
+                onDownloadOSM={handleDownloadOSM} onResetProject={handleResetProject}
+                isLoading={gisLoading} downloadProgress={downloadProgress}
+                trajectoryPoints={EMPTY_TRACK} editableDevices={false}
+              />
+              <SolverControls
+                {...rfControls} section="scene"
+                bandwidthMhz={coverageBandwidthMhz} onBandwidthChange={setCoverageBandwidthMhz}
+                noiseFigureDb={coverageNoiseFigureDb} onNoiseFigureChange={setCoverageNoiseFigureDb}
+                csiSettings={csiSettings} onCsiSettingsChange={setCsiSettings}
+              />
+              <details className="panel p-3">
+                <summary className="cursor-pointer font-semibold">{t('Geometry and radio materials', '几何与无线材质')}</summary>
+                <GeographyPanel buildings={buildings} anchor={anchor} materialIds={materialIds}
+                  materialConfigs={materialList} onMaterialChange={updateMaterial} />
+              </details>
+            </>}
+            {workspace === 'planning' && <>
+              <div className="panel p-4 flex flex-wrap items-center justify-between gap-2">
+                <h1 className="panel-title">{t('Devices and routes', '设备与轨迹规划')}</h1>
+                <button type="button" className={nextButton} onClick={() => openWorkspace('preview')}>
+                  {t('Continue to Preview', '下一步 · 预览')}
+                </button>
+              </div>
+              <DevicePanel
+                txs={txs} rxs={rxs} activeTxId={activeTxId} activeRxId={activeRxId}
+                onSelectTx={(id) => handleSelectPair(id, activeRxId)}
+                onSelectRx={(id) => handleSelectPair(activeTxId, id)}
+                onAddTx={() => startPlacement('add-tx')} onAddRx={() => startPlacement('add-rx')}
+                onRemoveTx={removeTx} onRemoveRx={removeRx}
+              />
+              <PlanningControls
+                tx={tx} rx={rx} anchor={anchor} trajectoryPoints={trajectoryPoints}
+                fronthaulMbps={currentFronthaul[tx.id]}
+                onFronthaulChange={(value) => setFronthaul(prev => ({ ...prev, [tx.id]: value }))}
+                speedKmh={mobilitySpeedKmh} intervalMs={mobilityIntervalMs}
+                onSpeedChange={setMobilitySpeedKmh} onIntervalChange={setMobilityIntervalMs}
+                onClearTrajectory={() => setTrajectoryPoints([])} onTrajectoryChange={setTrajectoryPoints}
+              />
+              <SolverControls {...rfControls} section="planning" />
+            </>}
+            {previewing && <>
+              <div className="panel flex gap-2 p-2" aria-label={t('Preview type', '预览类型')}>
+                <button id="btn-preview-csi" type="button" aria-pressed={activeMode !== 'heatmap'}
+                  className={activeMode !== 'heatmap' ? nextButton : 'px-3 py-2 text-sm cursor-pointer'} onClick={() => setActiveMode('link')}>
+                  {t('Links and CSI', '链路与 CSI')}
+                </button>
+                <button id="btn-preview-coverage" type="button" aria-pressed={activeMode === 'heatmap'}
+                  className={activeMode === 'heatmap' ? nextButton : 'px-3 py-2 text-sm cursor-pointer'} onClick={() => setActiveMode('heatmap')}>
+                  {t('Coverage', '覆盖图')}
+                </button>
+              </div>
+              {activeMode !== 'heatmap' ? <>
+                <CsiPreviewPanel
+                  run={csiRun} stale={csiStale} running={csiRunning}
+                  error={csiIssue ? t(...csiIssue) : ''}
+                  staticDisabledReason={staticDisabledReason} trajectoryDisabledReason={trajectoryDisabledReason}
+                  trajectoryReceiverName={rx.name}
+                  onRun={handleCsiRun} selection={csiSelection}
+                  onSelect={selection => {
+                    setPreviewSource('csi');
+                    setCsiSelection(selection);
+                  }}
+                  link={csiLink} linkLoading={csiLinkLoading} linkError={csiLinkError}
+                  onOpenExport={() => openWorkspace('export')}
+                />
+                <details className="panel p-3 text-sm">
+                  <summary className="cursor-pointer font-semibold">{t('Trajectory metrics and A3 options', '轨迹指标与 A3 设置')}</summary>
+                  <div className="grid gap-2 pt-3">
+                    <label className="flex justify-between gap-2">
+                      {t('Power metric', '功率统计')}
+                      <select value={mobilityCombineMode} onChange={event => setMobilityCombineMode(event.target.value as MobilityCombineMode)}>
+                        <option value="best_server">{t('Strongest AP', '最强 AP')}</option>
+                        <option value="sum">{t('Sum power', '功率相加')}</option>
+                      </select>
+                    </label>
+                    <label className="flex justify-between gap-2">
+                      {t('Hysteresis (dB)', '迟滞（dB）')}
+                      <input type="range" min="0" max="15" step="0.5" value={handoverConfig.hysteresisDb}
+                        onChange={event => setHandoverConfig({ ...handoverConfig, hysteresisDb: Number(event.target.value) })} />
+                      <span>{handoverConfig.hysteresisDb.toFixed(1)}</span>
+                    </label>
+                    <label className="flex justify-between gap-2">
+                      {t('Time-to-trigger (ms)', '触发时间（ms）')}
+                      <select value={handoverConfig.timeToTriggerMs}
+                        onChange={event => setHandoverConfig({ ...handoverConfig, timeToTriggerMs: Number(event.target.value) })}>
+                        {[0, 40, 80, 160, 320, 480, 640, 1024].map(ms => <option key={ms} value={ms}>{ms}</option>)}
+                      </select>
+                    </label>
+                  </div>
+                </details>
+                <details className="panel p-3">
+                  <summary className="cursor-pointer font-semibold">{t('Advanced static link analysis', '高级静态链路分析')}</summary>
+                  <LinkPanel txs={txs} rxs={rxs} activeTxId={activeTxId} activeRxId={activeRxId}
+                    matrix={matrix} matrixLoading={matrixLoading} matrixProgress={matrixProgress}
+                    onSolveMatrix={handleSolveMatrix} onSelectPair={handleSelectPair}
+                    paths={paths} metrics={metrics} onSolve={handleSolve} solving={solving}
+                    solveError={solveError} backendOnline={backendOnline} />
+                  <AnalysisPanel tx={tx} rx={rx} paths={paths} metrics={metrics}
+                    freqGhz={freqGhz} radioMap={radioMap} buildings={buildings} maxDepth={maxDepth}
+                    solverOptions={solverOptions} materials={materialList} backendOnline={backendOnline} />
+                </details>
+              </> : <CoveragePanel
+                txCount={txs.length} backendOnline={backendOnline}
+                onRunHeatmap={handleRunHeatmap} heatmapLoading={loadingHeatmap} radioMap={radioMap}
+                coverageMetric={coverageMetric} setCoverageMetric={setCoverageMetric}
+                coverageBandwidthMhz={coverageBandwidthMhz} coverageNoiseFigureDb={coverageNoiseFigureDb}
+                coverageHeight={coverageHeight} setCoverageHeight={setCoverageHeight}
+                coverageRes={coverageRes} setCoverageRes={setCoverageRes}
+                samplesPerTx={coverageSamplesPerTx} setSamplesPerTx={setCoverageSamplesPerTx}
+                radioMapSeed={radioMapSeed} setRadioMapSeed={setRadioMapSeed}
+                showRaysOnHeatmap={showRaysOnHeatmap} setShowRaysOnHeatmap={setShowRaysOnHeatmap}
+                rmColormap={rmColormap} setRmColormap={setRmColormap}
+                rmAutoRange={rmAutoRange} setRmAutoRange={setRmAutoRange}
+                rmVmin={rmVmin} setRmVmin={setRmVmin} rmVmax={rmVmax} setRmVmax={setRmVmax}
+                solveError={solveError}
+              />}
+            </>}
           </div>
-        </div>
+        </aside>
+
+        <section className={workspace === 'export' ? 'hidden' : 'min-w-0 min-h-[420px] md:min-h-0 flex flex-col'}>
+          <ThreeStudio
+            buildings={buildings} anchor={anchor} tx={viewedTx} rx={viewedRx} txs={txs} rxs={rxs}
+            activeTxId={viewedTx.id} activeRxId={viewedRx.id}
+            paths={shownPaths} matrixPaths={previewing && !showingCsi ? matrixPaths : undefined}
+            showRaysOnHeatmap={showRaysOnHeatmap} radioMap={previewing ? radioMap : null}
+            rmColormap={rmColormap} rmAutoRange={rmAutoRange} rmVmin={rmVmin} rmVmax={rmVmax}
+            onPlaceDevice={placeDevice} editing={workspace === 'planning'} visible={workspace !== 'export'}
+            activeMode={trajectoryView ? 'playback' : previewing && activeMode === 'heatmap' ? 'heatmap' : 'link'}
+            placementMode={workspace === 'planning' ? placementMode : 'none'} setPlacementMode={setPlacementMode}
+            showOutlines={showOutlines} setShowOutlines={setShowOutlines}
+            mobilityRxPosition={previewPosition ? { x: previewPosition[0], y: previewPosition[1], z: previewPosition[2] } : null}
+            trajectoryPoints={workspace === 'planning' || trajectoryView
+              ? (Object.hasOwn(trajectoriesByRxId, viewedRx.id) ? trajectoriesByRxId[viewedRx.id] : EMPTY_TRACK) : EMPTY_TRACK}
+            setTrajectoryPoints={setTrajectoryPoints}
+          />
+        </section>
+
+        {workspace === 'export' && (
+          <section className="min-w-0 md:min-h-0 md:overflow-y-auto">
+            <ExportPanel
+              buildings={buildings} anchor={anchor} paths={paths}
+              txs={txs} rxs={rxs} tx={tx} rx={rx} freqGhz={freqGhz} maxDepth={maxDepth}
+              solverOptions={solverOptions} radioMap={radioMap} materials={materialList}
+              projectState={projectState} autosaveStatus={autosaveStatus}
+              onImportProject={handleImportProject} onResetProject={handleResetProject}
+              csiRun={csiRun} csiStale={csiStale} csiGrid={csiGrid} fronthaulMbpsByTxId={currentFronthaul}
+              onOpenPreview={() => openWorkspace('preview')}
+            />
+          </section>
+        )}
       </main>
+      <WorkflowNav activeWorkspace={workspace} onSelect={openWorkspace} />
     </div>
   );
 }

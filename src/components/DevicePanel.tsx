@@ -4,7 +4,7 @@
  */
 
 import React from 'react';
-import { Radio, Zap } from 'lucide-react';
+import { Radio } from 'lucide-react';
 import { useI18n } from '../i18n';
 import type { Receiver, Transmitter } from '../types';
 import { DeviceRow } from './DeviceRow';
@@ -20,15 +20,11 @@ interface DevicePanelProps {
   onRemoveRx: (id: string) => void;
   onAddTx: () => void;
   onAddRx: () => void;
-  onSolveAll: () => void;
-  solveAllDisabled: boolean;
-  solvingAll: boolean;
 }
 
 export function DevicePanel({
   txs, rxs, activeTxId, activeRxId,
   onSelectTx, onSelectRx, onRemoveTx, onRemoveRx, onAddTx, onAddRx,
-  onSolveAll, solveAllDisabled, solvingAll,
 }: DevicePanelProps) {
   const { t } = useI18n();
   return (
@@ -45,19 +41,6 @@ export function DevicePanel({
           '点击「新增」，再在三维场景中连续点击布点，按 Esc 结束。点选列表中的设备可编辑或移动它。',
         )}
       </p>
-      {txs.length * rxs.length > 1 && (
-        <button
-          id="btn-quick-solve-matrix"
-          type="button"
-          onClick={onSolveAll}
-          disabled={solveAllDisabled || solvingAll}
-          className="btn-signal flex w-full cursor-pointer items-center justify-center gap-1.5 rounded px-3 py-2 text-[13px] font-bold disabled:cursor-not-allowed"
-        >
-          <Zap aria-hidden="true" className={`h-3.5 w-3.5 ${solvingAll ? 'animate-pulse' : ''}`} />
-          {solvingAll ? t('Solving all links…', '正在计算所有链路…') : t('Solve all links', '计算所有链路')}
-          <span className="font-mono text-[11px] opacity-80">{txs.length} × {rxs.length}</span>
-        </button>
-      )}
     </section>
   );
 }

@@ -19,9 +19,7 @@ interface CoveragePanelProps {
   coverageMetric: CoverageMetric;
   setCoverageMetric: (m: CoverageMetric) => void;
   coverageBandwidthMhz: number;
-  setCoverageBandwidthMhz: (v: number) => void;
   coverageNoiseFigureDb: number;
-  setCoverageNoiseFigureDb: (v: number) => void;
   coverageHeight: number;
   setCoverageHeight: (v: number) => void;
   coverageRes: number;
@@ -53,9 +51,7 @@ export function CoveragePanel({
   coverageMetric,
   setCoverageMetric,
   coverageBandwidthMhz,
-  setCoverageBandwidthMhz,
   coverageNoiseFigureDb,
-  setCoverageNoiseFigureDb,
   coverageHeight,
   setCoverageHeight,
   coverageRes,
@@ -135,26 +131,12 @@ export function CoveragePanel({
 
       {/* Noise model — only affects interference-aware SINR */}
       {coverageMetric === 'sinr' && (
-        <div className="grid grid-cols-2 gap-3.5">
-          <div className="flex flex-col gap-1">
-            <label className="text-[12px] text-slate-600 font-bold">{t("Bandwidth: ", "带宽 ")}{coverageBandwidthMhz} MHz</label>
-            <input
-              type="range" min="1" max="400" step="1"
-              className="accent-[#cc785c] cursor-ew-resize"
-              value={coverageBandwidthMhz}
-              onChange={(e) => setCoverageBandwidthMhz(parseInt(e.target.value, 10))}
-            />
-          </div>
-          <div className="flex flex-col gap-1">
-            <label className="text-[12px] text-slate-600 font-bold">{t("Noise Figure: ", "噪声系数 ")}{coverageNoiseFigureDb} dB</label>
-            <input
-              type="range" min="0" max="15" step="0.5"
-              className="accent-[#cc785c] cursor-ew-resize"
-              value={coverageNoiseFigureDb}
-              onChange={(e) => setCoverageNoiseFigureDb(parseFloat(e.target.value))}
-            />
-          </div>
-        </div>
+        <p className="text-[12px] text-slate-600">
+          {t(
+            `Scene settings · ${coverageBandwidthMhz} MHz bandwidth · ${coverageNoiseFigureDb} dB noise figure`,
+            `场景设置 · 带宽 ${coverageBandwidthMhz} MHz · 噪声系数 ${coverageNoiseFigureDb} dB`,
+          )}
+        </p>
       )}
 
       <div className="grid grid-cols-2 gap-3.5 bg-[#f5f3ec] border border-[#e3e0d6] rounded p-2.5">

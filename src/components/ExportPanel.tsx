@@ -4,10 +4,11 @@
  */
 
 import { useI18n, type LocalizedText } from '../i18n';
-import React, { useRef, useState } from 'react';
+import React, { useLayoutEffect, useRef, useState } from 'react';
 import { Transmitter, Receiver, BuildingFootprint, GeoAnchor, PropagationPath, RadioMapGrid, SolverOptions, MaterialConfig, ChannelGridConfig } from '../types';
 import { exportGeoJSON, exportOBJ3D, exportPropagationCSV, exportCoverageChannelGrid } from '../utils';
-import { exportCIR, CIRFormat, exportCIRBundle, exportChannelGrid, exportScene } from '../api';
+import { exportCIR, CIRFormat, exportCIRBundle, exportChannelGrid, exportCsiRun, exportScene } from '../api';
+import type { CIRExportOptions, CsiRun } from '../api';
 import { createProjectDocument, StudioProjectState } from '../project';
 import { FileDown, FileSpreadsheet, Box, Compass, Database, AlertOctagon, Waves, Loader2, FileUp, Save, Package, RotateCcw, Fingerprint } from 'lucide-react';
 import { NumberField } from './NumberField';
@@ -15,6 +16,7 @@ import { NumberField } from './NumberField';
 // Backend cap on ray-traced channel-grid cells (MAX_CHANNEL_GRID_CELLS in
 // backend/solver.py) — keep in sync so the UI blocks over-cap exports up front.
 const CHANNEL_GRID_MAX_CELLS = 16384;
+const DEFAULT_CSI_GRID: CIRExportOptions = { numSubcarriers: 1024, subcarrierSpacing: 30_000, normalizeDelays: true };
 
 interface ExportPanelProps {
   buildings: BuildingFootprint[];
@@ -33,6 +35,11 @@ interface ExportPanelProps {
   autosaveStatus: 'saving' | 'saved' | 'error';
   onResetProject: () => void;
   onImportProject: (text: string) => void;
+  csiRun?: CsiRun | null;
+  csiStale?: boolean;
+  csiGrid?: CIRExportOptions;
+  fronthaulMbpsByTxId?: Record<string, number | null>;
+  onOpenPreview?: () => void;
 }
 
 const canonicalize = (value: unknown): unknown => {
@@ -70,12 +77,18 @@ function SectionHeading({ title, hint }: { title: string; hint: string }) {
 export function ExportPanel({
   buildings, anchor, paths, txs, rxs, tx, rx, freqGhz, maxDepth, solverOptions,
   radioMap, materials, projectState, autosaveStatus, onImportProject, onResetProject,
+  csiRun = null, csiStale = false, csiGrid = DEFAULT_CSI_GRID, fronthaulMbpsByTxId = {}, onOpenPreview,
 }: ExportPanelProps) {
   const { t } = useI18n();
-  // Channel impulse/frequency response (CIR/CFR) export configuration.
-  const [numSubcarriers, setNumSubcarriers] = useState(1024);
-  const [subcarrierSpacingKhz, setSubcarrierSpacingKhz] = useState(30); // 5G NR µ=1
-  const [normalizeDelays, setNormalizeDelays] = useState(true);
+  const { numSubcarriers, subcarrierSpacing, normalizeDelays } = csiGrid;
+  const exportableRunId = csiStale ? null : csiRun?.runId ?? null;
+  const csiRequest = useRef<symbol | null>(null);
+  const [csiBusy, setCsiBusy] = useState(false);
+  const [csiError, setCsiError] = useState<{ runId: string; message: string } | null>(null);
+  useLayoutEffect(() => {
+    setCsiBusy(false);
+    return () => { csiRequest.current = null; };
+  }, [exportableRunId]);
   const [cirBusy, setCirBusy] = useState<CIRFormat | 'bundle' | null>(null);
   const [cirError, setCirError] = useState('');
   const [exportAllDevices, setExportAllDevices] = useState(false);
@@ -105,7 +118,29 @@ export function ExportPanel({
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const handleExportCsiRun = async () => {
+    if (!csiRun || !exportableRunId || csiRequest.current) return;
+    const request = Symbol();
+    csiRequest.current = request;
+    setCsiBusy(true);
+    setCsiError(null);
+    try {
+      const fronthaul = Object.fromEntries(csiRun.txIds.map((id) => [id, fronthaulMbpsByTxId[id] ?? null]));
+      const { blob, filename } = await exportCsiRun(exportableRunId, fronthaul);
+      if (csiRequest.current === request) triggerDownload(blob, filename);
+    } catch (error) {
+      if (csiRequest.current === request) {
+        setCsiError({ runId: exportableRunId, message: error instanceof Error ? error.message : t('CSI download failed', 'CSI 下载失败') });
+      }
+    } finally {
+      if (csiRequest.current === request) {
+        csiRequest.current = null;
+        setCsiBusy(false);
+      }
+    }
   };
 
   const handleExportGeoJSON = () => {
@@ -271,11 +306,7 @@ export function ExportPanel({
         maxDepth,
         solverOptions,
         format,
-        {
-          numSubcarriers: Math.max(1, Math.round(numSubcarriers)),
-          subcarrierSpacing: Math.max(1, subcarrierSpacingKhz) * 1e3,
-          normalizeDelays,
-        },
+        csiGrid,
         materials,
         exportAllDevices ? { txs, rxs } : undefined,
       );
@@ -322,11 +353,7 @@ export function ExportPanel({
         freqGhz,
         maxDepth,
         solverOptions,
-        {
-          numSubcarriers: Math.max(1, Math.round(numSubcarriers)),
-          subcarrierSpacing: Math.max(1, subcarrierSpacingKhz) * 1e3,
-          normalizeDelays,
-        },
+        csiGrid,
         materials,
       );
       triggerDownload(blob, filename);
@@ -372,6 +399,54 @@ export function ExportPanel({
 
       {/* Grid of exporter cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <section id="csi-run-export-panel" className="md:col-span-2 flex flex-col gap-3 rounded border border-[var(--line)] bg-[#f5f3ec] p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h4 className="panel-title flex items-center gap-2">
+              <Waves className="w-4 h-4 text-[#4a727e]" aria-hidden="true" />
+              {t('CSI from Preview', '本次预览的 CSI')}
+            </h4>
+            {csiRun && !csiStale && <span className="rounded border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-800">{t('Ready', '可导出')}</span>}
+          </div>
+          {csiRun && (
+            <div className="grid gap-2 text-xs text-slate-700 sm:grid-cols-2">
+              <p>{csiRun.mode === 'static' ? t('Static all links', '静态全链路') : t('Selected UE trajectory', '所选 UE 轨迹')} · {csiRun.txIds.length} AP · {csiRun.rxIds.length} UE</p>
+              <p>{t(`${csiRun.timeSeconds.length} samples`, `${csiRun.timeSeconds.length} 个时刻`)} · {csiRun.carrierFrequencyGhz} GHz · {csiRun.numSubcarriers} × {csiRun.subcarrierSpacing / 1e3} kHz</p>
+              <p className="sm:col-span-2">
+                <span className="readout">H [{csiRun.shape.join(' × ')}]</span>{' '}
+                <span className="text-slate-500">{t('Time · UE · Rx port · AP · Tx port · subcarrier', '时间 · UE · Rx 端口 · AP · Tx 端口 · 子载波')}</span>
+              </p>
+            </div>
+          )}
+          {(!csiRun || csiStale) && (
+            <p role="status" className="text-xs text-slate-600">
+              {csiStale ? t('Inputs have changed. Run Preview again before exporting.', '输入已变化，请重新计算预览后再导出。') : t('Generate a static or trajectory result in Preview to export CSI.', '请先在预览页计算静态全链路或 UE 轨迹。')}
+            </p>
+          )}
+          {csiRun && !csiStale && (
+            <p className="text-xs text-slate-600">
+              {t('The ZIP includes the computed csi.npz and manifest.json with current AP fronthaul settings.', 'ZIP 包含本次计算的 csi.npz，以及记录当前 AP 前传配置的 manifest.json。')}
+            </p>
+          )}
+          {csiError && csiError.runId === csiRun?.runId && <p role="alert" className="text-xs text-red-700">{csiError.message}</p>}
+          <div className="flex flex-wrap gap-2">
+            <button
+              id="btn-export-csi-run"
+              type="button"
+              onClick={handleExportCsiRun}
+              disabled={!csiRun || csiStale || csiBusy}
+              className="flex items-center gap-1.5 rounded bg-[var(--accent)] px-3 py-2 text-sm font-bold text-white hover:bg-[var(--accent-deep)] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {csiBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileDown className="w-4 h-4" />}
+              {csiBusy ? t('Preparing ZIP…', '正在打包…') : t('Download CSI + manifest (.zip)', '下载 CSI 与清单（.zip）')}
+            </button>
+            {onOpenPreview && (!csiRun || csiStale || csiError?.runId === csiRun.runId) && (
+              <button type="button" id="btn-return-to-preview" onClick={onOpenPreview} className="rounded border border-[var(--line)] bg-white px-3 py-2 text-sm font-semibold text-slate-800 hover:border-[var(--accent)]">
+                {t('Go to Preview', '前往预览')}
+              </button>
+            )}
+          </div>
+        </section>
+
         {/* Project session. Studio state rather than a research artifact, so it
             reads as a control strip and stays above the exports — save, restore,
             and reset are what people reach for first. */}
@@ -441,11 +516,13 @@ export function ExportPanel({
           )}
         </div>
 
+        <details className="md:col-span-2 rounded border border-[var(--line)] p-3">
+          <summary className="cursor-pointer px-1 py-1 text-sm font-semibold text-slate-800">{t('Advanced exports', '高级导出')}</summary>
+          <div className="mt-3 grid grid-cols-1 gap-4 md:grid-cols-2">
         <SectionHeading
-          title={t("Channel data", "信道数据")}
-          hint={t("Sionna RT channel tensors — the primary research artifacts", "Sionna RT 信道张量，用于无线研究")}
+          title={t("Additional channel data", "其他信道数据")}
+          hint={t("Independent CIR/CFR and grid experiments", "独立的 CIR/CFR 和栅格实验")}
         />
-        {/* Native Sionna channel tensors. The reason most people open this tab. */}
         <div className="md:col-span-2 bg-[#f5f3ec] p-5 rounded border border-[#e3e0d6] flex flex-col gap-4 shadow-md hover:border-[#cc785c]/40 transition duration-240">
           <div className="flex items-start justify-between">
             <div className="p-3 bg-[#ebe7dc] border border-[#e3e0d6] rounded text-[#141413] shadow-inner">
@@ -515,44 +592,9 @@ export function ExportPanel({
             </div>
           )}
 
-          {/* OFDM grid configuration */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <label className="flex flex-col gap-1">
-              <span className="text-[11px] font-bold text-slate-600">{t("Subcarriers · CFR only", "子载波数 · 仅 CFR")}</span>
-              <NumberField
-                integer
-                min={1}
-                max={8192}
-                value={numSubcarriers}
-                onChange={setNumSubcarriers}
-                className="bg-white border border-[#e3e0d6] rounded px-2 py-1.5 text-[14px] text-slate-900 focus:border-[var(--accent)] focus:outline-none"
-              />
-            </label>
-            <label className="flex flex-col gap-1">
-              <span className="text-[11px] font-bold text-slate-600">{t("Spacing · CFR only (kHz)", "子载波间隔 · 仅 CFR（kHz）")}</span>
-              <NumberField
-                min={1}
-                max={3840}
-                value={subcarrierSpacingKhz}
-                onChange={setSubcarrierSpacingKhz}
-                className="bg-white border border-[#e3e0d6] rounded px-2 py-1.5 text-[14px] text-slate-900 focus:border-[var(--accent)] focus:outline-none"
-              />
-            </label>
-            <label className="flex flex-col gap-1 justify-end">
-              <span className="text-[11px] font-bold text-slate-600">{t("Normalize delays", "归一化时延")}</span>
-              <button
-                type="button"
-                onClick={() => setNormalizeDelays((v) => !v)}
-                className={`px-2 py-1.5 text-[14px] font-bold rounded border transition ${
-                  normalizeDelays
-                    ? 'bg-[var(--accent)] text-white border-transparent'
-                    : 'bg-white text-slate-600 border-[#e3e0d6]'
-                }`}
-              >
-                {normalizeDelays ? t('ON (τ₀ = 0)', "开启（τ₀ = 0）") : t('OFF (absolute τ)', "关闭（绝对时延 τ）")}
-              </button>
-            </label>
-          </div>
+          <p className="rounded border border-[var(--line)] bg-white px-3 py-2 text-xs text-slate-700">
+            {t('Scene OFDM settings', '场景 OFDM 设置')} · {numSubcarriers} × {subcarrierSpacing / 1e3} kHz · {normalizeDelays ? t('Normalized delay', '归一化时延') : t('Absolute delay', '绝对时延')}
+          </p>
 
           {cirError && (
             <div className="flex items-center gap-1.5 bg-[#f9efec] border border-[#d9aaa2] text-[#b4483c] rounded py-1.5 px-3 text-[12px] font-semibold">
@@ -603,7 +645,7 @@ export function ExportPanel({
           </div>
           {paths.length === 0 && (
             <p className="text-[11px] text-slate-500 font-medium leading-normal -mt-1">
-              {t("Solve a Tx→Rx link first (Link mode) to enable CIR/CFR export.", "请先在链路模式计算一条链路，再导出 CIR/CFR。")}
+              {t("To enable these CIR/CFR formats, solve a link under Advanced static link analysis in Preview.", "如需使用这些 CIR/CFR 格式，请先在预览页的「高级静态链路分析」中计算一条链路。")}
             </p>
           )}
         </div>
@@ -857,6 +899,9 @@ export function ExportPanel({
             {t("Download Propagation CSV", "下载传播路径 CSV")}
           </button>
         </div>
+
+          </div>
+        </details>
 
         <SectionHeading
           title={t("Scene geometry", "场景几何")}

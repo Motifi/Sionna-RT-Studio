@@ -1,8 +1,8 @@
 # Sionna RT Studio
 
-使用 NVIDIA Sionna RT 做交互式无线传播仿真。可以导入 OpenStreetMap 建筑，在三维场景中放置多个 AP 和 UE，计算全链路矩阵、覆盖图和移动轨迹上的传播路径。界面支持中文和英文，并提供 Apple Silicon macOS 桌面版。
+使用 NVIDIA Sionna RT 做交互式无线传播仿真。四个工作区覆盖场景配置、AP 与 UE 规划、CSI 预览和数据导出。界面支持中文和英文，并提供 Apple Silicon macOS 桌面版。
 
-An interactive wireless propagation studio built on NVIDIA Sionna RT. Import OpenStreetMap buildings, place multiple APs and UEs in 3D, and trace all device pairs, coverage maps, or a receiver trajectory. The interface supports Chinese and English, including a desktop app for Apple Silicon Macs.
+An interactive wireless propagation studio built on NVIDIA Sionna RT. Four workspaces cover scene setup, device planning, CSI preview, and export. The interface supports Chinese and English, including a desktop app for Apple Silicon Macs.
 
 ## 安装与运行 · Setup
 
@@ -40,19 +40,44 @@ open build/SionnaRTStudio.app
 
 The app opens in its own window and stops its local service when it quits. Keep the Python environment selected at build time available. See the [desktop build notes](desktop/README.md) for details.
 
-## 快速上手 · First run
+## 四个工作区 · Four workspaces
 
-1. 在**三维场景**中从默认的一台 AP 和一台 UE 开始。点击 **+ 新增 AP** 后在场景中点一次，再按 **Esc** 或点 **完成**。
-2. 点击 **+ 新增 UE**，在场景中点击两个不同位置，再结束布点。此时应有 2 台 AP 和 3 台 UE。可在**场景设备**中选中终端，再点击 **移动所选 UE** 调整位置。
-3. 点击 **计算所有链路**。在 **AP × UE 链路矩阵**中查看 6 条链路的接收功率。点击矩阵中的单元格可查看这对设备的射线路径。
+1. **场景**选择内置场景或导入 OSM 建筑，设置载频、系统带宽、传播机制和 CSI 子载波网格。默认的 100 MHz 系统带宽与 1024 × 30 kHz 的 CSI 网格分别设置。
+2. **规划**使用三维工具栏新增和移动 AP、UE。选中 AP 可设置阵列、功率、波束方向和前传容量。选中 UE 后用「绘制轨迹」添加控制点，并设置速度和采样间隔。
+3. **预览**计算静态全链路或所选 UE 轨迹。试算时可在场景页选择较少的每源射线采样数。2 台 AP 和 3 台 UE 会生成 6 条静态链路。移动模式追踪一台 UE 与全部 AP 的链路。
+4. **导出**下载本次预览的 CSI ZIP。切换工作区后仍可查看本次运行。更改传播输入后，在预览页重新计算。
 
-1. Start in **3D scene** with the default AP and UE. Select **+ Add AP**, click once in the scene, and press **Esc** or **Done**.
-2. Select **+ Add UE**, click two distinct locations, and finish placement. You should have 2 APs and 3 UEs. Select a receiver under **Scene devices** and use **Move selected UE** to adjust its position.
-3. Select **Solve all links**. The **AP × UE Link Matrix** shows received power for six pairs. Select a cell to inspect its propagation paths.
+1. **Scene** opens the built-in scene or imports OSM buildings. Set the carrier, system bandwidth, propagation mechanisms, and CSI subcarrier grid. The default system bandwidth is 100 MHz, and the CSI grid uses 1024 subcarriers spaced at 30 kHz.
+2. **Planning** places and moves APs and UEs. Select an AP to edit its array, power, orientation, and fronthaul capacity. Select a UE to draw its trajectory and set the speed and sampling interval.
+3. **Preview** solves all static links or one selected UE's trajectory. Choose a lower ray sample count in Scene for a quick check. Two APs and three UEs produce six static links. A trajectory run traces one moving UE against all APs.
+4. **Export** saves the CSI ZIP from the Preview run. You can revisit a run after switching workspaces. Recompute in Preview after changing propagation inputs.
 
-**移动轨迹**模式使用当前选中的单台 UE。仿真会追踪所有 AP 到该 UE 沿途各采样位置的链路，可查看传播和服务 AP 的变化。在线底图和建筑导入需要网络，默认场景可直接计算。
+在线底图和建筑导入需要网络，内置场景可直接计算。更新后，Web 版请强制刷新，桌面版请退出旧应用后打开新构建。
 
-**Trajectory** mode follows the currently selected UE and traces every AP to its sampled positions. Use it to inspect propagation and serving-AP changes along the path. Map tiles and building imports need a network connection. You can run solves directly in the built-in scene.
+Map tiles and building imports need a network connection. The built-in scene is ready to solve. After updating, hard-refresh the web page or quit the old desktop app and open the new build.
+
+## CSI 文件 · CSI files
+
+ZIP 包含 `csi.npz` 和 `manifest.json`。复数 `h_freq` 的轴顺序为 `[时间, UE, Rx 端口, AP, Tx 端口, 子载波]`。静态计算的时间维为 1，轨迹计算的 UE 维为 1。清单记录设备 ID、实际采样时间和位置、基带频率轴、时延参考及求解设置。逐 AP 前传容量以 Mb/s 记录在 `fronthaulMbpsByTxId`，`null` 表示未设置。调整前传容量后可复用同一份 CSI。
+
+The ZIP contains `csi.npz` and `manifest.json`. Complex `h_freq` uses the axis order `[time, UE, Rx port, AP, Tx port, subcarrier]`. Static runs have one time sample, and trajectory runs have one UE. The manifest records device IDs, actual sample times and positions, the baseband frequency axis, delay reference, and solver settings. AP fronthaul capacities are exported in Mb/s under `fronthaulMbpsByTxId`, with `null` for an unspecified capacity. The same CSI can be exported with revised fronthaul metadata.
+
+默认将每条链路的时延以该链路首径为参考。需要保留 AP 间传播时延差时，可在「场景」中选择绝对时延后计算。
+
+By default, each link uses its own first arrival as the delay reference. To preserve relative propagation delays across APs, select absolute delays in Scene before running CSI.
+
+```python
+from io import BytesIO
+from zipfile import ZipFile
+
+import numpy as np
+
+with ZipFile("your-csi-run.zip") as archive:
+    with np.load(BytesIO(archive.read("csi.npz"))) as data:
+        H = data["h_freq"]
+        time_seconds = data["time_seconds"]
+        frequencies_hz = data["frequencies"]
+```
 
 ## 研究导出与检查 · Research exports and checks
 

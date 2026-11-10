@@ -167,6 +167,8 @@ interface ThreeStudioProps {
   rmVmin: number;
   rmVmax: number;
   onPlaceDevice: (mode: DevicePlacement, enu: ENUVector) => void;
+  editing: boolean;
+  visible: boolean;
   activeMode: 'link' | 'heatmap' | 'playback';
   placementMode: PlacementMode;
   setPlacementMode: (mode: PlacementMode) => void;
@@ -203,6 +205,8 @@ export function ThreeStudio({
   rmVmin,
   rmVmax,
   onPlaceDevice,
+  editing,
+  visible,
   activeMode,
   placementMode,
   setPlacementMode,
@@ -224,11 +228,11 @@ export function ThreeStudio({
   const [pathDrawingMode, setPathDrawingMode] = useState(false);
 
   const [hoveredCoordinate, setHoveredCoordinate] = useState<ENUVector | null>(null);
-  const drawingTrajectory = activeMode === 'playback' && pathDrawingMode && placementMode === 'none';
+  const drawingTrajectory = editing && pathDrawingMode && placementMode === 'none';
 
   useEffect(() => {
-    if (activeMode !== 'playback' || placementMode !== 'none') setPathDrawingMode(false);
-  }, [activeMode, placementMode]);
+    if (!editing || placementMode !== 'none') setPathDrawingMode(false);
+  }, [editing, placementMode]);
 
   useEffect(() => {
     if (placementMode === 'none' && !drawingTrajectory) return;
@@ -269,6 +273,7 @@ export function ThreeStudio({
     trajectoryPoints,
     setTrajectoryPoints,
     onPlaceDevice,
+    visible,
   });
 
   useEffect(() => {
@@ -298,13 +303,14 @@ export function ThreeStudio({
       trajectoryPoints,
       setTrajectoryPoints,
       onPlaceDevice,
+      visible,
     };
-  }, [buildings, anchor, tx, rx, txs, rxs, activeTxId, activeRxId, paths, matrixPaths, showRaysOnHeatmap, radioMap, rmColormap, rmAutoRange, rmVmin, rmVmax, placementMode, activeMode, cameraMode, showOutlines, drawingTrajectory, mobilityRxPosition, trajectoryPoints, setTrajectoryPoints, onPlaceDevice]);
+  }, [buildings, anchor, tx, rx, txs, rxs, activeTxId, activeRxId, paths, matrixPaths, showRaysOnHeatmap, radioMap, rmColormap, rmAutoRange, rmVmin, rmVmax, placementMode, activeMode, cameraMode, showOutlines, drawingTrajectory, mobilityRxPosition, trajectoryPoints, setTrajectoryPoints, onPlaceDevice, visible]);
 
   useEffect(() => {
     if (!containerRef.current || !canvasRef.current) return;
 
-    const width = containerRef.current.clientWidth;
+    const width = Math.max(1, containerRef.current.clientWidth);
     const height = containerRef.current.clientHeight || 580;
 
     // 1. Initial Scene Setup
@@ -1135,6 +1141,7 @@ export function ThreeStudio({
 
     const animate = () => {
       animationFrameId = requestAnimationFrame(animate);
+      if (!stateRef.current.visible) return;
 
       // FPS tracking counter (skip the state update when the reading is stable
       // so an idle scene doesn't re-render React every second).
@@ -1186,6 +1193,7 @@ export function ThreeStudio({
     const resizeObserver = new ResizeObserver(() => {
       if (!containerRef.current) return;
       const w = containerRef.current.clientWidth;
+      if (w === 0) return;
       const h = containerRef.current.clientHeight || 580;
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
@@ -1263,7 +1271,7 @@ export function ThreeStudio({
         <div className="absolute bottom-4 left-4 right-4 flex flex-wrap justify-between items-center gap-3 bg-white/95 backdrop-blur-md border border-slate-200 p-2 rounded shadow-lg z-10 pointer-events-auto">
           {/* Quick Nodes Placement Actions */}
           <div className="flex flex-wrap items-center gap-2">
-            {placementButtons.map(({ mode, label, title }) => (
+            {editing && placementButtons.map(({ mode, label, title }) => (
               <button
                 key={mode}
                 id={`btn-${mode}`}
@@ -1318,7 +1326,7 @@ export function ThreeStudio({
                     : t('Screenshot', '截图')}
             </button>
 
-            {activeMode === 'playback' && (
+            {editing && (
               <>
                 <button
                   id="btn-draw-3d-mobility-path"

@@ -12,11 +12,23 @@ import {
   Transmitter,
 } from './types';
 
-export const PROJECT_SCHEMA_VERSION = 1;
+export const PROJECT_SCHEMA_VERSION = 2;
+// Keep the existing storage key so an upgrade can read and migrate the autosave.
 export const PROJECT_STORAGE_KEY = 'sionna-rt-studio.project.v1';
 
-export type StudioNavTab = '3d_scene' | 'geography' | 'analysis' | 'export';
+export type StudioWorkspace = 'scene' | 'planning' | 'preview' | 'export';
 export type StudioMode = 'link' | 'heatmap' | 'playback';
+export interface StudioCsiSettings {
+  numSubcarriers: number;
+  subcarrierSpacingKhz: number;
+  normalizeDelays: boolean;
+}
+
+export const DEFAULT_CSI_SETTINGS: StudioCsiSettings = {
+  numSubcarriers: 1024,
+  subcarrierSpacingKhz: 30,
+  normalizeDelays: true,
+};
 
 export interface StudioProjectState {
   scene: {
@@ -28,6 +40,7 @@ export interface StudioProjectState {
     receivers: Receiver[];
     activeTxId: string;
     activeRxId: string;
+    fronthaulMbpsByTxId: Record<string, number | null>;
   };
   solver: {
     carrierFrequencyGhz: number;
@@ -35,6 +48,7 @@ export interface StudioProjectState {
     options: SolverOptions;
     materialConfigs: Record<string, MaterialConfig>;
   };
+  csi: StudioCsiSettings;
   coverage: {
     metric: CoverageMetric;
     bandwidthMhz: number;
@@ -45,14 +59,14 @@ export interface StudioProjectState {
     seed: number;
   };
   mobility: {
-    trajectoryPoints: TrajectoryPoint[];
+    trajectoriesByRxId: Record<string, TrajectoryPoint[]>;
     combineMode: MobilityCombineMode;
     handover: HandoverConfig;
     speedKmh: number;
     intervalMs: number;
   };
   display: {
-    activeNavTab: StudioNavTab;
+    workspace: StudioWorkspace;
     activeMode: StudioMode;
     showOutlines: boolean;
     showRaysOnHeatmap: boolean;
@@ -162,11 +176,12 @@ const isMaterialConfig = (value: unknown): value is MaterialConfig =>
 
 const isProjectState = (value: unknown): value is StudioProjectState => {
   if (!isRecord(value)) return false;
-  const { scene, devices, solver, coverage, mobility, display } = value;
+  const { scene, devices, solver, csi, coverage, mobility, display } = value;
   if (
     !isRecord(scene) ||
     !isRecord(devices) ||
     !isRecord(solver) ||
+    !isRecord(csi) ||
     !isRecord(coverage) ||
     !isRecord(mobility) ||
     !isRecord(display)
@@ -189,11 +204,18 @@ const isProjectState = (value: unknown): value is StudioProjectState => {
     transmitters.some((tx) => tx.id === devices.activeTxId) &&
     typeof devices.activeRxId === 'string' &&
     receivers.some((rx) => rx.id === devices.activeRxId) &&
+    isRecord(devices.fronthaulMbpsByTxId) &&
+    Object.entries(devices.fronthaulMbpsByTxId).every(([id, capacity]) =>
+      transmitters.some(tx => tx.id === id) && (capacity === null || (isFiniteNumber(capacity) && capacity >= 0)),
+    ) &&
     isFiniteNumber(solver.carrierFrequencyGhz) &&
     isFiniteNumber(solver.maxDepth) &&
     isSolverOptions(solver.options) &&
     isRecord(materialConfigs) &&
     Object.values(materialConfigs).every(isMaterialConfig) &&
+    isFiniteNumber(csi.numSubcarriers) && Number.isInteger(csi.numSubcarriers) && csi.numSubcarriers > 0 &&
+    isFiniteNumber(csi.subcarrierSpacingKhz) && csi.subcarrierSpacingKhz > 0 &&
+    typeof csi.normalizeDelays === 'boolean' &&
     ['power', 'sinr'].includes(String(coverage.metric)) &&
     isFiniteNumber(coverage.bandwidthMhz) &&
     isFiniteNumber(coverage.noiseFigureDb) &&
@@ -201,15 +223,17 @@ const isProjectState = (value: unknown): value is StudioProjectState => {
     isFiniteNumber(coverage.gridStepM) &&
     isFiniteNumber(coverage.samplesPerTx) &&
     isFiniteNumber(coverage.seed) &&
-    Array.isArray(mobility.trajectoryPoints) &&
-    mobility.trajectoryPoints.every(isTrajectoryPoint) &&
+    isRecord(mobility.trajectoriesByRxId) &&
+    Object.entries(mobility.trajectoriesByRxId).every(([id, points]) =>
+      receivers.some(rx => rx.id === id) && Array.isArray(points) && points.every(isTrajectoryPoint),
+    ) &&
     ['best_server', 'sum'].includes(String(mobility.combineMode)) &&
     isRecord(mobility.handover) &&
     isFiniteNumber(mobility.handover.hysteresisDb) &&
     isFiniteNumber(mobility.handover.timeToTriggerMs) &&
     isFiniteNumber(mobility.speedKmh) &&
     isFiniteNumber(mobility.intervalMs) &&
-    ['3d_scene', 'geography', 'analysis', 'export'].includes(String(display.activeNavTab)) &&
+    ['scene', 'planning', 'preview', 'export'].includes(String(display.workspace)) &&
     ['link', 'heatmap', 'playback'].includes(String(display.activeMode)) &&
     typeof display.showOutlines === 'boolean' &&
     typeof display.showRaysOnHeatmap === 'boolean' &&
@@ -218,6 +242,24 @@ const isProjectState = (value: unknown): value is StudioProjectState => {
     isFiniteNumber(display.radioMapVmin) &&
     isFiniteNumber(display.radioMapVmax);
 };
+
+function migrateV1(value: unknown): unknown {
+  if (!isRecord(value) || !isRecord(value.devices) || !isRecord(value.mobility) || !isRecord(value.display)) {
+    return value;
+  }
+  const { trajectoryPoints, ...mobility } = value.mobility;
+  const { activeNavTab, ...display } = value.display;
+  const workspaces = new Map<string, StudioWorkspace>([
+    ['3d_scene', 'planning'], ['geography', 'scene'], ['analysis', 'preview'], ['export', 'export'],
+  ]);
+  return {
+    ...value,
+    devices: { ...value.devices, fronthaulMbpsByTxId: {} },
+    csi: { ...DEFAULT_CSI_SETTINGS },
+    mobility: { ...mobility, trajectoriesByRxId: { [String(value.devices.activeRxId)]: trajectoryPoints } },
+    display: { ...display, workspace: workspaces.get(String(activeNavTab)) },
+  };
+}
 
 export function createProjectDocument(state: StudioProjectState): StudioProjectDocument {
   return {
@@ -238,13 +280,14 @@ export function parseProjectDocument(value: string | unknown): StudioProjectDocu
   if (!isRecord(parsed) || parsed.format !== 'SionnaRTStudio Project') {
     throw new Error('This is not a SionnaRTStudio project file.');
   }
-  if (parsed.schemaVersion !== PROJECT_SCHEMA_VERSION) {
+  if (parsed.schemaVersion !== 1 && parsed.schemaVersion !== PROJECT_SCHEMA_VERSION) {
     throw new Error(`Unsupported project schema version: ${String(parsed.schemaVersion)}.`);
   }
-  if (typeof parsed.savedAtUtc !== 'string' || !isProjectState(parsed.state)) {
+  const state = parsed.schemaVersion === 1 ? migrateV1(parsed.state) : parsed.state;
+  if (typeof parsed.savedAtUtc !== 'string' || !isProjectState(state)) {
     throw new Error('The project file is incomplete or contains invalid settings.');
   }
-  return parsed as unknown as StudioProjectDocument;
+  return { format: 'SionnaRTStudio Project', schemaVersion: PROJECT_SCHEMA_VERSION, savedAtUtc: parsed.savedAtUtc, state };
 }
 
 export function loadAutosavedProject(): StudioProjectDocument | null {

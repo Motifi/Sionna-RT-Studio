@@ -5,6 +5,9 @@ Core endpoints (camelCase JSON, matching src/types.ts):
   POST /api/solve     {tx, rx, buildings, freqGhz} -> {paths, metrics}
   POST /api/radiomap  {tx, buildings, freqGhz, gridSize, gridHeight} -> RadioMapGrid
   POST /api/mobility  {txs, rx, buildings, waypoints, ...} -> {steps, execution}
+  POST /api/csi-runs  static or trajectory inputs -> immutable CSI run summary
+  GET  /api/csi-runs/{runId}/preview -> cached link paths and frequency response
+  POST /api/csi-runs/{runId}/export  -> saved CSI + current fronthaul metadata
   POST /api/cir       link + OFDM grid -> CIR/CFR file
   POST /api/linkkpi   link + OFDM grid -> Shannon-capacity link KPIs
   POST /api/phyber    link + PUSCH config -> BER/BLER sweep job (optional PHY pkg)
@@ -20,7 +23,9 @@ from __future__ import annotations
 import io
 import importlib.metadata
 import json
+from pathlib import Path
 import platform
+from tempfile import TemporaryDirectory
 import threading
 import time
 import traceback
@@ -78,8 +83,10 @@ if mi.variant() == _CPU_VARIANT:
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
+from starlette.background import BackgroundTask
 
+from .csi_runs import CsiExportRequest, CsiRun, CsiRunRequest, solve_csi_run
 from .linklevel import compute_link_kpis
 from .linkphy import phy_available, run_pusch_ber_sweep
 from .models import (
@@ -189,6 +196,59 @@ def api_mobility(req: MobilityRequest) -> MobilityResponse:
         return MobilityResponse(steps=steps, execution=execution, handover=handover)
     except Exception as exc:
         raise _solve_error(exc, "Mobility solve failed") from exc
+
+
+# Small process-local cache. A fetched run owns its temporary file until all
+# concurrent preview and export requests using the record have finished.
+_csi_runs: dict[str, CsiRun] = {}
+_csi_runs_lock = threading.Lock()
+_MAX_CACHED_CSI_RUNS = 2
+
+
+def _get_csi_run(run_id: str) -> CsiRun:
+    with _csi_runs_lock:
+        run = _csi_runs.get(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="This CSI run has expired. Compute it again in Preview")
+    return run
+
+
+@app.post("/api/csi-runs")
+def api_csi_run(req: CsiRunRequest) -> dict:
+    try:
+        with _solve_lock:
+            run = solve_csi_run(req)
+            with _csi_runs_lock:
+                _csi_runs[run.summary["runId"]] = run
+                if len(_csi_runs) > _MAX_CACHED_CSI_RUNS:
+                    _csi_runs.pop(next(iter(_csi_runs)))
+    except Exception as exc:
+        raise _solve_error(exc, "CSI calculation failed") from exc
+    return run.summary
+
+
+@app.get("/api/csi-runs/{run_id}/preview")
+def api_csi_preview(run_id: str, txId: str, rxId: str, sampleIndex: int = 0) -> dict:
+    run = _get_csi_run(run_id)
+    try:
+        return run.preview(sampleIndex, txId, rxId)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/csi-runs/{run_id}/export")
+def api_csi_export(run_id: str, req: CsiExportRequest) -> FileResponse:
+    run = _get_csi_run(run_id)
+    directory = TemporaryDirectory(prefix="srts_csi_export_")
+    archive = Path(directory.name) / "run.zip"
+    try:
+        run.write_export(archive, req.fronthaulMbpsByTxId)
+    except Exception as exc:
+        directory.cleanup()
+        raise _solve_error(exc, "CSI export failed") from exc
+    return FileResponse(archive, media_type="application/zip", background=BackgroundTask(directory.cleanup),
+                        filename=f"sionna_rt_csi_{run.summary['mode']}_{run_id[:8]}.zip",
+                        headers={"Cache-Control": "no-store"})
 
 
 # ── PHY BER/BLER background job (Tier 2) ────────────────────────────────────
