@@ -29,18 +29,49 @@ class LocalOrigin:
         return await self.app(scope, receive, send)
 
 
+def wait_for_parent_exit(stopped):
+    if sys.platform != "win32":
+        sys.stdin.buffer.read(1)
+        return
+
+    # A blocked stdin read can deadlock NumPy and SciPy DLL initialization
+    # on Windows (numpy/numpy#24290). Poll the parent's pipe without reading.
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    peek_pipe = ctypes.WinDLL("kernel32", use_last_error=True).PeekNamedPipe
+    peek_pipe.argtypes = (
+        wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+        wintypes.LPDWORD, wintypes.LPDWORD, wintypes.LPDWORD,
+    )
+    peek_pipe.restype = wintypes.BOOL
+    pipe = msvcrt.get_osfhandle(sys.stdin.fileno())
+    available = wintypes.DWORD()
+    while not stopped.is_set():
+        if not peek_pipe(pipe, None, 0, None, ctypes.byref(available), None):
+            error = ctypes.get_last_error()
+            if error not in (109, 232):  # ERROR_BROKEN_PIPE, ERROR_NO_DATA
+                raise ctypes.WinError(error)
+            return
+        if available.value or stopped.wait(0.2):
+            return
+
+
 def run(listener, port, token):
     stopping = threading.Event()
     stopped = threading.Event()
     server = None
 
     def stop_when_window_exits():
-        sys.stdin.buffer.read(1)
-        stopping.set()
-        if server is not None:
-            server.should_exit = True
-        if not stopped.wait(5):
-            os._exit(0)
+        try:
+            wait_for_parent_exit(stopped)
+        finally:
+            stopping.set()
+            if server is not None:
+                server.should_exit = True
+            if not stopped.wait(5):
+                os._exit(0)
 
     threading.Thread(target=stop_when_window_exits, daemon=True).start()
     try:
