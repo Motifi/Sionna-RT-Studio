@@ -1,0 +1,54 @@
+name: Windows desktop
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install the Windows x64 build
+        run: |
+          $app = Join-Path $env:RUNNER_TEMP 'Studio Windows Test\app'
+          & .\desktop\windows\Install-Studio.ps1 -InstallDirectory $app -PythonPath (Get-Command python.exe).Source -NoShortcut -SkipWebView2Check
+      - name: Check the frontend
+        run: |
+          npm.cmd run lint -- --noUnusedLocals
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm.cmd run check:osm-parser
+          exit $LASTEXITCODE
+      - name: Run installed backend CSI and CIR smoke test on CPU
+        run: |
+          $llvm = Join-Path $env:ProgramFiles 'LLVM\bin\LLVM-C.dll'
+          if (-not (Test-Path -LiteralPath $llvm -PathType Leaf)) { throw "Runner LLVM DLL missing at $llvm" }
+          $env:DRJIT_LIBLLVM_PATH = $llvm
+          $app = Join-Path $env:RUNNER_TEMP 'Studio Windows Test\app'
+          $report = Join-Path $env:RUNNER_TEMP 'studio-acceptance'
+          & .\desktop\windows\Test-Studio.ps1 -InstallDirectory $app -Headless -AllowCpu -ReportDirectory $report
+      - name: Save smoke test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64-acceptance
+          path: ${{ runner.temp }}/studio-acceptance
+          if-no-files-found: ignore
+          retention-days: 7

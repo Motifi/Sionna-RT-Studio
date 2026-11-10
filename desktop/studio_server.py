@@ -63,7 +63,17 @@ def run(listener, port, token):
 if __name__ == "__main__":
     port = int(sys.argv[1])
     token = os.environ.pop("SRTS_DESKTOP_LAUNCH_TOKEN")
+    port_file = os.environ.pop("SRTS_DESKTOP_PORT_FILE", None)
+    if port == 0 and not port_file:
+        raise ValueError("A desktop port file is required when requesting an ephemeral port")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        reuse_option = socket.SO_EXCLUSIVEADDRUSE if sys.platform == "win32" else socket.SO_REUSEADDR
+        listener.setsockopt(socket.SOL_SOCKET, reuse_option, 1)
         listener.bind(("127.0.0.1", port))
+        port = listener.getsockname()[1]
+        if port_file:
+            destination = Path(port_file)
+            staged = destination.with_suffix(".tmp")
+            staged.write_text(str(port), encoding="ascii")
+            staged.replace(destination)
         run(listener, port, token)

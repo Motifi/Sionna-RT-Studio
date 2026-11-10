@@ -56,12 +56,19 @@ for _candidate in (*_GPU_VARIANTS, _CPU_VARIANT):
     except Exception as exc:  # noqa: BLE001 — any init failure means "try the next one"
         reason = str(exc).strip().partition("\n")[0] or type(exc).__name__
         _failures.append(f"{_candidate}: {reason}")
-        print(f"[startup] Mitsuba variant {_candidate!r} unavailable.")
+        print(f"[startup] Mitsuba variant {_candidate!r} unavailable: {reason}")
 else:
-    if platform.system() == "Darwin":
+    system = platform.system()
+    if system == "Darwin":
         _llvm_help = (
             "Check the Metal initialization error above. For CPU fallback, "
             "install Homebrew LLVM with `brew install llvm` and retry."
+        )
+    elif system == "Windows":
+        _llvm_help = (
+            "For CUDA, check that your NVIDIA driver supports Mitsuba's CUDA/OptiX backend.\n"
+            "For CPU fallback, install LLVM for Windows (x64) and set "
+            "DRJIT_LIBLLVM_PATH to the full path of LLVM-C.dll."
         )
     else:
         _llvm_help = (
@@ -76,10 +83,7 @@ else:
         + _llvm_help
     )
 
-if mi.variant() == _CPU_VARIANT:
-    print(
-        f"[startup] Ray tracing on the CPU via {mi.variant()!r}."
-    )
+print(f"[startup] Ray tracing via {mi.variant()!r}.")
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware

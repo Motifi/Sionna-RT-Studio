@@ -1,5 +1,11 @@
 # Sionna RT Studio desktop app
 
+Windows 11 x64 用户请参阅 [Windows 安装与验收](windows/README.md)。
+
+For Windows 11 x64, see [Windows installation and acceptance](windows/README.md).
+
+## macOS
+
 在仓库根目录运行 `./setup.sh` 和 `./desktop/build.sh`，再双击 `build/SionnaRTStudio.app`。应用以独立 macOS 窗口打开实验台，关闭最后一个窗口时停止本地仿真服务。桌面版单独保存语言偏好和自动保存的项目。
 
 桌面版面向 Apple Silicon 和 macOS 14 或更新版本。应用内含前端资源和后端源码，运行时使用构建时指定的 Python 环境。在线底图和地理数据查询需要网络，内置三维场景与本地射线追踪可离线运行。

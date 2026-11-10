@@ -1,8 +1,8 @@
 # Sionna RT Studio
 
-使用 NVIDIA Sionna RT 做交互式无线传播仿真。四个工作区覆盖场景配置、AP 与 UE 规划、CSI 预览和数据导出。界面支持中文和英文，并提供 Apple Silicon macOS 桌面版。
+使用 NVIDIA Sionna RT 做交互式无线传播仿真。四个工作区覆盖场景配置、AP 与 UE 规划、CSI 预览和数据导出。界面支持中文和英文，并提供 Windows x64 和 Apple Silicon macOS 桌面版。
 
-An interactive wireless propagation studio built on NVIDIA Sionna RT. Four workspaces cover scene setup, device planning, CSI preview, and export. The interface supports Chinese and English, including a desktop app for Apple Silicon Macs.
+An interactive wireless propagation studio built on NVIDIA Sionna RT. Four workspaces cover scene setup, device planning, CSI preview, and export. The bilingual desktop app supports Windows x64 and Apple Silicon Macs.
 
 ## 安装与运行 · Setup
 
@@ -24,6 +24,12 @@ Open [http://localhost:3000](http://localhost:3000). When the upper-right status
 射线追踪使用可用的 CUDA、Metal 或 LLVM 后端。CPU 回退需要 LLVM 运行库。Web 版可用 `GET /api/health` 查看后端类型和 GPU 状态。
 
 Ray tracing uses an available CUDA, Metal, or LLVM backend. CPU fallback requires the LLVM runtime. For the web app, check the backend and GPU status at [`/api/health`](http://127.0.0.1:8000/api/health).
+
+## Windows 桌面版 · Windows desktop app
+
+Windows 11 x64 可用 PowerShell 从源码安装独立窗口版。安装脚本准备项目自己的 Python 环境和前端，并创建开始菜单快捷方式。参见 [Windows 安装和 CUDA、CSI、CIR 验收](desktop/windows/README.md)。
+
+On Windows 11 x64, use PowerShell to install the desktop app from source. The installer prepares the app's Python environment and frontend, and adds a Start menu shortcut. See [Windows installation and CUDA, CSI, and CIR acceptance](desktop/windows/README.md).
 
 ## macOS 桌面版 · macOS desktop app
 
