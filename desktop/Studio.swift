@@ -627,12 +627,29 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
               const points = project()?.state.mobility.trajectoriesByRxId[plannedRx];
               return points?.length === 2 && points;
             }, 'second control point');
+            await setNumber('#input-rx-ant-h', 8);
+            await setNumber('#input-rx-ant-v', 8);
+            await waitFor(() => savedDevices()?.receivers.find(rx => rx.id === plannedRx)?.antennaArraySize.join() === '8,8',
+              '64-port receiver');
+            await go('scene');
+            await setNumber('#input-csi-subcarriers', 256);
+            await waitFor(() => project()?.state.csi.numSubcarriers === 256, '256 CSI subcarriers');
             await go('preview');
             if (document.querySelector('#btn-draw-3d-mobility-path')) throw new Error('Draw controls remained visible in Preview');
+            const outputSelect = document.querySelector('#select-csi-output');
+            const trajectoryButton = document.querySelector('#btn-run-csi-trajectory');
+            if (!document.querySelector('#csi-size-estimate-trajectory') || !trajectoryButton.disabled ||
+                outputSelect?.value !== 'cir_cfr' || runRequests.length !== 1) {
+              throw new Error('Oversize CFR was not caught before solving');
+            }
+            outputSelect.value = 'cir';
+            outputSelect.dispatchEvent(new Event('change', {bubbles: true}));
             const trajectoryRun = await run('trajectory');
             const trajectorySamples = trajectoryRun.timeSeconds.length;
+            const denseBytes = trajectoryRun.shape.reduce((product, size) => product * size, 8);
             if (trajectorySamples < 2 || trajectorySamples > 100 || trajectoryRun.shape[0] !== trajectorySamples ||
-                trajectoryRun.shape[1] !== 1 || trajectoryRun.shape[3] !== 2 || trajectoryRun.shape[5] !== 9 ||
+                trajectoryRun.shape.slice(1).join() !== '1,64,2,64,256' || trajectoryRun.output !== 'cir' ||
+                denseBytes <= 256 * 1024 * 1024 || trajectoryRun.uncompressedBytes > 512 * 1024 * 1024 ||
                 trajectoryRun.rxIds[0] !== plannedRx || trajectoryRun.rxPositions.length !== trajectorySamples) {
               throw new Error('Unexpected trajectory result scope');
             }
@@ -643,13 +660,20 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
             await waitFor(() => document.querySelector('output[for=input-csi-time]')?.textContent ===
               trajectoryRun.timeSeconds[1].toFixed(3) + ' s', 'seek trajectory sample');
             const {manifest: motionManifest} = await extractZip(trajectoryRun, 0);
-            if (JSON.stringify(motionManifest.timeSeconds) !== JSON.stringify(trajectoryRun.timeSeconds) ||
+            if (motionManifest.output !== 'cir' ||
+                JSON.stringify(motionManifest.timeSeconds) !== JSON.stringify(trajectoryRun.timeSeconds) ||
                 JSON.stringify(motionManifest.rxPositions) !== JSON.stringify(trajectoryRun.rxPositions) ||
                 JSON.stringify(track) !== JSON.stringify(project().state.mobility.trajectoriesByRxId[plannedRx])) {
               throw new Error('Exported times/positions or source control points changed');
             }
             if (runRequests.length !== 2 || document.querySelector('#canvas-3d') !== canvas) {
               throw new Error('Workspace navigation recomputed CSI or replaced the canvas');
+            }
+            outputSelect.value = 'cir_cfr';
+            outputSelect.dispatchEvent(new Event('change', {bubbles: true}));
+            await go('export');
+            if (document.querySelector('#btn-export-csi-run').disabled) {
+              throw new Error('Changing the next output mode invalidated the completed CIR run');
             }
             const health = await (await fetch('/api/health')).json();
             const result = await fetch('/api/solve', {
@@ -672,6 +696,8 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
                     movedSelectedReceiver: true, placementEscape: true, solvedMatrixPairs: pairs,
                     legacyProjectMigrated: true, staticCsiShape: staticRun.shape,
                     trajectoryCsiShape: trajectoryRun.shape, csiReusedWithFronthaul: true,
+                    trajectoryOutput: trajectoryRun.output, trajectoryCfrBytes: denseBytes,
+                    trajectoryCirBytes: trajectoryRun.uncompressedBytes, oversizeCfrBlocked: true,
                     staleCsiBlocked: true, sameCanvasAcrossWorkspaces: true};
             """
         Task { [self] in

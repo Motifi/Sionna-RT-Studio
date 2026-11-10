@@ -6,6 +6,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { GeoAnchor, Transmitter, Receiver, BuildingFootprint, PropagationPath, RadioMapGrid, ChannelMetrics, MatrixCell, SolverOptions, DEFAULT_SOLVER_OPTIONS, MaterialConfig, CoverageMetric, MobilityCombineMode, TrajectoryPoint, defaultMaterialConfig } from './types';
 import { ColormapName } from './lib/colormaps';
+import { antennaPortCount, FULL_CSI_SIZE_LIMIT, estimateCsiSize } from './lib/csiSize';
 import { ThreeStudio } from './components/ThreeStudio';
 import { TopNav } from './components/TopNav';
 import { WorkflowNav } from './components/WorkflowNav';
@@ -27,7 +28,7 @@ import {
   fetchOSMBuildings,
 } from './utils';
 import { solveLink, solveRadioMap, checkBackend, createCsiRun, inspectCsiLink } from './api';
-import type { CsiRun, CsiRunMode, CsiSelection, CsiLinkPreview, HandoverConfig } from './api';
+import type { CsiRun, CsiRunMode, CsiRunOutput, CsiSelection, CsiLinkPreview, HandoverConfig } from './api';
 import {
   clearAutosavedProject,
   loadAutosavedProject,
@@ -755,6 +756,7 @@ export default function App() {
   };
 
   const [csiResult, setCsiResult] = useState<{ run: CsiRun; key: string } | null>(null);
+  const [csiOutput, setCsiOutput] = useState<CsiRunOutput>('cir_cfr');
   const [csiRunning, setCsiRunning] = useState<CsiRunMode | null>(null);
   const [csiIssue, setCsiIssue] = useState<LocalizedText | null>(null);
   const [csiSelection, setCsiSelection] = useState<CsiSelection | null>(null);
@@ -802,21 +804,37 @@ export default function App() {
 
   const sameArrays = (devices: (Receiver | Transmitter)[]) =>
     devices.every(device => device.antennaArraySize.every((value, i) => value === devices[0].antennaArraySize[i]));
+  const txArraysMatch = sameArrays(txs);
+  const rxArraysMatch = sameArrays(rxs);
   const unavailableReason = !backendOnline ? t('Solver is offline.', '求解器离线。') : undefined;
-  const txArrayReason = sameArrays(txs) ? undefined : t(
+  const txArrayReason = txArraysMatch ? undefined : t(
     'This CSI tensor needs matching AP array sizes. Static mixed-array CIR is available in advanced export.',
     '统一 CSI 张量要求各 AP 阵列等尺寸。静态混合阵列可使用高级导出中的逐链路 CIR。',
   );
-  const staticDisabledReason = unavailableReason ?? txArrayReason ?? (sameArrays(rxs) ? undefined : t(
-    'This CSI tensor needs matching UE array sizes. Use the advanced per-link CIR export for mixed arrays.',
-    '统一 CSI 张量要求各 UE 阵列等尺寸。混合阵列可使用高级逐链路 CIR 导出。',
-  ));
   const route = React.useMemo(
     () => sampleTrajectory(trajectoryPoints, mobilityIntervalMs, mobilitySpeedKmh),
     [trajectoryPoints, mobilityIntervalMs, mobilitySpeedKmh],
   );
+  const txPorts = antennaPortCount(tx.antennaArraySize, solverOptions.txPolarization);
+  const rxPorts = antennaPortCount(rx.antennaArraySize, solverOptions.rxPolarization);
+  const staticEstimate = txArraysMatch && rxArraysMatch
+    ? estimateCsiSize([1, rxs.length, rxPorts, txs.length, txPorts, csiGrid.numSubcarriers])
+    : null;
+  const trajectoryEstimate = txArraysMatch && route.timeSeconds.length > 1
+    ? estimateCsiSize([route.timeSeconds.length, 1, rxPorts, txs.length, txPorts, csiGrid.numSubcarriers])
+    : null;
+  const tooLargeReason = (bytes: number | undefined) => csiOutput === 'cir_cfr' && (bytes ?? 0) > FULL_CSI_SIZE_LIMIT
+    ? t('The CFR alone exceeds the limit. Try CIR only with these settings.', '仅 CFR 就超过上限。可保留当前设置，试用「仅 CIR」。')
+    : undefined;
+  const staticDisabledReason = unavailableReason ?? txArrayReason ?? (!rxArraysMatch
+    ? t(
+        'This CSI tensor needs matching UE array sizes. Use the advanced per-link CIR export for mixed arrays.',
+        '统一 CSI 张量要求各 UE 阵列等尺寸。混合阵列可使用高级逐链路 CIR 导出。',
+      )
+    : tooLargeReason(staticEstimate?.cfrBytes));
   const trajectoryDisabledReason = unavailableReason ?? txArrayReason ?? (route.waypoints.length < 2
-    ? t('Draw a nonzero trajectory for the selected UE in Planning.', '请先在规划页为所选 UE 绘制一条有长度的轨迹。') : undefined);
+    ? t('Draw a nonzero trajectory for the selected UE in Planning.', '请先在规划页为所选 UE 绘制一条有长度的轨迹。')
+    : tooLargeReason(trajectoryEstimate?.cfrBytes));
 
   const handleCsiRun = async (mode: CsiRunMode) => {
     if (csiRunning || (mode === 'static' ? staticDisabledReason : trajectoryDisabledReason)) return;
@@ -827,7 +845,7 @@ export default function App() {
     setActiveMode('link');
     try {
       const run = await createCsiRun({
-        ...csiCommon, mode, rxs: mode === 'static' ? rxs : [rx],
+        ...csiCommon, mode, output: csiOutput, rxs: mode === 'static' ? rxs : [rx],
         ...(mode === 'trajectory' ? {
           ...route, speedKmh: mobilitySpeedKmh, combineMode: mobilityCombineMode, handover: handoverConfig,
         } : {}),
@@ -991,6 +1009,11 @@ export default function App() {
                   error={csiIssue ? t(...csiIssue) : ''}
                   staticDisabledReason={staticDisabledReason} trajectoryDisabledReason={trajectoryDisabledReason}
                   trajectoryReceiverName={rx.name}
+                  staticEstimate={staticEstimate} trajectoryEstimate={trajectoryEstimate}
+                  output={csiOutput} onOutputChange={output => {
+                    setCsiOutput(output);
+                    setCsiIssue(null);
+                  }}
                   onRun={handleCsiRun} selection={csiSelection}
                   onSelect={selection => {
                     setPreviewSource('csi');

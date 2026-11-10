@@ -47,7 +47,7 @@ Sionna scene build, no network:
 | POST   | `/api/solve`    | `{tx, rx, buildings, freqGhz, maxDepth, options}`             | `{paths, metrics}`       |
 | POST   | `/api/radiomap` | `{txs, buildings, freqGhz, gridSize, gridHeight, maxDepth, options}` | `RadioMapGrid`    |
 | POST   | `/api/mobility` | `{txs, rx, buildings, waypoints, freqGhz, speedKmh, maxDepth, options, combineMode, handover}` | `{steps, execution, handover}` |
-| POST   | `/api/csi-runs` | `{mode, txs, rxs, buildings, freqGhz, options, numSubcarriers, subcarrierSpacing, normalizeDelays, …}` | CSI run summary with `runId` |
+| POST   | `/api/csi-runs` | `{mode, output, txs, rxs, buildings, freqGhz, options, numSubcarriers, subcarrierSpacing, normalizeDelays, …}` | CSI run summary with `runId` |
 | GET    | `/api/csi-runs/{runId}/preview` | Query `txId`, `rxId`, and `sampleIndex` (default 0) | Cached rays, metrics, and channel frequency curve |
 | POST   | `/api/csi-runs/{runId}/export` | `{fronthaulMbpsByTxId}` | ZIP with `csi.npz` and `manifest.json` |
 | POST   | `/api/cir`      | one/all Tx/Rx + optional OFDM grid + output format           | raw CIR or CIR/CFR `.npz`; single-link CSV |
@@ -66,16 +66,25 @@ channel data. The trajectory axis describes independent geometric snapshots.
 Each side needs uniform antenna array sizes for the dense tensor. For static
 mixed arrays, use the existing per-pair `/api/cir-bundle` endpoint.
 
-Inside `csi.npz`, `h_freq` has axes `[time, ue, rx_port, ap, tx_port,
-subcarrier]`. Static runs have one time entry, and trajectory runs have one UE.
-`a` uses the same leading axes and replaces `subcarrier` with `path`.
-`tau_geometric` (seconds) and `valid_paths` share `[time, ue, ap, path]`.
-`frequencies` contains baseband offsets in Hz. The Preview curve shows
+Select `output="cir_cfr"` (the default) to store both CIR and CFR or
+`output="cir"` to store only CIR. In both modes, the run summary and
+manifest report the nominal CFR `shape`, padded `pathCount`, and
+`uncompressedBytes` for the stored channel arrays before compression.
+
+The CFR `h_freq` has axes `[time, ue, rx_port, ap, tx_port, subcarrier]`.
+Static runs have one time entry, and trajectory runs have one UE. In both
+modes `csi.npz` includes `a`, with the same leading axes and `path` replacing
+`subcarrier`. `tau_geometric` (seconds) and `valid_paths` share
+`[time, ue, ap, path]`. To reconstruct CFR, sum the valid path coefficients
+weighted by `exp(-2j * pi * tau_geometric * f)`, where `f` is a baseband offset
+in Hz from the stored `frequencies` axis. The Preview curve shows
 `10 log10(mean(|H|²))` across antenna ports at up to 256 sampled subcarriers.
 `null` marks zero magnitude on that curve.
 
 The two most recent runs remain available until eviction or server shutdown.
-CSI output is limited to 256 MiB before compression. Export copies the exact
+Before compression, CIR + CFR is limited to 256 MiB and CIR-only is limited
+to 512 MiB. CIR-only preview evaluates sampled frequency responses in blocks.
+The nominal dense CFR size does not count toward the CIR output limit. Export copies the exact
 stored NPZ and writes the supplied per-AP fronthaul capacity into the manifest.
 Use `null` for an unset capacity or `0` for an explicit zero. The export call
 does not acquire the solver lock or trace any additional paths.

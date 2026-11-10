@@ -9,6 +9,7 @@ import { Transmitter, Receiver, BuildingFootprint, GeoAnchor, PropagationPath, R
 import { exportGeoJSON, exportOBJ3D, exportPropagationCSV, exportCoverageChannelGrid } from '../utils';
 import { exportCIR, CIRFormat, exportCIRBundle, exportChannelGrid, exportCsiRun, exportScene } from '../api';
 import type { CIRExportOptions, CsiRun } from '../api';
+import { antennaPortCount, formatCsiBytes } from '../lib/csiSize';
 import { createProjectDocument, StudioProjectState } from '../project';
 import { FileDown, FileSpreadsheet, Box, Compass, Database, AlertOctagon, Waves, Loader2, FileUp, Save, Package, RotateCcw, Fingerprint } from 'lucide-react';
 import { NumberField } from './NumberField';
@@ -375,14 +376,8 @@ export function ExportPanel({
       candidate.antennaArraySize[1] === rxs[0]?.antennaArraySize[1],
   );
   const multiDeviceArraysMatch = txArraysMatch && rxArraysMatch;
-  const txPolarizationPorts = ['VH', 'cross'].includes(solverOptions.txPolarization) ? 2 : 1;
-  const rxPolarizationPorts = ['VH', 'cross'].includes(solverOptions.rxPolarization) ? 2 : 1;
-  const numTxPorts = txs[0]
-    ? txs[0].antennaArraySize[0] * txs[0].antennaArraySize[1] * txPolarizationPorts
-    : 0;
-  const numRxPorts = rxs[0]
-    ? rxs[0].antennaArraySize[0] * rxs[0].antennaArraySize[1] * rxPolarizationPorts
-    : 0;
+  const numTxPorts = txs[0] ? antennaPortCount(txs[0].antennaArraySize, solverOptions.txPolarization) : 0;
+  const numRxPorts = rxs[0] ? antennaPortCount(rxs[0].antennaArraySize, solverOptions.rxPolarization) : 0;
   const multiDeviceExportDisabled =
     exportAllDevices && (!multiDeviceArraysMatch || txs.length === 0 || rxs.length === 0);
 
@@ -411,7 +406,12 @@ export function ExportPanel({
             <div className="grid gap-2 text-xs text-slate-700 sm:grid-cols-2">
               <p>{csiRun.mode === 'static' ? t('Static all links', '静态全链路') : t('Selected UE trajectory', '所选 UE 轨迹')} · {csiRun.txIds.length} AP · {csiRun.rxIds.length} UE</p>
               <p>{t(`${csiRun.timeSeconds.length} samples`, `${csiRun.timeSeconds.length} 个时刻`)} · {csiRun.carrierFrequencyGhz} GHz · {csiRun.numSubcarriers} × {csiRun.subcarrierSpacing / 1e3} kHz</p>
+              <p id="csi-export-output" className="sm:col-span-2">
+                {csiRun.output === 'cir' ? t('CIR only', '仅 CIR') : t('CIR + full CFR', 'CIR + 完整 CFR')}
+                {' · '}{formatCsiBytes(csiRun.uncompressedBytes)} {t('uncompressed', '未压缩')}
+              </p>
               <p className="sm:col-span-2">
+                {csiRun.output === 'cir' && <span>{t('Reconstructible CFR', '可重建的 CFR')} </span>}
                 <span className="readout">H [{csiRun.shape.join(' × ')}]</span>{' '}
                 <span className="text-slate-500">{t('Time · UE · Rx port · AP · Tx port · subcarrier', '时间 · UE · Rx 端口 · AP · Tx 端口 · 子载波')}</span>
               </p>
@@ -424,7 +424,10 @@ export function ExportPanel({
           )}
           {csiRun && !csiStale && (
             <p className="text-xs text-slate-600">
-              {t('The ZIP includes the computed csi.npz and manifest.json with current AP fronthaul settings.', 'ZIP 包含本次计算的 csi.npz，以及记录当前 AP 前传配置的 manifest.json。')}
+              {csiRun.output === 'cir' ? t(
+                'The ZIP includes path coefficients, delays, valid paths, and the frequency grid in csi.npz. Use these arrays to reconstruct CFR. The manifest records current AP fronthaul settings.',
+                'ZIP 的 csi.npz 包含路径复系数、时延、有效路径掩码和频率网格，可用于重建 CFR。清单记录当前 AP 前传配置。',
+              ) : t('The ZIP includes the computed csi.npz and manifest.json with current AP fronthaul settings.', 'ZIP 包含本次计算的 csi.npz，以及记录当前 AP 前传配置的 manifest.json。')}
             </p>
           )}
           {csiError && csiError.runId === csiRun?.runId && <p role="alert" className="text-xs text-red-700">{csiError.message}</p>}
@@ -437,7 +440,9 @@ export function ExportPanel({
               className="flex items-center gap-1.5 rounded bg-[var(--accent)] px-3 py-2 text-sm font-bold text-white hover:bg-[var(--accent-deep)] disabled:cursor-not-allowed disabled:opacity-50"
             >
               {csiBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileDown className="w-4 h-4" />}
-              {csiBusy ? t('Preparing ZIP…', '正在打包…') : t('Download CSI + manifest (.zip)', '下载 CSI 与清单（.zip）')}
+              {csiBusy ? t('Preparing ZIP…', '正在打包…') : csiRun?.output === 'cir'
+                ? t('Download CIR + manifest (.zip)', '下载 CIR 与清单（.zip）')
+                : t('Download CSI + manifest (.zip)', '下载 CSI 与清单（.zip）')}
             </button>
             {onOpenPreview && (!csiRun || csiStale || csiError?.runId === csiRun.runId) && (
               <button type="button" id="btn-return-to-preview" onClick={onOpenPreview} className="rounded border border-[var(--line)] bg-white px-3 py-2 text-sm font-semibold text-slate-800 hover:border-[var(--accent)]">

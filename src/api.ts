@@ -113,9 +113,11 @@ export interface MobilityResponse {
 }
 
 export type CsiRunMode = 'static' | 'trajectory';
+export type CsiRunOutput = 'cir_cfr' | 'cir';
 
 export interface CsiRunRequest extends CIRExportOptions {
   mode: CsiRunMode;
+  output?: CsiRunOutput;
   txs: Transmitter[];
   rxs: Receiver[];
   buildings: BuildingFootprint[];
@@ -135,6 +137,7 @@ export interface CsiRunRequest extends CIRExportOptions {
 export interface CsiRun {
   runId: string;
   mode: CsiRunMode;
+  output: CsiRunOutput;
   txIds: string[];
   rxIds: string[];
   txNames: string[];
@@ -143,6 +146,8 @@ export interface CsiRun {
   rxPositions: number[][][];
   frequenciesHz: number[];
   shape: number[];
+  pathCount: number;
+  uncompressedBytes: number;
   carrierFrequencyGhz: number;
   numSubcarriers: number;
   subcarrierSpacing: number;

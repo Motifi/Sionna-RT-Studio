@@ -44,12 +44,12 @@ The app opens in its own window and stops its local service when it quits. Keep 
 
 1. **场景**选择内置场景或导入 OSM 建筑，设置载频、系统带宽、传播机制和 CSI 子载波网格。默认的 100 MHz 系统带宽与 1024 × 30 kHz 的 CSI 网格分别设置。
 2. **规划**使用三维工具栏新增和移动 AP、UE。选中 AP 可设置阵列、功率、波束方向和前传容量。选中 UE 后用「绘制轨迹」添加控制点，并设置速度和采样间隔。
-3. **预览**计算静态全链路或所选 UE 轨迹。试算时可在场景页选择较少的每源射线采样数。2 台 AP 和 3 台 UE 会生成 6 条静态链路。移动模式追踪一台 UE 与全部 AP 的链路。
+3. **预览**计算静态全链路或所选 UE 轨迹。计算前可查看采样时刻、收发端口和完整 CFR 的预计大小。大规模阵列或较长轨迹可选「仅 CIR」，保留阵列与时频网格。
 4. **导出**下载本次预览的 CSI ZIP。切换工作区后仍可查看本次运行。更改传播输入后，在预览页重新计算。
 
 1. **Scene** opens the built-in scene or imports OSM buildings. Set the carrier, system bandwidth, propagation mechanisms, and CSI subcarrier grid. The default system bandwidth is 100 MHz, and the CSI grid uses 1024 subcarriers spaced at 30 kHz.
 2. **Planning** places and moves APs and UEs. Select an AP to edit its array, power, orientation, and fronthaul capacity. Select a UE to draw its trajectory and set the speed and sampling interval.
-3. **Preview** solves all static links or one selected UE's trajectory. Choose a lower ray sample count in Scene for a quick check. Two APs and three UEs produce six static links. A trajectory run traces one moving UE against all APs.
+3. **Preview** solves all static links or one selected UE's trajectory. Check the number of time samples and antenna ports and the estimated full CFR size before running. Choose CIR only for large arrays or long trajectories to retain the array and sampling grid.
 4. **Export** saves the CSI ZIP from the Preview run. You can revisit a run after switching workspaces. Recompute in Preview after changing propagation inputs.
 
 在线底图和建筑导入需要网络，内置场景可直接计算。更新后，Web 版请强制刷新，桌面版请退出旧应用后打开新构建。
@@ -66,6 +66,14 @@ The ZIP contains `csi.npz` and `manifest.json`. Complex `h_freq` uses the axis o
 
 By default, each link uses its own first arrival as the delay reference. To preserve relative propagation delays across APs, select absolute delays in Scene before running CSI.
 
+「CIR + CFR」保存路径数据与完整 `h_freq`。「仅 CIR」保存每条路径的复系数 `a`、时延 `tau_geometric`、有效路径掩码 `valid_paths` 和频率轴。清单中的 `output` 分别为 `cir_cfr` 或 `cir`，`shape` 在两种模式下都描述完整 CFR 的形状。仅 CIR 模式的大小取决于求解找到的路径数。两种模式分别以 256 MiB 和 512 MiB 为上限，按实际要保存的未压缩信道数组估算。
+
+CIR + CFR stores the path data and the full `h_freq`. CIR only stores the complex path coefficients `a`, delays `tau_geometric`, mask `valid_paths`, and frequency axis. The manifest records `output` as `cir_cfr` or `cir`, and `shape` describes the full CFR shape in either mode. The CIR-only size depends on the paths found. The limits are 256 MiB for CIR + CFR and 512 MiB for CIR only, measured on the uncompressed channel arrays being saved.
+
+下面的示例读取两种格式中的任一种，得到首个时刻、首个 UE、首个 AP 的 CFR，轴顺序为 `[Rx 端口, Tx 端口, 子载波]`。
+
+This example reads either format and returns the first time sample, UE, and AP as a CFR with axes `[Rx port, Tx port, subcarrier]`.
+
 ```python
 from io import BytesIO
 from zipfile import ZipFile
@@ -74,9 +82,16 @@ import numpy as np
 
 with ZipFile("your-csi-run.zip") as archive:
     with np.load(BytesIO(archive.read("csi.npz"))) as data:
-        H = data["h_freq"]
         time_seconds = data["time_seconds"]
         frequencies_hz = data["frequencies"]
+        if "h_freq" in data.files:
+            H = data["h_freq"][0, 0, :, 0, :, :]
+        else:
+            valid = data["valid_paths"][0, 0, 0]
+            delay = data["tau_geometric"][0, 0, 0, valid]
+            a = data["a"][0, 0, :, 0, :, :][..., valid]
+            phase = np.exp(-2j * np.pi * delay[:, None] * frequencies_hz[None, :])
+            H = a @ phase
 ```
 
 ## 研究导出与检查 · Research exports and checks

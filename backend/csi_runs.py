@@ -28,13 +28,17 @@ from .solver import (
 
 
 _MAX_OUTPUT_BYTES = 256 * 1024 * 1024
+_MAX_CIR_BYTES = 512 * 1024 * 1024
 _CFR_CHUNK_BYTES = 64 * 1024 * 1024
+_CIR_CURVE_CHUNK_BYTES = 16 * 1024 * 1024
 _MAX_LINK_SNAPSHOTS = 4096
 _MAX_CURVE_POINTS = 256
+_COMPLEX_BYTES = np.dtype(np.complex64).itemsize
 
 
 class CsiRunRequest(BaseModel):
     mode: Literal["static", "trajectory"]
+    output: Literal["cir_cfr", "cir"] = "cir_cfr"
     txs: list[Transmitter] = Field(min_length=1, max_length=64)
     rxs: list[Receiver] = Field(min_length=1, max_length=64)
     buildings: list[BuildingFootprint]
@@ -151,28 +155,76 @@ def _geometric_axes(native: np.ndarray, moving: bool) -> np.ndarray:
     return native[:, None, ...] if moving else native[None, ...]
 
 
+def _cir_curves(a: np.ndarray, tau: np.ndarray, valid: np.ndarray,
+                frequencies: np.ndarray) -> np.ndarray:
+    """Reconstruct sampled CFR power using the shared delays of synthetic arrays."""
+    curves = np.full(tau.shape[:-1] + (frequencies.size,), -np.inf, dtype=np.float32)
+    phase_scale = np.complex64(-2j * math.pi) * frequencies.astype(np.float32, copy=False)
+    for sample, ue, ap in np.ndindex(tau.shape[:-1]):
+        mask = valid[sample, ue, ap]
+        delays = tau[sample, ue, ap, mask]
+        if not delays.size:
+            continue
+        link = a[sample, ue, :, ap]
+        rx_ports, tx_ports = link.shape[:2]
+        power = np.zeros(frequencies.size, dtype=np.float32)
+        # Limit the coefficient copy for masked or strided arrays, then budget
+        # the Fourier matrix and response together for each frequency block.
+        rx_block = max(1, _CIR_CURVE_CHUNK_BYTES // (2 * _COMPLEX_BYTES * tx_ports * delays.size))
+        for rx_start in range(0, rx_ports, rx_block):
+            coeffs = link[rx_start:rx_start + rx_block, :, mask].reshape(-1, delays.size)
+            freq_block = max(1, _CIR_CURVE_CHUNK_BYTES // (2 * _COMPLEX_BYTES * (coeffs.shape[0] + delays.size)))
+            for start in range(0, frequencies.size, freq_block):
+                stop = min(start + freq_block, frequencies.size)
+                phase = np.exp(delays[:, None] * phase_scale[start:stop])
+                response = coeffs @ phase
+                power[start:stop] += np.sum(np.abs(response) ** 2, axis=0)
+        with np.errstate(divide="ignore"):
+            curves[sample, ue, ap] = 10.0 * np.log10(power / (rx_ports * tx_ports))
+    return curves
+
+
 def _write_csi(directory: Path, paths, frequencies: np.ndarray, moving: bool, normalize: bool,
-               shape: tuple[int, ...], metadata: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+               shape: tuple[int, ...], metadata: dict[str, np.ndarray], *,
+               output_mode: Literal["cir_cfr", "cir"] = "cir_cfr") -> tuple[np.ndarray, np.ndarray, int, int]:
     time_count, rx_count, rx_ports, tx_count, tx_ports, frequency_count = shape
     ports = time_count * rx_count * rx_ports * tx_count * tx_ports
     path_count = int(paths.valid.shape[-1])
-    if (ports * (frequency_count + path_count) * np.dtype(np.complex64).itemsize
-            + time_count * rx_count * tx_count * path_count * 5 > _MAX_OUTPUT_BYTES):
-        raise ValueError("CSI exceeds the 256 MiB limit. Reduce subcarriers, antennas, or samples")
+    # Per path: a complex64 coefficient per port pair, plus one float32
+    # delay and one boolean validity flag per link snapshot.
+    cir_bytes = path_count * (ports * _COMPLEX_BYTES + time_count * rx_count * tx_count * 5)
+    output_limit = _MAX_CIR_BYTES if output_mode == "cir" else _MAX_OUTPUT_BYTES
+    if cir_bytes > output_limit:
+        hint = "Choose CIR only or reduce antennas, trajectory samples, or ray interactions" if output_mode == "cir_cfr" else (
+            "Reduce antennas, trajectory samples, or ray interactions"
+        )
+        raise ValueError(f"Uncompressed CIR alone requires {cir_bytes / 2**20:.1f} MiB, "
+                         f"above the {output_limit / 2**20:g} MiB limit. {hint}")
+    output_bytes = cir_bytes + (ports * frequency_count * _COMPLEX_BYTES if output_mode == "cir_cfr" else 0)
+    if output_bytes > output_limit:
+        raise ValueError(f"Uncompressed CIR + CFR requires {output_bytes / 2**20:.1f} MiB, above the 256 MiB limit. "
+                         "Choose CIR only or reduce subcarriers, antennas, or samples")
 
     a, tau = paths.cir(normalize_delays=normalize, out_type="numpy")
     a = _run_axes(np.asarray(a), moving, axis=-1)
     tau = _geometric_axes(np.asarray(tau), moving)
-    valid = _geometric_axes(to_numpy(paths.valid).astype(bool), moving)
+    valid = _geometric_axes(to_numpy(paths.valid).astype(bool, copy=False), moving)
+    curve_indices = np.linspace(0, frequency_count - 1, min(_MAX_CURVE_POINTS, frequency_count), dtype=int)
+    curve_frequencies = frequencies[curve_indices]
+    arrays = dict(a=a, tau_geometric=tau, valid_paths=valid, frequencies=frequencies, **metadata)
+    if output_mode == "cir":
+        curves_db = _cir_curves(a, tau, valid, curve_frequencies)
+        np.savez_compressed(directory / "csi.npz", **arrays)
+        return curve_frequencies, curves_db, path_count, output_bytes
 
     # CFR calculation broadcasts over paths as well as frequency, so size the
     # frequency chunks by the intermediate tensor, not just the final output.
     per_frequency_bytes = ports * max(1, path_count) * 32
     if per_frequency_bytes > _MAX_OUTPUT_BYTES:
-        raise ValueError("The ray set is too large for CSI. Reduce antennas, samples, or interaction depth")
+        raise ValueError("The ray set is too large for dense CFR computation. "
+                         "Choose CIR only or reduce antennas, samples, or interaction depth")
     chunk_size = max(1, _CFR_CHUNK_BYTES // per_frequency_bytes)
     output = np.lib.format.open_memmap(directory / "cfr.npy", mode="w+", dtype=np.complex64, shape=shape)
-    curve_indices = np.linspace(0, frequency_count - 1, min(_MAX_CURVE_POINTS, frequency_count), dtype=int)
     curves_db = np.full((time_count, rx_count, tx_count, len(curve_indices)), -np.inf, dtype=np.float32)
     try:
         for start in range(0, frequency_count, chunk_size):
@@ -186,12 +238,11 @@ def _write_csi(directory: Path, paths, frequencies: np.ndarray, moving: bool, no
                 power = np.mean(np.abs(cfr[..., curve_indices[left:right] - start]) ** 2, axis=(2, 4))
                 with np.errstate(divide="ignore"):
                     curves_db[..., left:right] = 10.0 * np.log10(power)
-        np.savez_compressed(directory / "csi.npz", a=a, tau_geometric=tau, valid_paths=valid,
-                            h_freq=output, frequencies=frequencies, **metadata)
+        np.savez_compressed(directory / "csi.npz", h_freq=output, **arrays)
     finally:
         del output
         (directory / "cfr.npy").unlink(missing_ok=True)
-    return frequencies[curve_indices], curves_db
+    return curve_frequencies, curves_db, path_count, output_bytes
 
 
 def solve_csi_run(req: CsiRunRequest) -> CsiRun:
@@ -207,8 +258,10 @@ def solve_csi_run(req: CsiRunRequest) -> CsiRun:
     n_tx_ant = _set_tx_array(scene, tx_size, req.options)
     n_rx_ant = _set_rx_array(scene, rx_size, req.options)
     shape = (len(times), len(req.rxs), n_rx_ant, len(req.txs), n_tx_ant, req.numSubcarriers)
-    if math.prod(shape) * np.dtype(np.complex64).itemsize > _MAX_OUTPUT_BYTES:
-        raise ValueError("CSI exceeds the 256 MiB limit. Reduce subcarriers, antennas, or samples")
+    cfr_bytes = math.prod(shape) * _COMPLEX_BYTES
+    if req.output == "cir_cfr" and cfr_bytes > _MAX_OUTPUT_BYTES:
+        raise ValueError(f"Uncompressed CFR alone requires {cfr_bytes / 2**20:.1f} MiB, above the 256 MiB limit. "
+                         "Choose CIR only or reduce subcarriers, antennas, or samples")
     tx_specs = _resolve_tx_specs(req.txs, req.buildings)
     speed_ms = req.speedKmh / 3.6
     if moving:
@@ -226,21 +279,23 @@ def solve_csi_run(req: CsiRunRequest) -> CsiRun:
         tx_ids = [tx.id for tx in req.txs]
         rx_ids = [rx.id for rx in req.rxs]
         tx_positions = [spec.pos for spec in tx_specs]
-        curve_frequencies, curves_db = _write_csi(Path(directory.name), paths, frequencies, moving,
-                                                 req.normalizeDelays, shape, {
-            "tx_ids": np.asarray(tx_ids), "rx_ids": np.asarray(rx_ids),
-            "tx_positions": np.asarray(tx_positions), "rx_positions": positions,
-            "time_seconds": np.asarray(times), "carrier_frequency": np.asarray(req.freqGhz * 1e9),
-            "subcarrier_spacing": np.asarray(req.subcarrierSpacing),
-            "normalize_delays": np.asarray(req.normalizeDelays),
-        })
+        curve_frequencies, curves_db, path_count, output_bytes = _write_csi(
+            Path(directory.name), paths, frequencies, moving, req.normalizeDelays, shape, {
+                "tx_ids": np.asarray(tx_ids), "rx_ids": np.asarray(rx_ids),
+                "tx_positions": np.asarray(tx_positions), "rx_positions": positions,
+                "time_seconds": np.asarray(times), "carrier_frequency": np.asarray(req.freqGhz * 1e9),
+                "subcarrier_spacing": np.asarray(req.subcarrierSpacing),
+                "normalize_delays": np.asarray(req.normalizeDelays),
+            }, output_mode=req.output,
+        )
         traced_links = _summarize_batched(paths, tx_specs, rx_positions, n_tx_ant)
         links = [[_Link(rays[:MAX_PATHS], _channel_metrics(rays)) for rays, _ in row] for row in traced_links]
         summary = {
-            "runId": run_id, "mode": req.mode, "txIds": tx_ids, "rxIds": rx_ids,
+            "runId": run_id, "mode": req.mode, "output": req.output, "txIds": tx_ids, "rxIds": rx_ids,
             "txNames": [tx.name for tx in req.txs], "rxNames": [rx.name for rx in req.rxs],
             "timeSeconds": times, "rxPositions": positions.tolist(), "txPositions": tx_positions,
             "frequenciesHz": frequencies.tolist(), "shape": list(shape),
+            "pathCount": path_count, "uncompressedBytes": output_bytes,
             "carrierFrequencyGhz": req.freqGhz, "systemBandwidthMhz": req.systemBandwidthMhz,
             "noiseFigureDb": req.noiseFigureDb, "numSubcarriers": req.numSubcarriers,
             "subcarrierSpacing": req.subcarrierSpacing, "normalizeDelays": req.normalizeDelays,
@@ -279,6 +334,8 @@ def solve_csi_run(req: CsiRunRequest) -> CsiRun:
             "buildingCount": len(req.buildings),
             "settings": req.model_dump(mode="json", exclude={"buildings"}),
         })
+        if req.output == "cir":
+            manifest["axes"].pop("h_freq")
         return CsiRun(directory, summary, manifest, links, curve_frequencies, curves_db)
     except Exception:
         directory.cleanup()

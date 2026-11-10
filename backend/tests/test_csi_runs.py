@@ -41,7 +41,9 @@ class TestCsiArtifacts(unittest.TestCase):
                 shape = (2, 1, 1, 1, 2, 5) if moving else (1, 2, 1, 1, 2, 5)
                 paths = _Paths()
                 with patch("backend.csi_runs._CFR_CHUNK_BYTES", 96):
-                    plotted, curves = _write_csi(Path(folder), paths, frequencies, moving, False, shape, {})
+                    plotted, curves, path_count, output_bytes = _write_csi(
+                        Path(folder), paths, frequencies, moving, False, shape, {},
+                    )
                 with np.load(Path(folder) / "csi.npz") as archive:
                     cfr = archive["h_freq"]
                     self.assertEqual(cfr.shape, shape)
@@ -53,18 +55,72 @@ class TestCsiArtifacts(unittest.TestCase):
                     expected_db = 10 * np.log10(np.mean(np.abs(cfr) ** 2, axis=(2, 4)))
                     np.testing.assert_allclose(curves, expected_db)
                 np.testing.assert_array_equal(plotted, frequencies)
+                self.assertEqual(path_count, 1)
+                self.assertEqual(output_bytes, 202)
                 self.assertEqual(paths.frequency_calls, frequencies.tolist())
                 self.assertFalse((Path(folder) / "cfr.npy").exists())
 
-    def test_no_paths_produces_valid_zero_cfr(self):
+    def test_cir_only_reconstructs_preview_without_allocating_dense_cfr(self):
+        class MaskedPaths(_Paths):
+            def cir(self, **kwargs):
+                a, tau = super().cir(**kwargs)
+                a[0, 0, 0, :, :, 0] = [[1, 2, np.nan], [3j, 4j, np.nan]]
+                tau[0, 0] = [0, 0.25, np.nan]
+                self.valid[0, 0, -1] = False
+                self.valid[1, 0] = False
+                return a, tau
+
+        frequencies = np.arange(5, dtype=np.float32)
+        with TemporaryDirectory() as folder:
+            shape = (2, 1, 1, 1, 2, 5)
+            paths = MaskedPaths(path_count=3)
+            with patch("backend.csi_runs._MAX_OUTPUT_BYTES", 130):
+                with self.assertRaisesRegex(ValueError, r"CIR \+ CFR"):
+                    _write_csi(Path(folder), paths, frequencies, True, False, shape, {})
+            with patch("backend.csi_runs._MAX_OUTPUT_BYTES", 100), patch(
+                "backend.csi_runs._CIR_CURVE_CHUNK_BYTES", 32,
+            ):
+                plotted, curves, path_count, output_bytes = _write_csi(
+                    Path(folder), paths, frequencies, True, False, shape, {}, output_mode="cir",
+                )
+            with np.load(Path(folder) / "csi.npz") as archive:
+                self.assertNotIn("h_freq", archive)
+                self.assertEqual(archive["a"].shape, shape[:-1] + (3,))
+                self.assertEqual(output_bytes, sum(archive[key].nbytes for key in ("a", "tau_geometric", "valid_paths")))
+                self.assertEqual(path_count, 3)
+                mask = archive["valid_paths"][0, 0, 0]
+                phase = np.exp(-2j * np.pi * archive["tau_geometric"][0, 0, 0, mask, None] * frequencies)
+                h = archive["a"][0, 0, 0, 0][:, mask] @ phase
+                np.testing.assert_allclose(curves[0, 0, 0], 10 * np.log10(np.mean(np.abs(h) ** 2, axis=0)))
+            self.assertEqual(paths.frequency_calls, [])
+            np.testing.assert_array_equal(plotted, frequencies)
+            self.assertTrue(np.isneginf(curves[1]).all())
+            self.assertFalse((Path(folder) / "cfr.npy").exists())
+
+    def test_cir_only_keeps_its_own_output_limit(self):
+        with TemporaryDirectory() as folder, patch("backend.csi_runs._MAX_CIR_BYTES", 40):
+            with self.assertRaisesRegex(ValueError, "CIR alone"):
+                _write_csi(Path(folder), _Paths(), np.arange(3), True, True,
+                           (2, 1, 1, 1, 2, 3), {}, output_mode="cir")
+
+    def test_no_paths_produces_valid_zero_frequency_response(self):
         with TemporaryDirectory() as folder:
             shape = (2, 1, 1, 1, 2, 3)
-            _, curves = _write_csi(Path(folder), _Paths(path_count=0), np.arange(3), True, True, shape, {})
-            with np.load(Path(folder) / "csi.npz") as archive:
-                self.assertEqual(archive["h_freq"].shape, shape)
-                self.assertEqual(archive["valid_paths"].shape, (2, 1, 1, 0))
-                self.assertFalse(archive["h_freq"].any())
-            self.assertTrue(np.isneginf(curves).all())
+            for output_mode in ("cir_cfr", "cir"):
+                with self.subTest(output=output_mode):
+                    _, curves, path_count, _ = _write_csi(
+                        Path(folder), _Paths(path_count=0), np.arange(3), True, True, shape, {},
+                        output_mode=output_mode,
+                    )
+                    with np.load(Path(folder) / "csi.npz") as archive:
+                        self.assertEqual(archive["valid_paths"].shape, (2, 1, 1, 0))
+                        if output_mode == "cir_cfr":
+                            self.assertEqual(archive["h_freq"].shape, shape)
+                            self.assertFalse(archive["h_freq"].any())
+                        else:
+                            self.assertNotIn("h_freq", archive)
+                    self.assertEqual(path_count, 0)
+                    self.assertTrue(np.isneginf(curves).all())
 
     def test_export_updates_fronthaul_without_changing_csi_bytes(self):
         directory = TemporaryDirectory()
@@ -89,8 +145,12 @@ class TestCsiValidation(unittest.TestCase):
         a, b = {"x": 0, "y": 0, "z": 0}, {"x": 1, "y": 0, "z": 0}
         config = dict(mode="trajectory", txs=[{"enu": a}], rxs=[{"enu": b}],
                       buildings=[], freqGhz=3.5, waypoints=[a, b], timeSeconds=[0, 0.2])
-        self.assertEqual(CsiRunRequest(**config).timeSeconds, [0, 0.2])
+        request = CsiRunRequest(**config)
+        self.assertEqual(request.timeSeconds, [0, 0.2])
+        self.assertEqual(request.output, "cir_cfr")
+        self.assertEqual(CsiRunRequest(**config, output="cir").output, "cir")
         for invalid in (dict(timeSeconds=[0, 0]), dict(timeSeconds=[1, 2]), dict(timeSeconds=[0]),
+                        dict(output="cfr"),
                         dict(rxs=[{"enu": a, "id": "1"}, {"enu": b, "id": "2"}])):
             with self.assertRaises(ValidationError):
                 CsiRunRequest(**{**config, **invalid})

@@ -468,8 +468,7 @@ def _summarize_batched(
     num_tx = valid.shape[1]
     num_paths = valid.shape[-1]
     tau = to_numpy(paths.tau)
-    a_real, a_imag = paths.a
-    a_full = to_numpy(a_real).astype(float) + 1j * to_numpy(a_imag).astype(float)
+    a_real, a_imag = map(to_numpy, paths.a)
     inter = to_numpy(paths.interactions)
     vert = to_numpy(paths.vertices)
     depth = vert.shape[0]
@@ -498,7 +497,8 @@ def _summarize_batched(
             tau_rt = tau[r, t, :].reshape(-1)[:num_paths]
             # Preserve the physical Rx-port axis while applying the same
             # unit-norm Tx precoder as the single-pair solve.
-            a_path_rt = _beamform(a_full[r, :, t, :, :], n_tx_ant, num_paths)
+            coefficients = a_real[r, :, t].astype(float) + 1j * a_imag[r, :, t].astype(float)
+            a_path_rt = _beamform(coefficients, n_tx_ant, num_paths)
             dopp_rt = dopp[r, t, :].reshape(-1)[:num_paths]
             inter_rt = inter[:, r, t, :].reshape(depth, num_paths)
             vert_rt = vert[:, r, t, :, :].reshape(depth, num_paths, 3)

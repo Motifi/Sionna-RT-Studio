@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { ArrowRight, Loader2, Pause, Play, Waves } from 'lucide-react';
-import type { CsiLinkPreview, CsiRun, CsiRunMode, CsiSelection } from '../api';
+import type { CsiLinkPreview, CsiRun, CsiRunMode, CsiRunOutput, CsiSelection } from '../api';
 import { useI18n } from '../i18n';
+import { CIR_SIZE_LIMIT, FULL_CSI_SIZE_LIMIT, formatCsiBytes, type CsiSizeEstimate } from '../lib/csiSize';
 
 interface CsiPreviewPanelProps {
   run: CsiRun | null;
@@ -11,6 +12,10 @@ interface CsiPreviewPanelProps {
   staticDisabledReason?: string;
   trajectoryDisabledReason?: string;
   trajectoryReceiverName?: string;
+  staticEstimate: CsiSizeEstimate | null;
+  trajectoryEstimate: CsiSizeEstimate | null;
+  output: CsiRunOutput;
+  onOutputChange: (output: CsiRunOutput) => void;
   onRun: (mode: CsiRunMode) => void;
   selection: CsiSelection | null;
   onSelect: (selection: CsiSelection) => void;
@@ -70,6 +75,7 @@ function FrequencyResponse({ link }: { link: CsiLinkPreview }) {
 
 export function CsiPreviewPanel({
   run, stale, running, error, staticDisabledReason, trajectoryDisabledReason, trajectoryReceiverName,
+  staticEstimate, trajectoryEstimate, output, onOutputChange,
   onRun, selection, onSelect, link, linkLoading, linkError, onOpenExport,
 }: CsiPreviewPanelProps) {
   const { t } = useI18n();
@@ -111,17 +117,55 @@ export function CsiPreviewPanel({
         <Waves size={17} className="text-[var(--accent)]" aria-hidden="true" />
         <h3 className="panel-title">{t('Channel preview', '信道预览')}</h3>
       </div>
+      <div className="grid gap-1 rounded border border-[var(--line)] bg-[#f5f3ec] p-2.5">
+        <label htmlFor="select-csi-output" className="text-xs font-semibold text-slate-800">
+          {t('Data to save for the next run', '下次计算保存的数据')}
+        </label>
+        <select
+          id="select-csi-output"
+          value={output}
+          disabled={!!running}
+          aria-describedby="csi-output-hint"
+          onChange={event => onOutputChange(event.target.value === 'cir' ? 'cir' : 'cir_cfr')}
+          className="rounded border border-[var(--line)] bg-white px-2 py-1.5 text-sm"
+        >
+          <option value="cir_cfr">{t('CIR + full CFR', 'CIR + 完整 CFR')}</option>
+          <option value="cir">{t('CIR only (reconstruct CFR as needed)', '仅 CIR（按需重建 CFR）')}</option>
+        </select>
+        <p id="csi-output-hint" className="text-[11px] text-slate-600">
+          {t(
+            `Uncompressed limits per run · CIR + full CFR ${formatCsiBytes(FULL_CSI_SIZE_LIMIT)} · CIR only ${formatCsiBytes(CIR_SIZE_LIMIT)}. CIR size depends on the path count after tracing.`,
+            `每次计算的未压缩数组上限 · CIR + 完整 CFR ${formatCsiBytes(FULL_CSI_SIZE_LIMIT)} · 仅 CIR ${formatCsiBytes(CIR_SIZE_LIMIT)}。CIR 大小取决于追踪得到的路径数。`,
+          )}
+        </p>
+      </div>
       <div className="grid gap-2">
         {([
-          ['static', t('Solve all static links', '计算静态全链路'), staticDisabledReason],
-          ['trajectory', t('Solve selected UE trajectory', '计算所选 UE 轨迹'), trajectoryDisabledReason],
-        ] as const).map(([mode, label, disabledReason]) => (
+          ['static', t('Solve all static links', '计算静态全链路'), staticDisabledReason, staticEstimate],
+          ['trajectory', t('Solve selected UE trajectory', '计算所选 UE 轨迹'), trajectoryDisabledReason, trajectoryEstimate],
+        ] as const).map(([mode, label, disabledReason, estimate]) => (
           <div key={mode}>
+            {estimate && (
+              <div id={`csi-size-estimate-${mode}`} className="mb-1.5 space-y-0.5 text-[11px] leading-normal text-slate-600">
+                <p>
+                  <span className="readout font-semibold text-slate-800">
+                    CFR [{estimate.shape.join(' × ')}] · {formatCsiBytes(estimate.cfrBytes)}
+                  </span>{' '}
+                  {output === 'cir' ? t('if full CFR were stored', '如保存完整 CFR') : t('uncompressed', '未压缩')}
+                </p>
+                <p>{t('Time · UE · Rx port · AP · Tx port · subcarrier', '时刻 · UE · Rx 端口 · AP · Tx 端口 · 子载波')}</p>
+                <p>{t(
+                  `CIR adds ${formatCsiBytes(estimate.cirBytesPerPath)} per slot on the path axis.`,
+                  `CIR 路径维每增加 1，数据量增加 ${formatCsiBytes(estimate.cirBytesPerPath)}。`,
+                )}</p>
+              </div>
+            )}
             <button
               id={`btn-run-csi-${mode}`}
               type="button"
               onClick={() => { setPlayingRunId(null); onRun(mode); }}
               disabled={!!running || !!disabledReason}
+              aria-describedby={estimate ? `csi-size-estimate-${mode}` : undefined}
               className="flex w-full items-center justify-center gap-2 rounded border border-[var(--line)] bg-[#ebe7dc] px-3 py-2 text-sm font-semibold text-slate-900 transition hover:border-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-55"
             >
               {running === mode && <Loader2 size={15} className="animate-spin" aria-hidden="true" />}
@@ -154,6 +198,10 @@ export function CsiPreviewPanel({
             <span className="text-sm font-semibold text-slate-900">{run.mode === 'static' ? t('Static result', '静态结果') : t('Trajectory result', '轨迹结果')}</span>
             <span className="text-[11px] text-slate-600">{run.txIds.length} AP · {run.rxIds.length} UE · {t(`${sampleCount} samples`, `${sampleCount} 个时刻`)}</span>
           </div>
+          <p id="csi-run-output" className="text-[11px] text-slate-600">
+            {run.output === 'cir' ? t('CIR only · CFR preview reconstructed from paths', '仅 CIR · 频域预览由路径重建') : t('CIR + full CFR', 'CIR + 完整 CFR')}
+            {' · '}{formatCsiBytes(run.uncompressedBytes)} {t('uncompressed', '未压缩')}
+          </p>
           {run.mode === 'trajectory' && (
             <div className="flex flex-col gap-2 rounded border border-[var(--line)] p-3">
               <div className="flex items-center gap-2">
