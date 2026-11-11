@@ -1,15 +1,18 @@
 """Tests for the standalone Sionna RT scene export (no GPU / Sionna needed).
 
-Only the generated ``load_scene.py`` and manifest are exercised here; zipping the
-Mitsuba scene itself needs a real scene build.
+Scene packaging is tested with a fixture in place of a Mitsuba scene build.
 
 Run with:  .venv/bin/python -m unittest discover backend/tests
 """
+import io
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
+from backend import runtime_env
 from backend.scene_build import (
     GROUND_BSDF_ID,
     GROUND_COLOR,
@@ -25,7 +28,7 @@ from backend.models import (
     SolverOptions,
     Transmitter,
 )
-from backend.scene_export import _array_groups, _load_scene_script, _manifest
+from backend.scene_export import _array_groups, _load_scene_script, _manifest, scene_export_zip
 
 
 def _building(height: float = 20.0) -> BuildingFootprint:
@@ -64,6 +67,23 @@ def _request(**overrides) -> SceneExportRequest:
 class TestGeneratedScript(unittest.TestCase):
     def test_script_is_valid_python(self):
         compile(_load_scene_script(_request()), "load_scene.py", "exec")
+
+    def test_export_prepares_llvm_before_importing_mitsuba(self):
+        with tempfile.TemporaryDirectory() as folder:
+            scene_dir = Path(folder)
+            (scene_dir / "scene.xml").write_text("<scene/>", encoding="utf-8")
+            with (
+                patch("backend.scene_export.build_scene_dir", return_value=scene_dir),
+                patch("backend.scene_export.solver_runtime", return_value={}),
+                patch("backend.scene_export.inspect_scene", return_value={}),
+            ):
+                exported = scene_export_zip(_request())
+
+        with zipfile.ZipFile(io.BytesIO(exported)) as archive:
+            self.assertEqual(archive.read("srts_runtime.py"), Path(runtime_env.__file__).read_bytes())
+            script = archive.read("load_scene.py").decode()
+        self.assertIn("from srts_runtime import configure_drjit_llvm_path", script)
+        self.assertLess(script.index("configure_drjit_llvm_path()"), script.index("import mitsuba"))
 
     def test_loads_the_relative_scene_and_sets_frequency(self):
         script = _load_scene_script(_request(freqGhz=3.5))

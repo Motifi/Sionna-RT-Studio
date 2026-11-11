@@ -220,6 +220,9 @@ def _load_scene_script(req: SceneExportRequest) -> str:
         "import numpy as np",
         "from pathlib import Path",
         "import os",
+        "from srts_runtime import configure_drjit_llvm_path",
+        "",
+        "configure_drjit_llvm_path()",
         "import mitsuba as mi",
         'if os.environ.get("SRTS_MITSUBA_VARIANT"):',
         '    mi.set_variant(os.environ["SRTS_MITSUBA_VARIANT"])',
@@ -418,6 +421,7 @@ replays the Python-side configuration Sionna does not store in the XML.
     scene.xml       Mitsuba scene, ITU radio-material BSDFs, relative mesh paths
     meshes/*.ply    ground plane + one extruded prism per building
     load_scene.py   frequency, material overrides, arrays, devices, PathSolver
+    srts_runtime.py LLVM discovery and initialization for the replay script
     manifest.json   the settings this export was generated from
     channels/*.npz exact array-compatible tensors created by load_scene.py
 
@@ -481,6 +485,7 @@ def scene_export_zip(req: SceneExportRequest) -> bytes:
         for member in mesh_members:
             archive.writestr(member, (scene_dir / member).read_bytes())
         archive.writestr("load_scene.py", _load_scene_script(req))
+        archive.writestr("srts_runtime.py", Path(__file__).with_name("runtime_env.py").read_bytes())
         manifest = _manifest(req, mesh_members)
         manifest["solverRuntime"] = solver_runtime()
         manifest["anchor"] = req.anchor.model_dump() if req.anchor else None
