@@ -28,7 +28,7 @@ from .models import (
     Transmitter,
 )
 from .runtime_env import trace_paths_for_runtime
-from .scene_build import building_polygon, build_scene, inspect_scene
+from .scene_build import build_compiled_scene, build_scene, building_polygon, compile_scene, inspect_scene
 from .solver_runtime import solver_runtime
 
 # Sionna InteractionType codes (sionna.rt.constants.InteractionType).
@@ -1209,32 +1209,32 @@ def _validate_radio_map_grid(size_x: float, size_y: float, cell: float,
 
 def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
     txs = req.transmitters()
-    # Bounding box must enclose every transmitter and all geometry.
-    xs = [t.enu.x for t in txs]
-    ys = [t.enu.y for t in txs]
-    for b in req.buildings:
-        for p in b.enuPoints:
-            xs.append(p.x)
-            ys.append(p.y)
-    minx, maxx = min(xs), max(xs)
-    miny, maxy = min(ys), max(ys)
-    size_x = max(maxx - minx, 100.0) + 60.0
-    size_y = max(maxy - miny, 100.0) + 60.0
     grid_step = float(req.gridSize)
     if not math.isfinite(grid_step):
         raise ValueError("Coverage grid step must be finite.")
     cell = max(grid_step, 1.0)
-    center = [minx / 2.0 + maxx / 2.0, miny / 2.0 + maxy / 2.0, float(req.gridHeight)]
     num_tx = len(txs)
-    _validate_radio_map_grid(size_x, size_y, cell, center, num_tx)
-
     array_sizes = [tuple(int(v) for v in t.antennaArraySize) for t in txs]
     if any(size != array_sizes[0] for size in array_sizes):
         raise ValueError("Radio maps with multiple transmitters require matching antennaArraySize")
 
+    compiled = compile_scene(req.buildings, req.freqGhz, req.materials)
+    # Bound the transmitters and physical triangles at solver precision. The
+    # compiler puts the generated ground plane first, outside this extent.
+    tx_xy = np.asarray([(t.enu.x, t.enu.y) for t in txs])
+    mesh_bounds = [mesh.bounds[:, :2] for _, _, mesh in compiled.meshes[1:]]
+    with np.errstate(over="ignore"):
+        xy = np.concatenate([tx_xy, *mesh_bounds], dtype=np.float32)
+    minx, miny = map(float, xy.min(axis=0))
+    maxx, maxy = map(float, xy.max(axis=0))
+    size_x = max(maxx - minx, 100.0) + 60.0
+    size_y = max(maxy - miny, 100.0) + 60.0
+    center = [minx / 2.0 + maxx / 2.0, miny / 2.0 + maxy / 2.0, float(req.gridHeight)]
+    _validate_radio_map_grid(size_x, size_y, cell, center, num_tx)
+
     from sionna.rt import RadioMapSolver
 
-    scene = build_scene(req.buildings, req.freqGhz, req.materials)
+    scene = build_compiled_scene(compiled, req.freqGhz, req.materials)
 
     # Physical noise floor for SINR: bandwidth → thermal noise; fold the receiver
     # noise figure into an effective temperature (raises the floor by NF dB).

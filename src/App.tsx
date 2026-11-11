@@ -37,9 +37,12 @@ import {
   clearAutosavedProject,
   loadAutosavedProject,
   parseProjectDocument,
+  replaceUnreadableAutosave,
   saveAutosavedProject,
   StudioProjectState,
   DEFAULT_CSI_SETTINGS,
+  FutureAutosaveError,
+  UnreadableAutosaveError,
 } from './project';
 import type { ProjectAutosaveStatus, StudioWorkspace } from './project';
 
@@ -221,7 +224,7 @@ function warnUnsavedProject(event: BeforeUnloadEvent) {
 export default function App() {
   const { t } = useI18n();
   const [initialProject, setInitialProject] = useState<StudioProjectState | null | undefined>();
-  const [loadFailed, setLoadFailed] = useState(false);
+  const [loadFailure, setLoadFailure] = useState<'unreadable' | 'future' | 'storage' | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const [temporary, setTemporary] = useState(false);
 
@@ -232,21 +235,27 @@ export default function App() {
     }).catch(error => {
       if (!current) return;
       console.warn('Could not restore the autosaved SionnaRTStudio project.', error);
-      setLoadFailed(true);
+      setLoadFailure(error instanceof UnreadableAutosaveError ? 'unreadable'
+        : error instanceof FutureAutosaveError ? 'future' : 'storage');
     });
     return () => { current = false; };
   }, [loadAttempt]);
 
   if (initialProject !== undefined || temporary) {
-    return <StudioApp initialProject={initialProject ?? null} temporary={temporary} />;
+    return <StudioApp initialProject={initialProject ?? null} startTemporary={temporary}
+      unreadableAutosave={loadFailure === 'unreadable'} />;
   }
 
   return (
     <main className="min-h-screen grid place-content-center gap-3 p-4 text-center text-[var(--text-hi)]">
-      {loadFailed ? <>
-        <p role="alert">{t('Could not open the local project storage.', '无法打开本地项目存储。')}</p>
+      {loadFailure ? <>
+        <p role="alert">{loadFailure === 'unreadable'
+          ? t('The local autosave could not be read. Open a temporary project to replace it.', '无法读取本地自动存档。可以打开临时项目并替换存档。')
+          : loadFailure === 'future'
+            ? t('This autosave was created by a newer version of Studio.', '此自动存档由较新版本的实验台创建。')
+            : t('Could not open the local project storage.', '无法打开本地项目存储。')}</p>
         <button className="btn-signal mx-auto rounded px-3 py-2" onClick={() => {
-          setLoadFailed(false);
+          setLoadFailure(null);
           setLoadAttempt(attempt => attempt + 1);
         }}>{t('Retry opening project', '重试打开项目')}</button>
         <button className="mx-auto text-sm underline underline-offset-2" onClick={() => setTemporary(true)}>
@@ -257,8 +266,13 @@ export default function App() {
   );
 }
 
-function StudioApp({ initialProject, temporary }: { initialProject: StudioProjectState | null; temporary: boolean }) {
+function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
+  initialProject: StudioProjectState | null;
+  startTemporary: boolean;
+  unreadableAutosave: boolean;
+}) {
   const { t } = useI18n();
+  const [temporary, setTemporary] = useState(startTemporary);
   const [anchor, setAnchor] = useState<GeoAnchor>(
     () => initialProject?.scene.anchor ?? INITIAL_ANCHOR,
   );
@@ -708,6 +722,8 @@ function StudioApp({ initialProject, temporary }: { initialProject: StudioProjec
   const [saveAttempt, setSaveAttempt] = useState(0);
   const saveImmediately = useRef(false);
   const resettingRef = useRef(false);
+  const replacingAutosave = useRef(false);
+  const [recoveryError, setRecoveryError] = useState<LocalizedText | null>(null);
 
   const projectState = React.useMemo<StudioProjectState>(() => ({
     scene: { coordinateFrame: 'ENU_m', anchor, buildings, hiddenLayers: editor.hiddenLayers },
@@ -760,6 +776,8 @@ function StudioApp({ initialProject, temporary }: { initialProject: StudioProjec
     showRaysOnHeatmap, rmColormap, rmAutoRange, rmVmin, rmVmax,
   ]);
   const lastSavedProject = useRef(initialProject || temporary ? projectState : null);
+  const latestProjectState = useRef(projectState);
+  useLayoutEffect(() => { latestProjectState.current = projectState; }, [projectState]);
 
   // Persist only editable inputs and display choices. Solver outputs are
   // intentionally omitted because they become stale whenever an input changes.
@@ -814,11 +832,44 @@ function StudioApp({ initialProject, temporary }: { initialProject: StudioProjec
     setSaveAttempt(attempt => attempt + 1);
   };
 
+  const handleReplaceUnreadableAutosave = async () => {
+    if (!temporary || !unreadableAutosave || replacingAutosave.current) return;
+    if (!window.confirm(t(
+      'Replace the unreadable autosave with this project and resume autosaving?',
+      '用当前项目替换无法读取的自动存档，并恢复自动保存？',
+    ))) return;
+    replacingAutosave.current = true;
+    setRecoveryError(null);
+    window.addEventListener('beforeunload', warnUnsavedProject);
+    document.documentElement.dataset.projectSaveState = 'saving';
+    setAutosaveStatus('saving');
+    try {
+      const replaced = await replaceUnreadableAutosave(projectState);
+      if (!replaced) {
+        setRecoveryError(['The local autosave changed. Export this temporary project before reopening Studio.',
+          '本地自动存档已变更。请先导出临时项目，再重新打开实验台。']);
+        setAutosaveStatus('disabled');
+        return;
+      }
+      lastSavedProject.current = projectState;
+      saveImmediately.current = latestProjectState.current !== projectState;
+      setTemporary(false);
+      setAutosaveStatus('saved');
+    } catch (error) {
+      console.warn('Could not replace the unreadable autosave.', error);
+      setRecoveryError(['Could not replace the autosave. Your temporary project is still open.',
+        '无法替换自动存档，当前临时项目仍可使用。']);
+      setAutosaveStatus('disabled');
+    } finally {
+      replacingAutosave.current = false;
+    }
+  };
+
   const saveImportedProject = () => {
     // Protect closing as soon as the import is applied and bypass the usual
     // editing delay when the new project state is ready.
     window.addEventListener('beforeunload', warnUnsavedProject);
-    document.documentElement.dataset.projectSaveState = temporary ? 'error' : 'saving';
+    document.documentElement.dataset.projectSaveState = temporary && !replacingAutosave.current ? 'error' : 'saving';
     if (!temporary) {
       saveImmediately.current = true;
       setAutosaveStatus('saving');
@@ -826,7 +877,7 @@ function StudioApp({ initialProject, temporary }: { initialProject: StudioProjec
   };
 
   const handleResetProject = async () => {
-    if (resettingRef.current) return;
+    if (resettingRef.current || replacingAutosave.current) return;
     const confirmed = window.confirm(temporary ? t(
       'Discard this temporary project and reopen Studio?',
       '放弃当前临时项目并重新打开实验台？',
@@ -1096,7 +1147,9 @@ function StudioApp({ initialProject, temporary }: { initialProject: StudioProjec
 
   return (
     <div id="sionna-rt-studio-app-frame" className="min-h-screen md:h-screen md:overflow-hidden text-[var(--text-hi)] flex flex-col font-sans">
-      <TopNav health={health} autosaveStatus={autosaveStatus} onRetryAutosave={retryAutosave} />
+      <TopNav health={health} autosaveStatus={autosaveStatus} onRetryAutosave={retryAutosave}
+        onReplaceUnreadableAutosave={unreadableAutosave ? handleReplaceUnreadableAutosave : undefined}
+        recoveryError={recoveryError ? t(...recoveryError) : undefined} />
       <main className={`flex-1 md:min-h-0 grid grid-cols-1 gap-4 p-4 w-full ${workspace === 'export' ? '' : 'md:grid-cols-[minmax(290px,37%)_minmax(0,1fr)] lg:grid-cols-[400px_minmax(0,1fr)]'}`}>
         <aside hidden={workspace === 'export'} className="min-w-0 md:min-h-0 md:overflow-y-auto md:pr-1">
           <div className="flex flex-col gap-4">

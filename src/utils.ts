@@ -27,19 +27,28 @@ export function enuToLatLon(enu: ENUVector, anchor: GeoAnchor): { lat: number; l
   return { lat, lon };
 }
 
-// 2D point-in-polygon test (ray casting) against a building footprint.
-// Used by the 3D scene to snap devices onto rooftops.
+// Match the solver's strict containment rule: roof mounting excludes the boundary.
 export function isPointInPolygon(pt: { x: number; y: number }, poly: ENUVector[]): boolean {
   let inside = false;
-  const n = poly.length;
-  for (let i = 0, j = n - 1; i < n; j = i++) {
-    const xi = poly[i].x, yi = poly[i].y;
-    const xj = poly[j].x, yj = poly[j].y;
-    const intersect = ((yi > pt.y) !== (yj > pt.y)) &&
-      (pt.x < (xj - xi) * (pt.y - yi) / (yj - yi + 1e-9) + xi);
-    if (intersect) inside = !inside;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i], b = poly[j];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    if ((pt.x - a.x) * dy === (pt.y - a.y) * dx &&
+      pt.x >= Math.min(a.x, b.x) && pt.x <= Math.max(a.x, b.x) &&
+      pt.y >= Math.min(a.y, b.y) && pt.y <= Math.max(a.y, b.y)) return false;
+    if ((a.y > pt.y) !== (b.y > pt.y) && pt.x < a.x + dx * (pt.y - a.y) / dy) inside = !inside;
   }
   return inside;
+}
+
+function footprintArea(vertices: ENUVector[]): number {
+  const origin = vertices[0];
+  let twiceArea = 0;
+  for (let i = 1; i < vertices.length - 1; i++) {
+    const a = vertices[i], b = vertices[i + 1];
+    twiceArea += (a.x - origin.x) * (b.y - origin.y) - (a.y - origin.y) * (b.x - origin.x);
+  }
+  return Math.abs(twiceArea) / 2;
 }
 
 export function getDeviceElevation(
@@ -47,10 +56,15 @@ export function getDeviceElevation(
   buildings: BuildingFootprint[],
 ): number {
   if (device.heightReference === 'enu') return device.height;
-  const footprint = buildings.find(building => building.category === 'building' &&
-    (building.kind ?? 'building') === 'building' && building.enuPoints.length >= 3 &&
-    isPointInPolygon(device.enu, building.enuPoints));
-  const roof = footprint ? Math.max(0, (footprint.baseZ ?? 0) + Math.max(footprint.height, 1)) : 0;
+  let roof = 0;
+  for (const building of buildings) {
+    if (building.category !== 'building' || (building.kind ?? 'building') !== 'building' ||
+      building.height <= 0 || building.enuPoints.length < 3) continue;
+    const top = (building.baseZ ?? 0) + Math.max(building.height, 1);
+    if (top > roof && isPointInPolygon(device.enu, building.enuPoints) && footprintArea(building.enuPoints) >= 0.5) {
+      roof = top;
+    }
+  }
   return roof + device.height;
 }
 
@@ -539,35 +553,70 @@ export function exportCoverageChannelGrid(
 // GIS / 3D / propagation exporters used by the EXPORT navigation panel.
 // ---------------------------------------------------------------------------
 
-// Compile building footprints (+ anchor metadata) into a standard GeoJSON FeatureCollection.
-export function exportGeoJSON(buildings: BuildingFootprint[], anchor: GeoAnchor): string {
-  const features = buildings.map((b) => {
-    let coordinates: [number, number][][] = [];
-    if (b.points && b.points.length > 0) {
-      coordinates = [b.points.map((p) => [p.lon, p.lat])];
-      // Close the polygon safely
-      if (
-        coordinates[0].length > 0 &&
-        (coordinates[0][0][0] !== coordinates[0][coordinates[0].length - 1][0] ||
-          coordinates[0][0][1] !== coordinates[0][coordinates[0].length - 1][1])
-      ) {
-        coordinates[0].push([coordinates[0][0][0], coordinates[0][0][1]]);
+type Position2D = [number, number];
+
+function samePosition(a: Position2D, b: Position2D): boolean {
+  return a[0] === b[0] && a[1] === b[1];
+}
+
+function signedTurn(a: Position2D, b: Position2D, c: Position2D): number {
+  return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+}
+
+function meshConvexHull({ vertices, triangles }: NonNullable<BuildingFootprint['mesh']>): Position2D[] {
+  const sorted = Array.from(new Set(triangles), (index): Position2D => [vertices[3 * index], vertices[3 * index + 1]])
+    .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const points = sorted.filter((point, i) => i === 0 || !samePosition(point, sorted[i - 1]));
+  if (points.length <= 2) return points;
+
+  // Andrew's monotone chain also reduces a collinear projection to its endpoints.
+  const halfHull = (ordered: Position2D[]) => {
+    const hull: Position2D[] = [];
+    for (const point of ordered) {
+      while (hull.length >= 2 && signedTurn(hull[hull.length - 2], hull[hull.length - 1], point) <= 0) {
+        hull.pop();
       }
-    } else {
-      coordinates = [
-        b.enuPoints.map((ep) => {
-          const latLon = enuToLatLon(ep, anchor);
-          return [latLon.lon, latLon.lat];
-        }),
-      ];
-      if (
-        coordinates[0].length > 0 &&
-        (coordinates[0][0][0] !== coordinates[0][coordinates[0].length - 1][0] ||
-          coordinates[0][0][1] !== coordinates[0][coordinates[0].length - 1][1])
-      ) {
-        coordinates[0].push([coordinates[0][0][0], coordinates[0][0][1]]);
-      }
+      hull.push(point);
     }
+    return hull.slice(0, -1);
+  };
+  const lower = halfHull(points);
+  const upper = halfHull(points.reverse());
+  return [...lower, ...upper];
+}
+
+function geoJsonGeometry(coordinates: Position2D[], linear: boolean) {
+  const positions = coordinates.filter((position, i) => i === 0 || !samePosition(position, coordinates[i - 1]));
+  if (positions.length === 0) return null;
+  const first = positions[0];
+  if (positions.length === 1) return { type: 'Point', coordinates: first };
+  if (!linear && samePosition(first, positions[positions.length - 1])) positions.pop();
+
+  if (!linear && positions.length >= 3) {
+    const area = positions.reduce((sum, point, i) => sum + signedTurn(first, point, positions[i + 1] ?? first), 0);
+    if (area !== 0) {
+      positions.push(first);
+      if (area < 0) positions.reverse();
+      return { type: 'Polygon', coordinates: [positions] };
+    }
+  }
+  return { type: 'LineString', coordinates: positions };
+}
+
+// Compile scene footprints (+ anchor metadata) into a GeoJSON FeatureCollection.
+export function exportGeoJSON(buildings: BuildingFootprint[], anchor: GeoAnchor): string {
+  const geographicPosition = (point: ENUVector): Position2D => {
+    const { lon, lat } = enuToLatLon(point, anchor);
+    return [lon, lat];
+  };
+  const features = buildings.map((b) => {
+    const mesh = b.kind === 'mesh' ? b.mesh : undefined;
+    const positions = mesh
+      ? meshConvexHull(mesh).map(([x, y]) => geographicPosition({ x, y, z: 0 }))
+      : b.points?.length
+        ? b.points.map((p): Position2D => [p.lon, p.lat])
+        : b.enuPoints.map(geographicPosition);
+    const linear = !mesh && (b.kind === 'wall' || b.category === 'infrastructure');
 
     return {
       type: 'Feature',
@@ -580,10 +629,7 @@ export function exportGeoJSON(buildings: BuildingFootprint[], anchor: GeoAnchor)
         material: b.material,
         levels: b.levels,
       },
-      geometry: {
-        type: b.category === 'infrastructure' ? 'LineString' : 'Polygon',
-        coordinates: b.category === 'infrastructure' ? coordinates[0] : coordinates,
-      },
+      geometry: geoJsonGeometry(positions, linear),
     };
   });
 

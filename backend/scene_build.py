@@ -350,14 +350,13 @@ _scene_cache: "OrderedDict[tuple[str, float], _BuiltScene]" = OrderedDict()
 
 
 def _build(
-    buildings: list[BuildingFootprint],
+    compiled: CompiledScene,
     freq_ghz: float,
     material_configs: list[MaterialConfig] | None = None,
 ) -> _BuiltScene:
-    """Return the cached scene holder, building (and caching) it if needed."""
+    """Load the compiled geometry into Sionna RT, reusing a cached scene."""
     from sionna.rt import PlanarArray, load_scene
 
-    compiled = compile_scene(buildings, freq_ghz, material_configs)
     key = (compiled.scene_id, freq_ghz)
     cached = _scene_cache.get(key)
     if cached is not None:
@@ -406,7 +405,17 @@ def build_scene(
     material_configs: list[MaterialConfig] | None = None,
 ):
     """Return a Sionna RT Scene built from the building footprints (cached)."""
-    return _build(buildings, freq_ghz, material_configs).scene
+    compiled = compile_scene(buildings, freq_ghz, material_configs)
+    return build_compiled_scene(compiled, freq_ghz, material_configs)
+
+
+def build_compiled_scene(
+    compiled: CompiledScene,
+    freq_ghz: float,
+    material_configs: list[MaterialConfig] | None = None,
+):
+    """Load a compiled scene using the same frequency and material settings."""
+    return _build(compiled, freq_ghz, material_configs).scene
 
 
 def build_scene_dir(
@@ -425,4 +434,5 @@ def build_scene_dir(
     away — the export endpoint does so while holding the solver lock, which is
     also what keeps a concurrent build from evicting the entry mid-copy.
     """
-    return _build(buildings, freq_ghz, material_configs).scene_dir
+    compiled = compile_scene(buildings, freq_ghz, material_configs)
+    return _build(compiled, freq_ghz, material_configs).scene_dir

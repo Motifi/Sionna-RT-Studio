@@ -14,9 +14,11 @@ interface TopNavProps {
   health: BackendHealth | null;
   autosaveStatus: ProjectAutosaveStatus;
   onRetryAutosave: () => void;
+  onReplaceUnreadableAutosave?: () => void;
+  recoveryError?: string;
 }
 
-export function TopNav({ health, autosaveStatus, onRetryAutosave }: TopNavProps) {
+export function TopNav({ health, autosaveStatus, onRetryAutosave, onReplaceUnreadableAutosave, recoveryError }: TopNavProps) {
   const { t, locale, setLocale } = useI18n();
 
   return (
@@ -71,9 +73,15 @@ export function TopNav({ health, autosaveStatus, onRetryAutosave }: TopNavProps)
         </div>
       </div>
       {autosaveStatus === 'disabled' ? (
-        <p role="status" className="border-t border-[var(--line)] px-3 py-1 text-xs text-[var(--bad)] sm:px-6">
-          {t('Autosave unavailable. Export the project to keep your changes.', '自动保存不可用。请导出项目以保留修改。')}
-        </p>
+        <div className="flex flex-wrap items-center gap-x-2 border-t border-[var(--line)] px-3 py-1 text-xs text-[var(--bad)] sm:px-6">
+          <span role="status">{t('Autosave unavailable. Export the project to keep your changes.', '自动保存不可用。请导出项目以保留修改。')}</span>
+          {onReplaceUnreadableAutosave && (
+            <button type="button" className="font-semibold underline underline-offset-2" onClick={onReplaceUnreadableAutosave}>
+              {t('Replace unreadable autosave', '替换无法读取的自动存档')}
+            </button>
+          )}
+          {recoveryError && <span role="alert" className="basis-full">{recoveryError}</span>}
+        </div>
       ) : autosaveStatus === 'error' ? (
         <div className="flex items-center gap-2 border-t border-[var(--line)] px-3 py-1.5 text-xs text-[var(--bad)] sm:px-6">
           <span role="alert">{t('Project autosave failed.', '项目自动保存失败。')}</span>

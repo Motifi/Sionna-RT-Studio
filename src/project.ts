@@ -316,6 +316,50 @@ export function parseProjectDocument(value: string | unknown): StudioProjectDocu
   return { format: 'SionnaRTStudio Project', schemaVersion: PROJECT_SCHEMA_VERSION, savedAtUtc: parsed.savedAtUtc, state };
 }
 
+export class UnreadableAutosaveError extends Error {
+  constructor(cause: unknown) {
+    super('The local autosave could not be read.', { cause });
+    this.name = 'UnreadableAutosaveError';
+  }
+}
+
+export class FutureAutosaveError extends Error {
+  constructor() {
+    super('This autosave was created by a newer version of Studio.');
+    this.name = 'FutureAutosaveError';
+  }
+}
+
+function parseStoredProject(value: unknown) {
+  try {
+    const original: unknown = typeof value === 'string' ? JSON.parse(value) : value;
+    if (isRecord(original) && original.format === 'SionnaRTStudio Project' &&
+        typeof original.schemaVersion === 'number' && Number.isInteger(original.schemaVersion) &&
+        original.schemaVersion > PROJECT_SCHEMA_VERSION) {
+      throw new FutureAutosaveError();
+    }
+    return {
+      project: parseProjectDocument(original),
+      oldSchema: isRecord(original) && original.schemaVersion !== PROJECT_SCHEMA_VERSION,
+    };
+  } catch (error) {
+    if (error instanceof FutureAutosaveError) throw error;
+    throw new UnreadableAutosaveError(error);
+  }
+}
+
+function isUnreadableAutosave(value: unknown) {
+  if (value === null) return false;
+  try {
+    parseStoredProject(value);
+    return false;
+  } catch (error) {
+    if (error instanceof UnreadableAutosaveError) return true;
+    if (error instanceof FutureAutosaveError) return false;
+    throw error;
+  }
+}
+
 // All operations in this page enter the database in the order they were
 // requested. In particular a reset must complete after any in-flight save.
 let pendingStorageOperation: Promise<unknown> = Promise.resolve();
@@ -378,10 +422,9 @@ export function loadAutosavedProject(): Promise<StudioProjectDocument | null> {
             setResult(null);
             return;
           }
-          const original: unknown = JSON.parse(raw);
-          const project = parseProjectDocument(original);
+          const { project, oldSchema } = parseStoredProject(raw);
           store.put(project, PROJECT_STORAGE_KEY);
-          migrated = { raw, oldSchema: isRecord(original) && original.schemaVersion !== PROJECT_SCHEMA_VERSION };
+          migrated = { raw, oldSchema };
           setResult(project);
         } catch (error) {
           reject(error);
@@ -389,8 +432,8 @@ export function loadAutosavedProject(): Promise<StudioProjectDocument | null> {
       };
     });
     if (migrated) {
+      removeLegacyAutosave(migrated.raw);
       try {
-        window.localStorage.removeItem(PROJECT_STORAGE_KEY);
         const backupKey = `${PROJECT_STORAGE_KEY}.pre-v3`;
         if (migrated.oldSchema && !window.localStorage.getItem(backupKey)) {
           window.localStorage.setItem(backupKey, migrated.raw);
@@ -399,7 +442,7 @@ export function loadAutosavedProject(): Promise<StudioProjectDocument | null> {
         console.warn('Could not update the legacy project backup.', error);
       }
     }
-    return saved === null ? null : parseProjectDocument(saved);
+    return saved === null ? null : parseStoredProject(saved).project;
   });
 }
 
@@ -409,6 +452,45 @@ export function saveAutosavedProject(state: StudioProjectState): Promise<void> {
   }));
 }
 
+function removeLegacyAutosave(expected?: string) {
+  try {
+    if (expected === undefined || window.localStorage.getItem(PROJECT_STORAGE_KEY) === expected) {
+      window.localStorage.removeItem(PROJECT_STORAGE_KEY);
+    }
+  } catch (error) {
+    console.warn('Could not remove the legacy autosave.', error);
+  }
+}
+
+export function replaceUnreadableAutosave(state: StudioProjectState): Promise<boolean> {
+  return queueStorageOperation(async () => {
+    const replacement = parseProjectDocument(createProjectDocument(state));
+    let replacedLegacy: string | null = null;
+    const replaced = await projectTransaction<boolean>((store, setResult, reject) => {
+      const request = store.get(PROJECT_STORAGE_KEY);
+      request.onsuccess = () => {
+        try {
+          const fromLegacy = request.result === undefined;
+          const raw = fromLegacy ? window.localStorage.getItem(PROJECT_STORAGE_KEY) : null;
+          const current = fromLegacy ? raw : request.result;
+          // A healthy autosave may have been restored or written by another
+          // window since startup. Recheck within the replacement transaction.
+          const unreadable = isUnreadableAutosave(current);
+          if (unreadable) {
+            store.put(replacement, PROJECT_STORAGE_KEY);
+            replacedLegacy = raw;
+          }
+          setResult(unreadable);
+        } catch (error) {
+          reject(error);
+        }
+      };
+    });
+    if (replaced && replacedLegacy !== null) removeLegacyAutosave(replacedLegacy);
+    return replaced;
+  });
+}
+
 export function clearAutosavedProject(): Promise<void> {
   return queueStorageOperation(async () => {
     // Record the reset before removing the old fallback. An interrupted
@@ -416,10 +498,6 @@ export function clearAutosavedProject(): Promise<void> {
     await projectTransaction<void>(store => {
       store.put(null, PROJECT_STORAGE_KEY);
     });
-    try {
-      window.localStorage.removeItem(PROJECT_STORAGE_KEY);
-    } catch (error) {
-      console.warn('Could not remove the legacy project after reset.', error);
-    }
+    removeLegacyAutosave();
   });
 }

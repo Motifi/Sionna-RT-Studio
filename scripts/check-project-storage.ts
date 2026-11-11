@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   clearAutosavedProject, createProjectDocument, DEFAULT_CSI_SETTINGS, loadAutosavedProject,
-  PROJECT_STORAGE_KEY, saveAutosavedProject, type StudioProjectState,
+  PROJECT_STORAGE_KEY, replaceUnreadableAutosave, saveAutosavedProject, type StudioProjectState,
 } from '../src/project';
 import { DEFAULT_SOLVER_OPTIONS } from '../src/types';
 
@@ -33,6 +33,7 @@ function setupStorage() {
   const old = new Map<string, string>();
   const records = new Map<string, unknown>();
   let failCommit = false;
+  let afterWrite: (() => void) | undefined;
   let created = false;
   const localStorage = {
     getItem: (key: string) => old.get(key) ?? null,
@@ -70,6 +71,11 @@ function setupStorage() {
           transaction.onabort();
         } else {
           writes.forEach(write => write());
+          if (writes.length) {
+            const callback = afterWrite;
+            afterWrite = undefined;
+            callback?.();
+          }
           transaction.oncomplete();
         }
       });
@@ -87,7 +93,13 @@ function setupStorage() {
     },
   };
   Object.assign(globalThis, { window: { localStorage, indexedDB }, localStorage });
-  return { localStorage, abortNextCommit: () => { failCommit = true; } };
+  return {
+    localStorage,
+    abortNextCommit: () => { failCommit = true; },
+    afterNextWrite: (callback: () => void) => { afterWrite = callback; },
+    seedAutosave: (value: unknown) => records.set(PROJECT_STORAGE_KEY, value),
+    readAutosave: () => records.get(PROJECT_STORAGE_KEY),
+  };
 }
 
 test('restores a supported project mesh larger than the Web Storage quota', async () => {
@@ -140,4 +152,73 @@ test('keeps a legacy-only project if resetting the database fails', async () => 
   abortNextCommit();
   await assert.rejects(async () => clearAutosavedProject(), /Project write aborted/);
   assert.equal(localStorage.getItem(PROJECT_STORAGE_KEY), raw);
+});
+
+test('distinguishes an unreadable legacy autosave from an unavailable store', async () => {
+  const { localStorage } = setupStorage();
+  localStorage.setItem(PROJECT_STORAGE_KEY, '{unreadable');
+  await assert.rejects(loadAutosavedProject, { name: 'UnreadableAutosaveError' });
+  assert.equal(localStorage.getItem(PROJECT_STORAGE_KEY), '{unreadable');
+});
+
+test('replaces an unreadable legacy autosave only after a successful write', async () => {
+  const { localStorage, abortNextCommit } = setupStorage();
+  localStorage.setItem(PROJECT_STORAGE_KEY, '{unreadable');
+  abortNextCommit();
+  await assert.rejects(() => replaceUnreadableAutosave(project), /Project write aborted/);
+  assert.equal(localStorage.getItem(PROJECT_STORAGE_KEY), '{unreadable');
+  assert.equal(await replaceUnreadableAutosave(project), true);
+  assert.deepEqual((await loadAutosavedProject())?.state, project);
+  assert.equal(localStorage.getItem(PROJECT_STORAGE_KEY), null);
+});
+
+test('preserves an unreadable database record when replacing it aborts', async () => {
+  const { seedAutosave, readAutosave, abortNextCommit } = setupStorage();
+  const invalid = { format: 'SionnaRTStudio Project', schemaVersion: 3, state: { incomplete: true } };
+  seedAutosave(invalid);
+  await assert.rejects(loadAutosavedProject, { name: 'UnreadableAutosaveError' });
+  abortNextCommit();
+  await assert.rejects(() => replaceUnreadableAutosave(project), /Project write aborted/);
+  assert.deepEqual(readAutosave(), invalid);
+  assert.equal(await replaceUnreadableAutosave(project), true);
+  assert.deepEqual((await loadAutosavedProject())?.state, project);
+});
+
+test('recovery preserves a valid project saved by another session', async () => {
+  const { localStorage, seedAutosave } = setupStorage();
+  localStorage.setItem(PROJECT_STORAGE_KEY, '{unreadable');
+  await assert.rejects(loadAutosavedProject, { name: 'UnreadableAutosaveError' });
+  const newer = { ...project, coverage: { ...project.coverage, seed: 123 } };
+  seedAutosave(createProjectDocument(newer));
+  assert.equal(await replaceUnreadableAutosave(project), false);
+  assert.deepEqual((await loadAutosavedProject())?.state, newer);
+});
+
+test('recovery refuses a replacement that Studio cannot restore', async () => {
+  const { localStorage } = setupStorage();
+  localStorage.setItem(PROJECT_STORAGE_KEY, '{unreadable');
+  const invalid = { ...project, devices: { ...project.devices, receivers: [] } };
+  await assert.rejects(() => replaceUnreadableAutosave(invalid), /project file is incomplete/);
+  assert.equal(localStorage.getItem(PROJECT_STORAGE_KEY), '{unreadable');
+});
+
+test('treats a newer autosave as incompatible and preserves it during recovery', async () => {
+  const { localStorage, seedAutosave, readAutosave } = setupStorage();
+  localStorage.setItem(PROJECT_STORAGE_KEY, '{unreadable');
+  await assert.rejects(loadAutosavedProject, { name: 'UnreadableAutosaveError' });
+  const future = { ...createProjectDocument(project), schemaVersion: 4 };
+  seedAutosave(future);
+  await assert.rejects(loadAutosavedProject, { name: 'FutureAutosaveError' });
+  assert.equal(await replaceUnreadableAutosave(project), false);
+  assert.deepEqual(readAutosave(), future);
+});
+
+test('preserves a different legacy value written during a recovery transaction', async () => {
+  const { localStorage, afterNextWrite } = setupStorage();
+  localStorage.setItem(PROJECT_STORAGE_KEY, '{unreadable');
+  const newer = JSON.stringify(createProjectDocument(project));
+  afterNextWrite(() => localStorage.setItem(PROJECT_STORAGE_KEY, newer));
+  assert.equal(await replaceUnreadableAutosave(project), true);
+  assert.equal(localStorage.getItem(PROJECT_STORAGE_KEY), newer);
+  assert.deepEqual((await loadAutosavedProject())?.state, project);
 });
