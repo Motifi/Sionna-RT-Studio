@@ -69,3 +69,30 @@ def configure_drjit_llvm_path() -> str | None:
             os.environ["DRJIT_LIBLLVM_PATH"] = str(library)
             return str(library)
     return None
+
+
+def trace_paths_for_runtime(scene, **options):
+    """Trace paths with a compatible execution mode for Windows CPU solves."""
+    from sionna.rt import PathSolver
+
+    solver = PathSolver()
+    if platform.system() != "Windows":
+        return solver(scene, **options)
+
+    import mitsuba as mi
+
+    if not mi.variant().startswith("llvm_"):
+        return solver(scene, **options)
+
+    import drjit as dr
+
+    # Dr.Jit 1.5 uses LLVM RuntimeDyld on Windows. Its linker can fail to
+    # resolve constant-pool symbols in kernels containing symbolic callables.
+    # Evaluated loops and calls trace the same paths in smaller kernels.
+    solver.loop_mode = "evaluated"
+    with (
+        dr.scoped_set_flag(dr.JitFlag.SymbolicLoops, False),
+        dr.scoped_set_flag(dr.JitFlag.SymbolicConditionals, False),
+        dr.scoped_set_flag(dr.JitFlag.SymbolicCalls, False),
+    ):
+        return solver(scene, **options)

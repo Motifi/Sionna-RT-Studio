@@ -27,6 +27,7 @@ from .models import (
     SolverOptions,
     Transmitter,
 )
+from .runtime_env import trace_paths_for_runtime
 from .scene_build import building_polygon, build_scene, inspect_scene
 from .solver_runtime import solver_runtime
 
@@ -193,19 +194,20 @@ def _place_tx(scene, name: str, pos: list[float], beam: list[float] | None,
 
 def _trace_paths(scene, max_depth: int, opts: SolverOptions | None):
     """Run PathSolver on the scene with the request's interaction switches."""
-    from sionna.rt import PathSolver
-
     opts = opts or SolverOptions()
-    return PathSolver()(scene, max_depth=int(max(0, max_depth)),
-                        samples_per_src=int(opts.pathSamplesPerSource),
-                        seed=int(opts.pathSeed),
-                        los=opts.los,
-                        specular_reflection=opts.specularReflection,
-                        diffuse_reflection=opts.diffuseReflection,
-                        refraction=opts.refraction,
-                        diffraction=opts.diffraction,
-                        edge_diffraction=opts.edgeDiffraction,
-                        synthetic_array=True)
+    return trace_paths_for_runtime(
+        scene,
+        max_depth=int(max(0, max_depth)),
+        samples_per_src=int(opts.pathSamplesPerSource),
+        seed=int(opts.pathSeed),
+        los=opts.los,
+        specular_reflection=opts.specularReflection,
+        diffuse_reflection=opts.diffuseReflection,
+        refraction=opts.refraction,
+        diffraction=opts.diffraction,
+        edge_diffraction=opts.edgeDiffraction,
+        synthetic_array=True,
+    )
 
 
 def _device_z(enu: ENUVector, height: float, buildings: list[BuildingFootprint], reference: str = "roof") -> float:

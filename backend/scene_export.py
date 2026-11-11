@@ -200,7 +200,7 @@ def _load_scene_script(req: SceneExportRequest) -> str:
 
     material_imports, material_lines = _material_lines(req.materials)
     rt_imports = [
-        "PathSolver", "PlanarArray", "Receiver", "Transmitter",
+        "PlanarArray", "Receiver", "Transmitter",
         "load_scene", "subcarrier_frequencies",
     ] + material_imports
 
@@ -220,7 +220,7 @@ def _load_scene_script(req: SceneExportRequest) -> str:
         "import numpy as np",
         "from pathlib import Path",
         "import os",
-        "from srts_runtime import configure_drjit_llvm_path",
+        "from srts_runtime import configure_drjit_llvm_path, trace_paths_for_runtime",
         "",
         "configure_drjit_llvm_path()",
         "import mitsuba as mi",
@@ -298,7 +298,7 @@ def _load_scene_script(req: SceneExportRequest) -> str:
         "    )",
         "    _add_devices(group['txIndices'], group['rxIndices'])",
         "",
-        "    paths = PathSolver()(",
+        "    paths = trace_paths_for_runtime(",
         "        scene,",
         f"        max_depth={int(max(0, req.maxDepth))},",
         f"        samples_per_src={int(opts.pathSamplesPerSource)},",
