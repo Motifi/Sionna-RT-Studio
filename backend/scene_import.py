@@ -1,5 +1,6 @@
 """Import a bounded, offline mesh copy. Mitsuba XML is parsed as data."""
 from io import BytesIO
+import json
 from pathlib import PurePosixPath
 from uuid import uuid4
 import xml.etree.ElementTree as ET
@@ -9,12 +10,13 @@ import numpy as np
 import trimesh
 
 from .models import BuildingFootprint, ENUVector, TriangleMesh
-from .scene_build import GROUND_MATERIAL, MATERIAL_MAP
+from .scene_build import GROUND_BSDF_ID, GROUND_MATERIAL, MATERIAL_MAP
 
 MAX_UPLOAD = 32 * 1024 * 1024
 MAX_VERTICES = 100_000
 MAX_TRIANGLES = 150_000
 MAX_SHAPES = 256
+STUDIO_GROUND_PATH = PurePosixPath("meshes/ground.ply")
 
 # Prefer canonical UI ids where more than one id refers to the same preset.
 ITU_IDS = {value: key for key, value in MATERIAL_MAP.items()}
@@ -66,6 +68,22 @@ def _transform(shape: ET.Element) -> np.ndarray:
     return result
 
 
+def _has_studio_ground(archive: ZipFile, xml: PurePosixPath, names: set[str]) -> bool:
+    path = str(xml.parent / "manifest.json")
+    if path not in names or archive.getinfo(path).file_size > 2 * 1024 * 1024:
+        return False
+    try:
+        manifest = json.loads(archive.read(path))
+    except (ValueError, RecursionError):
+        return False
+    return (
+        isinstance(manifest, dict)
+        and manifest.get("format") == "SionnaRTStudio standalone Sionna RT scene"
+        and isinstance(manifest.get("meshFiles"), list)
+        and str(STUDIO_GROUND_PATH) in manifest["meshFiles"]
+    )
+
+
 def _package_meshes(data: bytes):
     try:
         with ZipFile(BytesIO(data)) as archive:
@@ -92,6 +110,7 @@ def _package_meshes(data: bytes):
             shapes = root.findall("shape")
             if len(shapes) > MAX_SHAPES:
                 raise ValueError(f"Scene package exceeds {MAX_SHAPES} shapes.")
+            has_studio_ground = _has_studio_ground(archive, xml, names)
             skipped = []
             for shape in shapes:
                 suffix = shape.get("type")
@@ -112,12 +131,20 @@ def _package_meshes(data: bytes):
                     type_node = bsdf.find("./string[@name='type']")
                     itu_name = type_node.get("value") if type_node is not None else None
                 material = ITU_IDS.get(itu_name)
+                generated_ground = (
+                    has_studio_ground and suffix == "ply" and shape.get("id") == "mesh-ground"
+                    and path == STUDIO_GROUND_PATH
+                    and reference is not None and reference.get("id") == GROUND_BSDF_ID
+                    and material == GROUND_MATERIAL and shape.find("transform") is None
+                    and len(mesh.vertices) == 4 and len(mesh.faces) == 2
+                    and np.isfinite(mesh.vertices).all() and np.all(mesh.vertices[:, 2] == 0)
+                )
                 issues = [] if material else [f"No supported ITU material mapping for {ident!r}; using the selected preset."]
                 if material and len(bsdf) > 1:
                     issues.append("Imported the ITU preset; XML material overrides need review.")
-                yield mesh, ident if shape.get("id") else path.stem, material, issues
+                yield mesh, ident if shape.get("id") else path.stem, material, issues, generated_ground
             if skipped:
-                yield None, "", None, skipped
+                yield None, "", None, skipped, False
     except (BadZipFile, ET.ParseError, KeyError, NotImplementedError, RuntimeError) as exc:
         raise ValueError(f"Invalid Mitsuba scene package: {exc}") from exc
 
@@ -129,11 +156,15 @@ def import_meshes(data: bytes, filename: str, axes: str, scale: float, fallback:
         raise ValueError("Choose PLY, OBJ or a Mitsuba ZIP.")
     if fallback not in MATERIAL_MAP:
         raise ValueError("Choose a supported radio material.")
-    entries = _package_meshes(data) if suffix == "zip" else [(_load_mesh(data, suffix), path.stem, fallback, [])]
+    entries = _package_meshes(data) if suffix == "zip" else [(_load_mesh(data, suffix), path.stem, fallback, [], False)]
     objects = []
     issues = []
+    regenerate_ground = False
     vertices = triangles = 0
-    for mesh, name, material, notes in entries:
+    for mesh, name, material, notes, generated_ground in entries:
+        if generated_ground:
+            regenerate_ground = True
+            continue
         if mesh is None:
             issues.extend(notes)
             continue
@@ -158,6 +189,8 @@ def import_meshes(data: bytes, filename: str, axes: str, scale: float, fallback:
                      "boundsMinENU": str(low.tolist()), "boundsMaxENU": str(high.tolist())},
             mesh=TriangleMesh(vertices=points.reshape(-1).tolist(), triangles=mesh.faces.reshape(-1).tolist()),
         ))
-    if not objects:
+    if not objects and not regenerate_ground:
         raise ValueError("Package has no supported PLY or OBJ shapes.")
+    if regenerate_ground:
+        issues.append("Studio will generate the ground plane for the resulting scene.")
     return {"objects": [obj.model_dump(exclude_none=True) for obj in objects], "issues": issues, "vertexCount": vertices, "triangleCount": triangles}

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { BuildingFootprint, ENUVector, GeoAnchor } from './types';
-import { enuToLatLon } from './utils';
+import { createIdSuffix, enuToLatLon } from './utils';
 
 export type SceneTool = 'select' | 'rectangle' | 'polygon' | 'wall' | 'move';
 export type SceneLayer = BuildingFootprint['category'];
@@ -57,7 +57,7 @@ export function useSceneEditor(
   };
   const create = (kind: 'building' | 'wall', vertices: ENUVector[]) => {
     insert(withFootprint({
-      id: crypto.randomUUID(), kind, category: 'building', source: 'manual',
+      id: createIdSuffix(), kind, category: 'building', source: 'manual',
       type: kind, height: kind === 'wall' ? 3 : 8, baseZ: 0, material: 'itu_concrete',
       heightSource: 'manual', materialSource: 'manual', enuPoints: [], points: [],
     }, vertices, anchor));
@@ -91,7 +91,7 @@ export function useSceneEditor(
     hiddenLayers, setHiddenLayers, draft, click, update,
     finish: () => { if (tool === 'polygon' && draft.length >= 3) create('building', draft); },
     duplicate: () => {
-      if (selected) insert({ ...shift(selected, 3, 3), id: crypto.randomUUID() });
+      if (selected) insert({ ...shift(selected, 3, 3), id: createIdSuffix() });
     },
     remove: () => {
       if (selected) commit(buildings.filter(object => object.id !== selected.id));

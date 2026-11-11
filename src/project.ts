@@ -13,11 +13,14 @@ import {
 } from './types';
 
 export const PROJECT_SCHEMA_VERSION = 3;
-// Keep the existing storage key so an upgrade can read and migrate the autosave.
+// Keep the existing key to migrate old localStorage autosaves.
 export const PROJECT_STORAGE_KEY = 'sionna-rt-studio.project.v1';
+const PROJECT_DATABASE = 'sionna-rt-studio';
+const PROJECT_STORE = 'projects';
 
 export type StudioWorkspace = 'scene' | 'planning' | 'preview' | 'export';
 export type StudioMode = 'link' | 'heatmap' | 'playback';
+export type ProjectAutosaveStatus = 'saving' | 'saved' | 'error' | 'disabled';
 export interface StudioCsiSettings {
   numSubcarriers: number;
   subcarrierSpacingKhz: number;
@@ -313,34 +316,110 @@ export function parseProjectDocument(value: string | unknown): StudioProjectDocu
   return { format: 'SionnaRTStudio Project', schemaVersion: PROJECT_SCHEMA_VERSION, savedAtUtc: parsed.savedAtUtc, state };
 }
 
-export function loadAutosavedProject(): StudioProjectDocument | null {
+// All operations in this page enter the database in the order they were
+// requested. In particular a reset must complete after any in-flight save.
+let pendingStorageOperation: Promise<unknown> = Promise.resolve();
+
+function queueStorageOperation<T>(operation: () => Promise<T>): Promise<T> {
+  const next = pendingStorageOperation.then(operation);
+  pendingStorageOperation = next.catch(() => undefined);
+  return next;
+}
+
+function openProjectDatabase(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = window.indexedDB.open(PROJECT_DATABASE, 1);
+    let blocked = false;
+    request.onupgradeneeded = () => request.result.createObjectStore(PROJECT_STORE);
+    request.onerror = () => reject(request.error);
+    request.onblocked = () => {
+      blocked = true;
+      reject(new Error('The project database is blocked by another window.'));
+    };
+    request.onsuccess = () => {
+      if (blocked) request.result.close();
+      else resolve(request.result);
+    };
+  });
+}
+
+async function projectTransaction<T>(
+  run: (store: IDBObjectStore, setResult: (value: T) => void, reject: (error: unknown) => void) => void,
+): Promise<T> {
+  const database = await openProjectDatabase();
   try {
-    const saved = window.localStorage.getItem(PROJECT_STORAGE_KEY);
-    if (!saved) return null;
-    const original = JSON.parse(saved);
-    const project = parseProjectDocument(original);
-    if (original.schemaVersion < PROJECT_SCHEMA_VERSION) {
-      const backupKey = `${PROJECT_STORAGE_KEY}.pre-v3`;
-      try {
-        if (!localStorage.getItem(backupKey)) localStorage.setItem(backupKey, saved);
-      } catch {
-        // The existing project can still be read at the browser quota.
-      }
-    }
-    return project;
-  } catch (error) {
-    console.warn('Could not restore the autosaved SionnaRTStudio project.', error);
-    return null;
+    return await new Promise<T>((resolve, reject) => {
+      const transaction = database.transaction(PROJECT_STORE, 'readwrite', { durability: 'strict' });
+      let result: T;
+      transaction.oncomplete = () => resolve(result);
+      transaction.onabort = () => reject(transaction.error ?? new Error('The project transaction was interrupted.'));
+      run(transaction.objectStore(PROJECT_STORE), value => { result = value; }, reject);
+    });
+  } finally {
+    database.close();
   }
 }
 
-export function saveAutosavedProject(state: StudioProjectState): void {
-  window.localStorage.setItem(
-    PROJECT_STORAGE_KEY,
-    JSON.stringify(createProjectDocument(state)),
-  );
+export function loadAutosavedProject(): Promise<StudioProjectDocument | null> {
+  return queueStorageOperation(async () => {
+    let migrated: { raw: string; oldSchema: boolean } | undefined;
+    const saved = await projectTransaction<unknown>((store, setResult, reject) => {
+      const request = store.get(PROJECT_STORAGE_KEY);
+      request.onsuccess = () => {
+        if (request.result !== undefined) {
+          setResult(request.result);
+          return;
+        }
+        // The read and first write share a transaction so another window's save
+        // cannot be overwritten by a migration that observed an empty store.
+        try {
+          const raw = window.localStorage.getItem(PROJECT_STORAGE_KEY);
+          if (raw === null) {
+            setResult(null);
+            return;
+          }
+          const original: unknown = JSON.parse(raw);
+          const project = parseProjectDocument(original);
+          store.put(project, PROJECT_STORAGE_KEY);
+          migrated = { raw, oldSchema: isRecord(original) && original.schemaVersion !== PROJECT_SCHEMA_VERSION };
+          setResult(project);
+        } catch (error) {
+          reject(error);
+        }
+      };
+    });
+    if (migrated) {
+      try {
+        window.localStorage.removeItem(PROJECT_STORAGE_KEY);
+        const backupKey = `${PROJECT_STORAGE_KEY}.pre-v3`;
+        if (migrated.oldSchema && !window.localStorage.getItem(backupKey)) {
+          window.localStorage.setItem(backupKey, migrated.raw);
+        }
+      } catch (error) {
+        console.warn('Could not update the legacy project backup.', error);
+      }
+    }
+    return saved === null ? null : parseProjectDocument(saved);
+  });
 }
 
-export function clearAutosavedProject(): void {
-  window.localStorage.removeItem(PROJECT_STORAGE_KEY);
+export function saveAutosavedProject(state: StudioProjectState): Promise<void> {
+  return queueStorageOperation(() => projectTransaction<void>(store => {
+    store.put(createProjectDocument(state), PROJECT_STORAGE_KEY);
+  }));
+}
+
+export function clearAutosavedProject(): Promise<void> {
+  return queueStorageOperation(async () => {
+    // Record the reset before removing the old fallback. An interrupted
+    // transaction leaves the previous project available in either store.
+    await projectTransaction<void>(store => {
+      store.put(null, PROJECT_STORAGE_KEY);
+    });
+    try {
+      window.localStorage.removeItem(PROJECT_STORAGE_KEY);
+    } catch (error) {
+      console.warn('Could not remove the legacy project after reset.', error);
+    }
+  });
 }

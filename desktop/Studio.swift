@@ -2,7 +2,7 @@ import AppKit
 import WebKit
 
 @MainActor
-final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate,
+final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate,
     WKDownloadDelegate, WKScriptMessageHandler {
     private let bundle = Bundle.main
     private let origin: URL
@@ -23,6 +23,9 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
     private var smokeProject: URL?
     private var smokeCsi: URL?
     private var downloads: [ObjectIdentifier: (stage: URL, destination: URL)] = [:]
+    private var checkingProjectBeforeClose = false
+    private var terminationPending = false
+    private var closeApproved = false
 
     override init() {
         let arguments = ProcessInfo.processInfo.arguments
@@ -64,6 +67,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
         window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable],
                           backing: .buffered, defer: false)
+        window.delegate = self
         window.title = "Sionna RT Studio"
         window.minSize = NSSize(width: 840, height: 580)
         window.center()
@@ -97,6 +101,75 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if closeApproved { return true }
+        checkProjectBeforeClosing()
+        return false
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if closeApproved || smokeReport != nil || window == nil { return .terminateNow }
+        terminationPending = true
+        checkProjectBeforeClosing()
+        return .terminateLater
+    }
+
+    private func checkProjectBeforeClosing() {
+        guard !checkingProjectBeforeClose else { return }
+        checkingProjectBeforeClose = true
+        Task { [self] in
+            var approved = await waitForProjectSave()
+            if !approved {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = text("The project has unsaved changes", "项目有未保存的修改")
+                alert.informativeText = text("Keep Studio open to retry saving or export the project.",
+                                             "保持实验台打开以重试保存或导出项目。")
+                alert.addButton(withTitle: text("Keep Studio open", "保持打开"))
+                alert.addButton(withTitle: text("Discard changes", "放弃修改"))
+                approved = await withCheckedContinuation { continuation in
+                    alert.beginSheetModal(for: window) { response in
+                        continuation.resume(returning: response == .alertSecondButtonReturn)
+                    }
+                }
+            }
+            checkingProjectBeforeClose = false
+            closeApproved = approved
+            if terminationPending {
+                terminationPending = false
+                NSApp.reply(toApplicationShouldTerminate: approved)
+            } else if approved {
+                window.close()
+            }
+        }
+    }
+
+    private func waitForProjectSave() async -> Bool {
+        guard let url = webView.url, isLocal(url) else { return true }
+        return await withCheckedContinuation { continuation in
+            var completed = false
+            func finish(_ saved: Bool) {
+                guard !completed else { return }
+                completed = true
+                continuation.resume(returning: saved)
+            }
+            Task { @MainActor in
+                let result = try? await webView.callAsyncJavaScript("""
+                    const saveState = () => document.documentElement?.dataset.projectSaveState;
+                    window.dispatchEvent(new Event('sionna-studio-flush-project'));
+                    const deadline = Date.now() + 1800;
+                    while (saveState() === 'saving' && Date.now() < deadline) {
+                        await new Promise(resolve => setTimeout(resolve, 50));
+                    }
+                    return !['saving', 'error'].includes(saveState());
+                    """, arguments: [:], in: nil, contentWorld: .page)
+                finish(result as? Bool == true)
+            }
+            // WebKit may take longer to respond if its page process is busy.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { finish(false) }
+        }
+    }
 
     func applicationWillTerminate(_ notification: Notification) {
         stopServer()
@@ -407,7 +480,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
         let check = """
             async function waitFor(check, label = 'expected state') {
               for (let attempt = 0; attempt < 300; attempt++) {
-                const result = check();
+                const result = await check();
                 if (result) return result;
                 await new Promise(resolve => setTimeout(resolve, 100));
               }
@@ -418,7 +491,23 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
               navFor(id).click();
               await waitFor(() => navFor(id).getAttribute('aria-current') === 'page', id + ' workspace');
             };
-            const project = () => JSON.parse(localStorage.getItem('sionna-rt-studio.project.v1'));
+            const project = async () => {
+              const database = await new Promise((resolve, reject) => {
+                const request = indexedDB.open('sionna-rt-studio', 1);
+                request.onsuccess = () => resolve(request.result);
+                request.onerror = () => reject(request.error);
+              });
+              try {
+                return await new Promise((resolve, reject) => {
+                  const transaction = database.transaction('projects');
+                  const request = transaction.objectStore('projects').get('sionna-rt-studio.project.v1');
+                  transaction.oncomplete = () => resolve(request.result);
+                  transaction.onabort = () => reject(transaction.error);
+                });
+              } finally {
+                database.close();
+              }
+            };
             const setNumber = async (selector, value) => {
               const input = await waitFor(() => document.querySelector(selector), selector);
               input.focus();
@@ -469,21 +558,24 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
             transfer.items.add(new File([JSON.stringify(legacy)], 'legacy-project.json', {type: 'application/json'}));
             legacyInput.files = transfer.files;
             legacyInput.dispatchEvent(new Event('change', {bubbles: true}));
-            await waitFor(() => navFor('planning').getAttribute('aria-current') === 'page' &&
-              project()?.schemaVersion === 3 &&
-              project().state.devices.transmitters[0].beamsteeringAzimuth === 37 &&
-              project().state.devices.transmitters[0].beamsteeringElevation === -12 &&
-              project().state.mobility.trajectoriesByRxId[oldRxId]?.length === 2 &&
-              project().state.scene.buildings.length === starter.state.scene.buildings.length, 'legacy project migration');
+            await waitFor(async () => {
+              const saved = await project();
+              return navFor('planning').getAttribute('aria-current') === 'page' &&
+                saved?.schemaVersion === 3 &&
+                saved.state.devices.transmitters[0].beamsteeringAzimuth === 37 &&
+                saved.state.devices.transmitters[0].beamsteeringElevation === -12 &&
+                saved.state.mobility.trajectoriesByRxId[oldRxId]?.length === 2 &&
+                saved.state.scene.buildings.length === starter.state.scene.buildings.length;
+            }, 'legacy project migration');
             if (document.querySelector('#canvas-3d') !== canvas) throw new Error('Workspace change replaced the 3D canvas');
             const receivers = () => [...document.querySelectorAll('[data-device-type="rx"] [data-device-id]')];
-            const savedDevices = () => project()?.state.devices;
+            const savedDevices = async () => (await project())?.state.devices;
             const clickScene = (x, y) => {
               const rect = canvas.getBoundingClientRect();
               canvas.dispatchEvent(new MouseEvent('click', {bubbles: true,
                 clientX: rect.left + rect.width * x, clientY: rect.top + rect.height * y}));
             };
-            const before = await waitFor(() => savedDevices()?.receivers.length > 0 && savedDevices(), 'initial receivers');
+            const before = await waitFor(savedDevices, 'initial receivers');
             const count = before.receivers.length;
             const add = document.querySelector('#btn-add-rx');
             add.click();
@@ -493,7 +585,10 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
             clickScene(0.65, 0.58);
             await waitFor(() => receivers().length === count + 2, 'second new receiver');
             document.querySelector('#btn-finish-placement').click();
-            const placed = await waitFor(() => savedDevices()?.receivers.length === count + 2 && savedDevices(), 'saved receivers');
+            const placed = await waitFor(async () => {
+              const devices = await savedDevices();
+              return devices?.receivers.length === count + 2 && devices;
+            }, 'saved receivers');
             const samePosition = (a, b) => a && b && Math.hypot(a.enu.x - b.enu.x, a.enu.y - b.enu.y, a.enu.z - b.enu.z) < 0.001;
             if (!before.receivers.every(rx => samePosition(rx, placed.receivers.find(item => item.id === rx.id)))) {
               throw new Error('Adding receivers moved an existing receiver');
@@ -506,8 +601,8 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
             await waitFor(() => move.getAttribute('aria-pressed') === 'true', 'receiver move mode');
             clickScene(0.53, 0.72);
             await waitFor(() => move.getAttribute('aria-pressed') === 'false', 'receiver move completed');
-            const moved = await waitFor(() => {
-              const devices = savedDevices();
+            const moved = await waitFor(async () => {
+              const devices = await savedDevices();
               return devices?.receivers.length === count + 2 &&
                 !samePosition(placed.receivers[count], devices.receivers.find(rx => rx.id === selected.dataset.deviceId)) && devices;
             }, 'saved moved receiver');
@@ -521,7 +616,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
             await waitFor(() => add.getAttribute('aria-pressed') === 'false', 'placement cancelled');
             clickScene(0.48, 0.68);
             await new Promise(resolve => setTimeout(resolve, 600));
-            if (receivers().length !== count + 2 || savedDevices()?.receivers.length !== count + 2) {
+            if (receivers().length !== count + 2 || (await savedDevices())?.receivers.length !== count + 2) {
               throw new Error('Cancelled placement added a receiver');
             }
             const transmitters = () => document.querySelectorAll('[data-device-type="tx"] [data-device-id]');
@@ -532,18 +627,22 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
             clickScene(0.38, 0.66);
             await waitFor(() => transmitters().length === txCount + 1, 'new transmitter');
             document.querySelector('#btn-finish-placement').click();
-            const apId = await waitFor(() => savedDevices()?.transmitters.length === txCount + 1 && savedDevices().activeTxId,
-              'active AP');
+            const apId = await waitFor(async () => {
+              const devices = await savedDevices();
+              return devices?.transmitters.length === txCount + 1 && devices.activeTxId;
+            }, 'active AP');
             await setNumber('#input-ap-fronthaul', 25);
-            await waitFor(() => savedDevices()?.fronthaulMbpsByTxId[apId] === 25, 'fronthaul 25 Mbps');
+            await waitFor(async () => (await savedDevices())?.fronthaulMbpsByTxId[apId] === 25, 'fronthaul 25 Mbps');
 
             await go('scene');
             const samples = document.querySelector('#select-path-samples');
             samples.value = '10000';
             samples.dispatchEvent(new Event('change', {bubbles: true}));
             await setNumber('#input-csi-subcarriers', 8);
-            await waitFor(() => project()?.state.solver.options.pathSamplesPerSource === 10000 &&
-              project()?.state.csi.numSubcarriers === 8, 'quick CSI sampling');
+            await waitFor(async () => {
+              const state = (await project())?.state;
+              return state?.solver.options.pathSamplesPerSource === 10000 && state.csi.numSubcarriers === 8;
+            }, 'quick CSI sampling');
 
             const runRequests = [];
             const completedRuns = [];
@@ -607,7 +706,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
             const beforeFronthaul = await extractZip(staticRun, 25);
             await go('planning');
             await setNumber('#input-ap-fronthaul', 0);
-            await waitFor(() => savedDevices()?.fronthaulMbpsByTxId[apId] === 0, 'explicit zero fronthaul');
+            await waitFor(async () => (await savedDevices())?.fronthaulMbpsByTxId[apId] === 0, 'explicit zero fronthaul');
             await go('export');
             if (document.querySelector('#btn-export-csi-run').disabled) throw new Error('Fronthaul edit invalidated CSI');
             const afterFronthaul = await extractZip(staticRun, 0);
@@ -616,29 +715,29 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
             }
             await go('scene');
             await setNumber('#input-csi-subcarriers', 9);
-            await waitFor(() => project()?.state.csi.numSubcarriers === 9, 'changed CSI input');
+            await waitFor(async () => (await project())?.state.csi.numSubcarriers === 9, 'changed CSI input');
             await go('export');
             if (!document.querySelector('#btn-export-csi-run').disabled) throw new Error('Stale CSI remained exportable');
 
             await go('planning');
-            const plannedRx = savedDevices().activeRxId;
+            const plannedRx = (await savedDevices()).activeRxId;
             const draw = document.querySelector('#btn-draw-3d-mobility-path');
             draw.click();
             await waitFor(() => draw.getAttribute('aria-pressed') === 'true', 'draw mode');
             clickScene(0.42, 0.68);
-            await waitFor(() => project()?.state.mobility.trajectoriesByRxId[plannedRx]?.length === 1, 'first control point');
+            await waitFor(async () => (await project())?.state.mobility.trajectoriesByRxId[plannedRx]?.length === 1, 'first control point');
             clickScene(0.62, 0.67);
-            const track = await waitFor(() => {
-              const points = project()?.state.mobility.trajectoriesByRxId[plannedRx];
+            const track = await waitFor(async () => {
+              const points = (await project())?.state.mobility.trajectoriesByRxId[plannedRx];
               return points?.length === 2 && points;
             }, 'second control point');
             await setNumber('#input-rx-ant-h', 8);
             await setNumber('#input-rx-ant-v', 8);
-            await waitFor(() => savedDevices()?.receivers.find(rx => rx.id === plannedRx)?.antennaArraySize.join() === '8,8',
+            await waitFor(async () => (await savedDevices())?.receivers.find(rx => rx.id === plannedRx)?.antennaArraySize.join() === '8,8',
               '64-port receiver');
             await go('scene');
             await setNumber('#input-csi-subcarriers', 256);
-            await waitFor(() => project()?.state.csi.numSubcarriers === 256, '256 CSI subcarriers');
+            await waitFor(async () => (await project())?.state.csi.numSubcarriers === 256, '256 CSI subcarriers');
             await go('preview');
             if (document.querySelector('#btn-draw-3d-mobility-path')) throw new Error('Draw controls remained visible in Preview');
             const outputSelect = document.querySelector('#select-csi-output');
@@ -668,7 +767,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
             if (motionManifest.output !== 'cir' ||
                 JSON.stringify(motionManifest.timeSeconds) !== JSON.stringify(trajectoryRun.timeSeconds) ||
                 JSON.stringify(motionManifest.rxPositions) !== JSON.stringify(trajectoryRun.rxPositions) ||
-                JSON.stringify(track) !== JSON.stringify(project().state.mobility.trajectoriesByRxId[plannedRx])) {
+                JSON.stringify(track) !== JSON.stringify((await project()).state.mobility.trajectoriesByRxId[plannedRx])) {
               throw new Error('Exported times/positions or source control points changed');
             }
             if (runRequests.length !== 2 || document.querySelector('#canvas-3d') !== canvas) {

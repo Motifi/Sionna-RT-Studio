@@ -41,6 +41,9 @@ MAX_DEPTH = 3
 # bounded by the chunk — this cap guards total runtime and output size. Keep in
 # sync with CHANNEL_GRID_MAX_CELLS in src/components/ExportPanel.tsx.
 MAX_CHANNEL_GRID_CELLS = 16384
+# Coverage returns one JSON object per cell and allocates metrics per Tx × cell.
+MAX_RADIO_MAP_CELLS = 250_000
+MAX_RADIO_MAP_TX_CELLS = 1_000_000
 
 
 @dataclass
@@ -1110,37 +1113,22 @@ def _path_type(order: int, kinds: list[int]) -> str:
     return "NLOS"
 
 
-def _segment_has_building_los(
-    start: list[float],
-    end: list[float],
-    buildings: list[BuildingFootprint],
-) -> bool:
-    """Approximate LOS test for radio-map cells using the scene footprints."""
-    from shapely.geometry import LineString, Polygon
+def _segment_visibility(scene, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
+    """Test unobstructed segments against the same mesh used for propagation."""
+    import drjit as dr
+    import mitsuba as mi
+    from sionna.rt.utils import spawn_ray_to
 
-    line = LineString([(float(start[0]), float(start[1])), (float(end[0]), float(end[1]))])
-    for b in buildings:
-        if b.category != "building" or len(b.enuPoints) < 3:
-            continue
-        try:
-            poly = Polygon([(p.x, p.y) for p in b.enuPoints])
-            if poly.is_empty or not line.intersects(poly):
-                continue
-        except Exception:
-            continue
-
-        # If the 2D segment crosses the footprint, sample the segment near the
-        # building center. If the ray is below the roof there, LOS is blocked.
-        bx, by = poly.centroid.x, poly.centroid.y
-        dx, dy = float(end[0]) - float(start[0]), float(end[1]) - float(start[1])
-        denom = dx * dx + dy * dy
-        if denom <= 1e-9:
-            continue
-        t = max(0.0, min(1.0, ((bx - float(start[0])) * dx + (by - float(start[1])) * dy) / denom))
-        z_at_building = float(start[2]) + t * (float(end[2]) - float(start[2]))
-        if 0.0 <= z_at_building <= float(b.height):
-            return False
-    return True
+    origins = mi.Point3f(starts.T)
+    targets = mi.Point3f(ends.T)
+    lengths = dr.norm(targets - origins)
+    rays = spawn_ray_to(origins, targets)
+    # spawn_ray_to excludes the target. Also move off the source surface.
+    offset = dr.minimum(1e-4, lengths * 0.25)
+    rays.o += rays.d * offset
+    rays.maxt -= offset
+    active = lengths > 0
+    return np.asarray(to_numpy(active & ~scene.mi_scene.ray_test(rays, active=active)), dtype=bool)
 
 
 def _empty_metrics() -> ChannelMetrics:
@@ -1200,20 +1188,27 @@ def _to_tx_cells(arr, num_tx: int, n_cells: int) -> np.ndarray:
     return a.reshape(num_tx, -1)[:, :n_cells]
 
 
+def _validate_radio_map_grid(size_x: float, size_y: float, cell: float,
+                             center: list[float], num_tx: int) -> None:
+    # Match Sionna's PlanarRadioMap, which divides in float32 and rounds each
+    # dimension up before allocating the grid.
+    with np.errstate(over="ignore"):
+        sizes = np.asarray([size_x, size_y, cell, *center], dtype=np.float32)
+    if not np.isfinite(sizes).all():
+        raise ValueError("Coverage extent, height and grid step must be finite in solver coordinates.")
+    nx, ny = map(math.ceil, sizes[:2] / sizes[2])
+    requested_cells = nx * ny
+    max_cells = min(MAX_RADIO_MAP_CELLS, MAX_RADIO_MAP_TX_CELLS // num_tx)
+    if requested_cells > max_cells:
+        raise ValueError(
+            f"Coverage grid needs {requested_cells:,} cells, exceeding the {max_cells:,}-cell limit "
+            f"for {num_tx} transmitter(s). Increase the grid step or move distant geometry and "
+            "transmitters closer together."
+        )
+
+
 def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
-    from sionna.rt import RadioMapSolver
-
     txs = req.transmitters()
-    scene = build_scene(req.buildings, req.freqGhz, req.materials)
-
-    # Physical noise floor for SINR: bandwidth → thermal noise; fold the receiver
-    # noise figure into an effective temperature (raises the floor by NF dB).
-    try:
-        scene.bandwidth = float(req.bandwidthHz)
-        scene.temperature = 293.0 * (10.0 ** (float(req.noiseFigureDb) / 10.0))
-    except Exception:
-        pass
-
     # Bounding box must enclose every transmitter and all geometry.
     xs = [t.enu.x for t in txs]
     ys = [t.enu.y for t in txs]
@@ -1223,14 +1218,31 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
             ys.append(p.y)
     minx, maxx = min(xs), max(xs)
     miny, maxy = min(ys), max(ys)
-    cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
     size_x = max(maxx - minx, 100.0) + 60.0
     size_y = max(maxy - miny, 100.0) + 60.0
-    cell = max(float(req.gridSize), 1.0)
+    grid_step = float(req.gridSize)
+    if not math.isfinite(grid_step):
+        raise ValueError("Coverage grid step must be finite.")
+    cell = max(grid_step, 1.0)
+    center = [minx / 2.0 + maxx / 2.0, miny / 2.0 + maxy / 2.0, float(req.gridHeight)]
+    num_tx = len(txs)
+    _validate_radio_map_grid(size_x, size_y, cell, center, num_tx)
 
     array_sizes = [tuple(int(v) for v in t.antennaArraySize) for t in txs]
     if any(size != array_sizes[0] for size in array_sizes):
         raise ValueError("Radio maps with multiple transmitters require matching antennaArraySize")
+
+    from sionna.rt import RadioMapSolver
+
+    scene = build_scene(req.buildings, req.freqGhz, req.materials)
+
+    # Physical noise floor for SINR: bandwidth → thermal noise; fold the receiver
+    # noise figure into an effective temperature (raises the floor by NF dB).
+    try:
+        scene.bandwidth = float(req.bandwidthHz)
+        scene.temperature = 293.0 * (10.0 ** (float(req.noiseFigureDb) / 10.0))
+    except Exception:
+        pass
 
     # Directive array so the beam genuinely steers; default uniform precoding
     # forms the main lobe along each Tx's boresight.
@@ -1249,7 +1261,7 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
 
     rm = RadioMapSolver()(
         scene,
-        center=[cx, cy, float(req.gridHeight)],
+        center=center,
         orientation=[0.0, 0.0, 0.0],
         size=[size_x, size_y],
         cell_size=[cell, cell],
@@ -1266,8 +1278,6 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
 
     centers = np.asarray(to_numpy(rm.cell_centers), dtype=float).reshape(-1, 3)
     n_cells = centers.shape[0]
-    num_tx = len(txs)
-
     rss = _to_tx_cells(rm.rss, num_tx, n_cells)     # (num_tx, n_cells) linear W
     sinr = _to_tx_cells(rm.sinr, num_tx, n_cells)   # (num_tx, n_cells) linear
 
@@ -1287,26 +1297,22 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
     chosen = best_pwr if metric == "power" else sinr_db
     stats = _coverage_stats(chosen, metric, threshold)
 
+    # RadioMapSolver does not return a LOS flag. Test geometric visibility from
+    # each served cell's best Tx, independently of the propagation options.
+    reached = np.isfinite(best_pwr)
+    is_los = np.zeros(n_cells, dtype=bool)
+    if reached.any():
+        origins = np.asarray(tx_positions)[best_tx[reached]]
+        is_los[reached] = _segment_visibility(scene, origins, centers[reached])
+
     cells: list[RadioMapCell] = []
     for k in range(n_cells):
         pos = centers[k]
-        finite = np.isfinite(best_pwr[k])
-        power = float(best_pwr[k]) if finite else -250.0
+        power = float(best_pwr[k]) if reached[k] else -250.0
         sinr_val = float(sinr_db[k]) if np.isfinite(sinr_db[k]) else None
-        serving = int(best_tx[k]) if finite else None
-        # NOTE: Sionna's RadioMapSolver exposes path gain / RSS / SINR per cell,
-        # but not a per-cell LOS flag. `isLos` here is an app-side approximation
-        # from the 2D footprints (best-server Tx → cell), not an RT output, so it
-        # can disagree with the actual propagation (e.g. a footprint-"blocked"
-        # cell still served via reflection/diffraction). It drives only UI hints
-        # and the synthetic channel-grid LOS hint, never the RSS/SINR values.
-        is_los = False
-        if finite:
-            is_los = _segment_has_building_los(
-                tx_positions[int(best_tx[k])],
-                [float(pos[0]), float(pos[1]), float(pos[2])], req.buildings)
+        serving = int(best_tx[k]) if reached[k] else None
         cells.append(RadioMapCell(x=float(pos[0]), y=float(pos[1]), z=float(pos[2]),
-                                  powerDbm=power, isLos=is_los, sinr=sinr_val,
+                                  powerDbm=power, isLos=bool(is_los[k]), sinr=sinr_val,
                                   servingTx=serving))
 
     return RadioMapGrid(cells=cells, minX=float(minx), maxX=float(maxx),

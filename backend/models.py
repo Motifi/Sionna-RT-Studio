@@ -122,9 +122,8 @@ class RadioMapCell(BaseModel):
     y: float
     z: float
     powerDbm: float       # best-server received power (RSS) [dBm]
-    # Geometric LOS approximation from the 2D footprints, NOT a Sionna RadioMap
-    # output (which exposes path gain / RSS / SINR only). Used only as a UI and
-    # synthetic channel-grid hint.
+    # Geometric visibility from the serving transmitter through the solver scene.
+    # Used as a UI and synthetic channel-grid hint.
     isLos: bool
     sinr: Optional[float] = None      # best-server signal-to-interference-plus-noise [dB]
     servingTx: Optional[int] = None   # index of the serving transmitter

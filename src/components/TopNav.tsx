@@ -4,6 +4,7 @@
  */
 
 import type { BackendHealth } from '../api';
+import type { ProjectAutosaveStatus } from '../project';
 import { AboutStudio } from './AboutStudio';
 import { useI18n } from '../i18n';
 
@@ -11,9 +12,11 @@ const LOGO_URL = new URL('../../assets/logo-app-bone.png', import.meta.url).href
 
 interface TopNavProps {
   health: BackendHealth | null;
+  autosaveStatus: ProjectAutosaveStatus;
+  onRetryAutosave: () => void;
 }
 
-export function TopNav({ health }: TopNavProps) {
+export function TopNav({ health, autosaveStatus, onRetryAutosave }: TopNavProps) {
   const { t, locale, setLocale } = useI18n();
 
   return (
@@ -67,6 +70,22 @@ export function TopNav({ health }: TopNavProps) {
           </select>
         </div>
       </div>
+      {autosaveStatus === 'disabled' ? (
+        <p role="status" className="border-t border-[var(--line)] px-3 py-1 text-xs text-[var(--bad)] sm:px-6">
+          {t('Autosave unavailable. Export the project to keep your changes.', '自动保存不可用。请导出项目以保留修改。')}
+        </p>
+      ) : autosaveStatus === 'error' ? (
+        <div className="flex items-center gap-2 border-t border-[var(--line)] px-3 py-1.5 text-xs text-[var(--bad)] sm:px-6">
+          <span role="alert">{t('Project autosave failed.', '项目自动保存失败。')}</span>
+          <button type="button" className="font-semibold underline underline-offset-2" onClick={onRetryAutosave}>
+            {t('Retry save', '重试保存')}
+          </button>
+        </div>
+      ) : (
+        <p role="status" className="border-t border-[var(--line)] px-3 py-1 text-xs text-[var(--text-lo)] sm:px-6">
+          {autosaveStatus === 'saving' ? t('Saving project…', '正在保存项目…') : t('Project saved locally', '项目已保存到本机')}
+        </p>
+      )}
     </header>
   );
 }

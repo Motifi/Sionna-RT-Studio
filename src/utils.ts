@@ -42,6 +42,22 @@ export function isPointInPolygon(pt: { x: number; y: number }, poly: ENUVector[]
   return inside;
 }
 
+export function getDeviceElevation(
+  device: Pick<Transmitter, 'enu' | 'height' | 'heightReference'>,
+  buildings: BuildingFootprint[],
+): number {
+  if (device.heightReference === 'enu') return device.height;
+  const footprint = buildings.find(building => building.category === 'building' &&
+    (building.kind ?? 'building') === 'building' && building.enuPoints.length >= 3 &&
+    isPointInPolygon(device.enu, building.enuPoints));
+  const roof = footprint ? Math.max(0, (footprint.baseZ ?? 0) + Math.max(footprint.height, 1)) : 0;
+  return roof + device.height;
+}
+
+export function createIdSuffix(): string {
+  return crypto.getRandomValues(new Uint32Array(4)).join('-');
+}
+
 // Free space path loss: FSPL = 20 * log10(d) + 20 * log10(f_GHz) + 32.44
 // (display-only — the Analysis panel's link-budget card and FSPL curves).
 export function calculatePathLoss(distance: number, freqGhz: number): number {
@@ -509,7 +525,7 @@ export function exportCoverageChannelGrid(
       return {
         receiver_index: idx,
         coordinate_enu_m: [cell.x, cell.y, cell.z],
-        los_status: cell.isLos ? 1 : 0, // geometric LOS approximation, not an RT output
+        los_status: cell.isLos ? 1 : 0, // geometric visibility from the serving transmitter
         received_power_dbm: cell.powerDbm,
         h_matrix: subcarriers_data,
       };
@@ -585,7 +601,7 @@ export function exportGeoJSON(buildings: BuildingFootprint[], anchor: GeoAnchor)
   return JSON.stringify(geoJson, null, 2);
 }
 
-// Generate standard Wavefront OBJ file representing the procedural digital twin
+// Generate Wavefront OBJ geometry in ENU meters.
 export function exportOBJ3D(buildings: BuildingFootprint[]): string {
   let objText = `# SionnaRTStudio 3D Digital Twin Model OBJ Export\n`;
   objText += `# Generated at: ${new Date().toISOString()}\n`;
@@ -594,21 +610,40 @@ export function exportOBJ3D(buildings: BuildingFootprint[]): string {
   let vertexOffset = 1;
 
   for (const b of buildings) {
-    if (b.enuPoints.length < 2) continue;
+    if (b.kind !== 'mesh' && b.enuPoints.length < 2) continue;
 
     objText += `g ${b.id}_${b.category}_${b.type || 'generic'}\n`;
+    const baseZ = b.baseZ ?? 0;
+    const topZ = baseZ + b.height;
 
-    if (b.category === 'building' && b.enuPoints.length >= 3) {
-      const n = b.enuPoints.length;
-      const h = b.height;
-
-      // Add bottom vertices (z = 0)
-      for (const p of b.enuPoints) {
-        objText += `v ${p.x.toFixed(3)} ${p.y.toFixed(3)} 0.000\n`;
+    if (b.kind === 'mesh' && b.mesh) {
+      const { vertices, triangles } = b.mesh;
+      for (let i = 0; i < vertices.length; i += 3) {
+        objText += `v ${vertices[i]} ${vertices[i + 1]} ${vertices[i + 2] + baseZ}\n`;
       }
-      // Add top vertices (z = H)
+      for (let i = 0; i < triangles.length; i += 3) {
+        objText += `f ${vertexOffset + triangles[i]} ${vertexOffset + triangles[i + 1]} ${vertexOffset + triangles[i + 2]}\n`;
+      }
+      vertexOffset += vertices.length / 3;
+    } else if (b.category === 'building' && b.kind === 'wall') {
+      if (b.enuPoints.length !== 2 || b.height <= 0) continue;
+      const [start, end] = b.enuPoints;
+      if (Math.hypot(start.x - end.x, start.y - end.y) < 0.01) continue;
+      objText += `v ${start.x} ${start.y} ${baseZ}\n`;
+      objText += `v ${end.x} ${end.y} ${baseZ}\n`;
+      objText += `v ${end.x} ${end.y} ${topZ}\n`;
+      objText += `v ${start.x} ${start.y} ${topZ}\n`;
+      objText += `f ${vertexOffset} ${vertexOffset + 1} ${vertexOffset + 2}\n`;
+      objText += `f ${vertexOffset} ${vertexOffset + 2} ${vertexOffset + 3}\n`;
+      vertexOffset += 4;
+    } else if (b.category === 'building' && b.enuPoints.length >= 3) {
+      const n = b.enuPoints.length;
+
       for (const p of b.enuPoints) {
-        objText += `v ${p.x.toFixed(3)} ${p.y.toFixed(3)} ${h.toFixed(3)}\n`;
+        objText += `v ${p.x.toFixed(3)} ${p.y.toFixed(3)} ${baseZ}\n`;
+      }
+      for (const p of b.enuPoints) {
+        objText += `v ${p.x.toFixed(3)} ${p.y.toFixed(3)} ${topZ}\n`;
       }
 
       // 1. Bottom face

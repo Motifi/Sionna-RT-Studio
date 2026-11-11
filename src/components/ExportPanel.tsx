@@ -10,7 +10,7 @@ import { exportGeoJSON, exportOBJ3D, exportPropagationCSV, exportCoverageChannel
 import { exportCIR, CIRFormat, exportCIRBundle, exportChannelGrid, exportCsiRun, exportScene, readBackendHealth } from '../api';
 import type { CIRExportOptions, CsiRun } from '../api';
 import { antennaPortCount, formatCsiBytes } from '../lib/csiSize';
-import { createProjectDocument, StudioProjectState } from '../project';
+import { createProjectDocument, type ProjectAutosaveStatus, type StudioProjectState } from '../project';
 import { FileDown, FileSpreadsheet, Box, Compass, Database, AlertOctagon, Waves, Loader2, FileUp, Save, Package, RotateCcw, Fingerprint } from 'lucide-react';
 import { NumberField } from './NumberField';
 
@@ -33,7 +33,7 @@ interface ExportPanelProps {
   radioMap: RadioMapGrid | null;
   materials: MaterialConfig[];
   projectState: StudioProjectState;
-  autosaveStatus: 'saving' | 'saved' | 'error';
+  autosaveStatus: ProjectAutosaveStatus;
   onResetProject: () => void;
   onImportProject: (text: string) => void;
   csiRun?: CsiRun | null;
@@ -467,7 +467,10 @@ export function ExportPanel({
                     ? 'bg-amber-50 text-amber-700 border-amber-200'
                     : 'bg-red-50 text-red-700 border-red-200'
             }`}>
-              {autosaveStatus === 'saved' ? t('Autosaved locally', "已自动保存到本机") : autosaveStatus === 'saving' ? t('Autosaving…', "正在自动保存…") : t('Autosave failed', "自动保存失败")}
+              {autosaveStatus === 'saved' ? t('Autosaved locally', "已自动保存到本机")
+                : autosaveStatus === 'saving' ? t('Autosaving…', "正在自动保存…")
+                : autosaveStatus === 'disabled' ? t('Autosave unavailable', "自动保存不可用")
+                : t('Autosave failed', "自动保存失败")}
             </span>
             <div className="ml-auto flex flex-wrap items-center gap-2">
               <button

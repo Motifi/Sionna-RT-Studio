@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { GeoAnchor, Transmitter, Receiver, BuildingFootprint, PropagationPath, RadioMapGrid, ChannelMetrics, MatrixCell, SolverOptions, DEFAULT_SOLVER_OPTIONS, MaterialConfig, CoverageMetric, MobilityCombineMode, TrajectoryPoint, defaultMaterialConfig } from './types';
 import { ColormapName } from './lib/colormaps';
 import { antennaPortCount, FULL_CSI_SIZE_LIMIT, estimateCsiSize } from './lib/csiSize';
@@ -26,6 +26,7 @@ import { DevicePanel } from './components/DevicePanel';
 import type { PlacementMode, ENUVector } from './types';
 import { useI18n, type LocalizedText } from './i18n';
 import {
+  createIdSuffix,
   latLonToENU,
   enuToLatLon,
   fetchOSMBuildings,
@@ -40,7 +41,7 @@ import {
   StudioProjectState,
   DEFAULT_CSI_SETTINGS,
 } from './project';
-import type { StudioWorkspace } from './project';
+import type { ProjectAutosaveStatus, StudioWorkspace } from './project';
 
 const EMPTY_METRICS: ChannelMetrics = {
   totalRxPowerDbm: -200,
@@ -212,12 +213,54 @@ const PRELOADED_BUILDINGS: BuildingFootprint[] = [
   },
 ];
 
-const AUTOSAVED_PROJECT = loadAutosavedProject()?.state ?? null;
+function warnUnsavedProject(event: BeforeUnloadEvent) {
+  event.preventDefault();
+  event.returnValue = 'Unsaved project changes';
+}
 
 export default function App() {
   const { t } = useI18n();
+  const [initialProject, setInitialProject] = useState<StudioProjectState | null | undefined>();
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [temporary, setTemporary] = useState(false);
+
+  useEffect(() => {
+    let current = true;
+    loadAutosavedProject().then(project => {
+      if (current) setInitialProject(project?.state ?? null);
+    }).catch(error => {
+      if (!current) return;
+      console.warn('Could not restore the autosaved SionnaRTStudio project.', error);
+      setLoadFailed(true);
+    });
+    return () => { current = false; };
+  }, [loadAttempt]);
+
+  if (initialProject !== undefined || temporary) {
+    return <StudioApp initialProject={initialProject ?? null} temporary={temporary} />;
+  }
+
+  return (
+    <main className="min-h-screen grid place-content-center gap-3 p-4 text-center text-[var(--text-hi)]">
+      {loadFailed ? <>
+        <p role="alert">{t('Could not open the local project storage.', '无法打开本地项目存储。')}</p>
+        <button className="btn-signal mx-auto rounded px-3 py-2" onClick={() => {
+          setLoadFailed(false);
+          setLoadAttempt(attempt => attempt + 1);
+        }}>{t('Retry opening project', '重试打开项目')}</button>
+        <button className="mx-auto text-sm underline underline-offset-2" onClick={() => setTemporary(true)}>
+          {t('Open a temporary project', '打开临时项目')}
+        </button>
+      </> : <p role="status">{t('Opening project…', '正在打开项目…')}</p>}
+    </main>
+  );
+}
+
+function StudioApp({ initialProject, temporary }: { initialProject: StudioProjectState | null; temporary: boolean }) {
+  const { t } = useI18n();
   const [anchor, setAnchor] = useState<GeoAnchor>(
-    () => AUTOSAVED_PROJECT?.scene.anchor ?? INITIAL_ANCHOR,
+    () => initialProject?.scene.anchor ?? INITIAL_ANCHOR,
   );
   const [mapAnchor, setMapAnchor] = useState(anchor);
 
@@ -225,7 +268,7 @@ export default function App() {
   // The arrays hold every device; `activeTxId`/`activeRxId` mark the one the
   // sliders, map drag and 3D drag currently edit. `tx`/`rx` below are derived
   // from those, so all single-device UI keeps working on the active device.
-  const [txs, setTxs] = useState<Transmitter[]>(() => AUTOSAVED_PROJECT?.devices.transmitters ?? [
+  const [txs, setTxs] = useState<Transmitter[]>(() => initialProject?.devices.transmitters ?? [
     {
       id: 'tx_1',
       name: 'Tx 1',
@@ -239,7 +282,7 @@ export default function App() {
       beamsteeringElevation: 5,
     },
   ]);
-  const [rxs, setRxs] = useState<Receiver[]>(() => AUTOSAVED_PROJECT?.devices.receivers ?? [
+  const [rxs, setRxs] = useState<Receiver[]>(() => initialProject?.devices.receivers ?? [
     {
       id: 'rx_1',
       name: 'Rx 1',
@@ -251,62 +294,62 @@ export default function App() {
     },
   ]);
   const [activeTxId, setActiveTxId] = useState(
-    () => AUTOSAVED_PROJECT?.devices.activeTxId ?? 'tx_1',
+    () => initialProject?.devices.activeTxId ?? 'tx_1',
   );
   const [activeRxId, setActiveRxId] = useState(
-    () => AUTOSAVED_PROJECT?.devices.activeRxId ?? 'rx_1',
+    () => initialProject?.devices.activeRxId ?? 'rx_1',
   );
   const [fronthaulMbpsByTxId, setFronthaul] = useState<Record<string, number | null>>(
-    () => AUTOSAVED_PROJECT?.devices.fronthaulMbpsByTxId ?? {},
+    () => initialProject?.devices.fronthaulMbpsByTxId ?? {},
   );
 
   const tx = txs.find((t) => t.id === activeTxId) ?? txs[0];
   const rx = rxs.find((r) => r.id === activeRxId) ?? rxs[0];
 
   const [buildings, setBuildings] = useState<BuildingFootprint[]>(
-    () => AUTOSAVED_PROJECT?.scene.buildings ?? PRELOADED_BUILDINGS,
+    () => initialProject?.scene.buildings ?? PRELOADED_BUILDINGS,
   );
   const [freqGhz, setFreqGhz] = useState(
-    () => AUTOSAVED_PROJECT?.solver.carrierFrequencyGhz ?? 28.0,
+    () => initialProject?.solver.carrierFrequencyGhz ?? 28.0,
   ); // Default to mmWave
   const [maxDepth, setMaxDepth] = useState(
-    () => AUTOSAVED_PROJECT?.solver.maxDepth ?? 3,
+    () => initialProject?.solver.maxDepth ?? 3,
   ); // Sionna RT max interaction depth
 
   // Ray-interaction switches + Tx antenna pattern/polarization (sionna-rt-gui style).
   const [solverOptions, setSolverOptions] = useState<SolverOptions>(
-    () => AUTOSAVED_PROJECT?.solver.options ?? DEFAULT_SOLVER_OPTIONS,
+    () => initialProject?.solver.options ?? DEFAULT_SOLVER_OPTIONS,
   );
-  const [csiSettings, setCsiSettings] = useState(() => AUTOSAVED_PROJECT?.csi ?? DEFAULT_CSI_SETTINGS);
+  const [csiSettings, setCsiSettings] = useState(() => initialProject?.csi ?? DEFAULT_CSI_SETTINGS);
 
   // Radio map display (colormap + manual range), like sionna-rt-gui's map panel.
   const [rmColormap, setRmColormap] = useState<ColormapName>(
-    () => AUTOSAVED_PROJECT?.display.radioMapColormap ?? 'viridis',
+    () => initialProject?.display.radioMapColormap ?? 'viridis',
   );
   const [rmAutoRange, setRmAutoRange] = useState(
-    () => AUTOSAVED_PROJECT?.display.radioMapAutoRange ?? true,
+    () => initialProject?.display.radioMapAutoRange ?? true,
   );
   const [rmVmin, setRmVmin] = useState(
-    () => AUTOSAVED_PROJECT?.display.radioMapVmin ?? -120,
+    () => initialProject?.display.radioMapVmin ?? -120,
   );
   const [rmVmax, setRmVmax] = useState(
-    () => AUTOSAVED_PROJECT?.display.radioMapVmax ?? -50,
+    () => initialProject?.display.radioMapVmax ?? -50,
   );
 
   const [workspace, setWorkspace] = useState<StudioWorkspace>(
-    () => AUTOSAVED_PROJECT?.display.workspace ?? 'scene',
+    () => initialProject?.display.workspace ?? 'scene',
   );
 
   // Active Studio Modes
   const [activeMode, setActiveMode] = useState<'link' | 'heatmap' | 'playback'>(
-    () => AUTOSAVED_PROJECT?.display.activeMode ?? 'link',
+    () => initialProject?.display.activeMode ?? 'link',
   );
   const [placementMode, setPlacementMode] = useState<PlacementMode>('none');
   const [showOutlines, setShowOutlines] = useState(
-    () => AUTOSAVED_PROJECT?.display.showOutlines ?? true,
+    () => initialProject?.display.showOutlines ?? true,
   );
   const [showRaysOnHeatmap, setShowRaysOnHeatmap] = useState(
-    () => AUTOSAVED_PROJECT?.display.showRaysOnHeatmap ?? false,
+    () => initialProject?.display.showRaysOnHeatmap ?? false,
   ); // overlay rays on coverage
 
   // Coverage Map State
@@ -314,30 +357,30 @@ export default function App() {
   const [loadingHeatmap, setLoadingHeatmap] = useState(false);
   // Interference-aware coverage controls (Sionna RadioMapSolver rss/sinr).
   const [coverageMetric, setCoverageMetric] = useState<CoverageMetric>(
-    () => AUTOSAVED_PROJECT?.coverage.metric ?? 'power',
+    () => initialProject?.coverage.metric ?? 'power',
   );
   const [coverageBandwidthMhz, setCoverageBandwidthMhz] = useState(
-    () => AUTOSAVED_PROJECT?.coverage.bandwidthMhz ?? 100,
+    () => initialProject?.coverage.bandwidthMhz ?? 100,
   );
   const [coverageNoiseFigureDb, setCoverageNoiseFigureDb] = useState(
-    () => AUTOSAVED_PROJECT?.coverage.noiseFigureDb ?? 7,
+    () => initialProject?.coverage.noiseFigureDb ?? 7,
   );
   const [coverageHeight, setCoverageHeight] = useState(
-    () => AUTOSAVED_PROJECT?.coverage.heightM ?? 1.5,
+    () => initialProject?.coverage.heightM ?? 1.5,
   );
   const [coverageRes, setCoverageRes] = useState(
-    () => AUTOSAVED_PROJECT?.coverage.gridStepM ?? 8,
+    () => initialProject?.coverage.gridStepM ?? 8,
   );
   const [coverageSamplesPerTx, setCoverageSamplesPerTx] = useState(
-    () => AUTOSAVED_PROJECT?.coverage.samplesPerTx ?? 1_000_000,
+    () => initialProject?.coverage.samplesPerTx ?? 1_000_000,
   );
   const [radioMapSeed, setRadioMapSeed] = useState(
-    () => AUTOSAVED_PROJECT?.coverage.seed ?? 42,
+    () => initialProject?.coverage.seed ?? 42,
   );
 
   // Per-material scattering / EM overrides, keyed by material id, sent with solves.
   const [materialConfigs, setMaterialConfigs] = useState<Record<string, MaterialConfig>>(
-    () => AUTOSAVED_PROJECT?.solver.materialConfigs ?? {},
+    () => initialProject?.solver.materialConfigs ?? {},
   );
   const materialIds = React.useMemo(
     () => Array.from(new Set(['itu_concrete', ...buildings.filter(b => b.category === 'building').map(b => b.material)])).sort(),
@@ -361,7 +404,7 @@ export default function App() {
 
   // Trajectory points state
   const [trajectoriesByRxId, setTrajectories] = useState<Record<string, TrajectoryPoint[]>>(
-    () => AUTOSAVED_PROJECT?.mobility.trajectoriesByRxId ?? {},
+    () => initialProject?.mobility.trajectoriesByRxId ?? {},
   );
   const trajectoryPoints = Object.hasOwn(trajectoriesByRxId, rx.id) ? trajectoriesByRxId[rx.id] : EMPTY_TRACK;
   const setTrajectoryPoints = (points: TrajectoryPoint[]) => setTrajectories(prev => ({ ...prev, [rx.id]: points }));
@@ -507,7 +550,7 @@ export default function App() {
       setPlacementMode('none');
       return;
     }
-    const suffix = crypto.getRandomValues(new Uint32Array(2)).join('-');
+    const suffix = createIdSuffix();
     if (mode === 'add-tx') {
       const added = positionDevice({ ...tx, id: `tx_${suffix}`, name: nextDeviceName(txs, 'Tx') }, enu, anchor);
       setTxs(prev => [...prev, added]);
@@ -553,7 +596,7 @@ export default function App() {
 
   const sceneEditRevision = useRef(buildings);
   sceneEditRevision.current = buildings;
-  const editor = useSceneEditor(buildings, anchor, setBuildings, handleAnchorChange, AUTOSAVED_PROJECT?.scene.hiddenLayers);
+  const editor = useSceneEditor(buildings, anchor, setBuildings, handleAnchorChange, initialProject?.scene.hiddenLayers);
   const [osmMode, setOsmMode] = useState<'replace' | 'merge'>('replace');
   const [inspection, setInspection] = useState<{ input: object; result: SceneInspection } | null>(null);
   const [inspectionIssue, setInspectionIssue] = useState('');
@@ -646,20 +689,24 @@ export default function App() {
   // How multiple transmitters collapse into each waypoint's KPIs (best-server vs
   // total power); the rays drawn are the union of all Tx in either case.
   const [mobilityCombineMode, setMobilityCombineMode] = useState<MobilityCombineMode>(
-    () => AUTOSAVED_PROJECT?.mobility.combineMode ?? 'best_server',
+    () => initialProject?.mobility.combineMode ?? 'best_server',
   );
   // A3 handover parameters (applied on the next Run Mobility) + the backend's
   // hysteresis/TTT association analysis for the last run.
   const [handoverConfig, setHandoverConfig] = useState<HandoverConfig>(
-    () => AUTOSAVED_PROJECT?.mobility.handover ?? { hysteresisDb: 3, timeToTriggerMs: 160 },
+    () => initialProject?.mobility.handover ?? { hysteresisDb: 3, timeToTriggerMs: 160 },
   );
   const [mobilitySpeedKmh, setMobilitySpeedKmh] = useState(
-    () => AUTOSAVED_PROJECT?.mobility.speedKmh ?? 30,
+    () => initialProject?.mobility.speedKmh ?? 30,
   );
   const [mobilityIntervalMs, setMobilityIntervalMs] = useState(
-    () => AUTOSAVED_PROJECT?.mobility.intervalMs ?? 100,
+    () => initialProject?.mobility.intervalMs ?? 100,
   );
-  const [autosaveStatus, setAutosaveStatus] = useState<'saving' | 'saved' | 'error'>('saving');
+  const [autosaveStatus, setAutosaveStatus] = useState<ProjectAutosaveStatus>(
+    temporary ? 'disabled' : initialProject ? 'saved' : 'saving',
+  );
+  const [saveAttempt, setSaveAttempt] = useState(0);
+  const saveImmediately = useRef(false);
   const resettingRef = useRef(false);
 
   const projectState = React.useMemo<StudioProjectState>(() => ({
@@ -712,31 +759,78 @@ export default function App() {
     mobilitySpeedKmh, mobilityIntervalMs, workspace, activeMode, showOutlines,
     showRaysOnHeatmap, rmColormap, rmAutoRange, rmVmin, rmVmax,
   ]);
+  const lastSavedProject = useRef(initialProject || temporary ? projectState : null);
 
   // Persist only editable inputs and display choices. Solver outputs are
   // intentionally omitted because they become stale whenever an input changes.
-  useEffect(() => {
-    setAutosaveStatus('saving');
-    const timeout = window.setTimeout(() => {
-      // A reset clears storage and reloads; a debounced write landing in that
-      // window would restore the state the user just discarded.
-      if (resettingRef.current) return;
-      try {
-        saveAutosavedProject(projectState);
+  useLayoutEffect(() => {
+    if (temporary || projectState === lastSavedProject.current) return;
+    let current = true;
+    let started = false;
+    const save = () => {
+      if (started || resettingRef.current) return;
+      started = true;
+      saveAutosavedProject(projectState).then(() => {
+        if (!current || resettingRef.current) return;
+        lastSavedProject.current = projectState;
         setAutosaveStatus('saved');
-      } catch (error) {
+      }).catch(error => {
+        if (!current || resettingRef.current) return;
         console.warn('Could not autosave the SionnaRTStudio project.', error);
         setAutosaveStatus('error');
-      }
-    }, 500);
-    return () => window.clearTimeout(timeout);
-  }, [projectState]);
+      });
+    };
+    setAutosaveStatus('saving');
+    const timeout = saveImmediately.current ? undefined : window.setTimeout(save, 500);
+    if (saveImmediately.current) {
+      saveImmediately.current = false;
+      save();
+    }
+    const flushWhenHidden = () => {
+      if (document.visibilityState === 'hidden') save();
+    };
+    document.addEventListener('visibilitychange', flushWhenHidden);
+    window.addEventListener('sionna-studio-flush-project', save);
+    return () => {
+      current = false;
+      window.clearTimeout(timeout);
+      document.removeEventListener('visibilitychange', flushWhenHidden);
+      window.removeEventListener('sionna-studio-flush-project', save);
+    };
+  }, [projectState, saveAttempt, temporary]);
 
-  // Discard the autosave and reload. Every state hook seeds itself from the
-  // module-level AUTOSAVED_PROJECT snapshot, so a reload is what actually
-  // returns the studio to its defaults.
-  const handleResetProject = () => {
-    const confirmed = window.confirm(t(
+  const projectChanged = projectState !== lastSavedProject.current;
+  const projectSaveState = autosaveStatus === 'disabled'
+    ? projectChanged ? 'error' : 'saved'
+    : autosaveStatus === 'saved' && projectChanged ? 'saving' : autosaveStatus;
+  useLayoutEffect(() => {
+    document.documentElement.dataset.projectSaveState = projectSaveState;
+    if (projectSaveState !== 'saved') window.addEventListener('beforeunload', warnUnsavedProject);
+    return () => window.removeEventListener('beforeunload', warnUnsavedProject);
+  }, [projectSaveState]);
+
+  const retryAutosave = () => {
+    saveImmediately.current = true;
+    setSaveAttempt(attempt => attempt + 1);
+  };
+
+  const saveImportedProject = () => {
+    // Protect closing as soon as the import is applied and bypass the usual
+    // editing delay when the new project state is ready.
+    window.addEventListener('beforeunload', warnUnsavedProject);
+    document.documentElement.dataset.projectSaveState = temporary ? 'error' : 'saving';
+    if (!temporary) {
+      saveImmediately.current = true;
+      setAutosaveStatus('saving');
+    }
+  };
+
+  const handleResetProject = async () => {
+    if (resettingRef.current) return;
+    const confirmed = window.confirm(temporary ? t(
+      'Discard this temporary project and reopen Studio?',
+      '放弃当前临时项目并重新打开实验台？',
+    ) : t(
       'Reset the studio to its defaults?\n\n'
       + 'This discards the autosaved project: scene geometry, every transmitter '
       + 'and receiver, solver and material settings, trajectory, and coverage '
@@ -745,14 +839,28 @@ export default function App() {
       '恢复实验台默认设置？\n\n这会清除自动保存的场景、收发设备、求解和材质设置、轨迹及覆盖参数。已导出的文件仍可使用。\n\n如需保留当前项目，请先导出。',
     ));
     if (!confirmed) return;
+    if (temporary) {
+      window.removeEventListener('beforeunload', warnUnsavedProject);
+      window.location.reload();
+      return;
+    }
     resettingRef.current = true;
-    clearAutosavedProject();
-    window.location.reload();
+    try {
+      await clearAutosavedProject();
+      window.removeEventListener('beforeunload', warnUnsavedProject);
+      window.location.reload();
+    } catch (error) {
+      console.warn('Could not clear the autosaved SionnaRTStudio project.', error);
+      resettingRef.current = false;
+      retryAutosave();
+      window.alert(t('Could not reset the local project.', '无法重置本地项目。'));
+    }
   };
 
 
   const handleImportProject = (text: string) => {
     const imported = parseProjectDocument(text).state;
+    saveImportedProject();
     csiRequest.current++;
     setCsiRunning(null);
     setCsiResult(null);
@@ -988,7 +1096,7 @@ export default function App() {
 
   return (
     <div id="sionna-rt-studio-app-frame" className="min-h-screen md:h-screen md:overflow-hidden text-[var(--text-hi)] flex flex-col font-sans">
-      <TopNav health={health} />
+      <TopNav health={health} autosaveStatus={autosaveStatus} onRetryAutosave={retryAutosave} />
       <main className={`flex-1 md:min-h-0 grid grid-cols-1 gap-4 p-4 w-full ${workspace === 'export' ? '' : 'md:grid-cols-[minmax(290px,37%)_minmax(0,1fr)] lg:grid-cols-[400px_minmax(0,1fr)]'}`}>
         <aside hidden={workspace === 'export'} className="min-w-0 md:min-h-0 md:overflow-y-auto md:pr-1">
           <div className="flex flex-col gap-4">
@@ -1008,9 +1116,11 @@ export default function App() {
               <SceneWorkbench editor={editor} objects={buildings} anchor={anchor} inspection={currentInspection}
                 inspectionError={!backendOnline && editor.solverMesh ? t('Solver mesh unavailable while solver is offline.', '求解器离线，无法查看求解网格。') : inspectionIssue} />
               <MeshImportPanel online={backendOnline} onImport={(objects, replace) => {
+                if (!replace && objects.length === 0) return;
                 const imported = objects.map(object => withFootprint(object, object.enuPoints, anchor));
+                saveImportedProject();
                 editor.commit(replace ? imported : [...buildings, ...imported]);
-                editor.select(imported[0].id);
+                editor.select(imported[0]?.id ?? null);
                 editor.chooseTool('select');
               }} />
               <label className="panel p-3 flex items-center gap-2 text-xs">

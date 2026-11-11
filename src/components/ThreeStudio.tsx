@@ -11,7 +11,7 @@ import type { SolverMesh } from '../api';
 import type { SceneEditor } from '../sceneEditor';
 import { BuildingFootprint, GeoAnchor, Transmitter, Receiver, PropagationPath, ENUVector, PlacementMode } from '../types';
 import { cn } from '../lib/utils';
-import { enuToLatLon, isPointInPolygon } from '../utils';
+import { enuToLatLon, getDeviceElevation, isPointInPolygon } from '../utils';
 import { RadioMapGrid } from '../types';
 import { ColormapName, sampleColormap } from '../lib/colormaps';
 import { Compass, Activity, Camera } from 'lucide-react';
@@ -809,25 +809,14 @@ export function ThreeStudio({
 
       const current = stateRef.current;
 
-      // Roof height under a device: if it sits over a building footprint, its
-      // antenna height is measured from that roof.
-      const rooftopZ = (enu: { x: number; y: number }) => {
-        const fp = current.buildings.find(
-          (b) => b.category === 'building' && (b.kind ?? 'building') === 'building' && b.enuPoints.length >= 3 && isPointInPolygon(enu, b.enuPoints),
-        );
-        return fp ? Math.max(0, (fp.baseZ ?? 0) + Math.max(fp.height, 1)) : 0;
-      };
-
       // Draw Transmitter Tower (TX)
-      const txEnuPos = { ...current.tx.enu };
-      const txBaseZ = current.tx.heightReference === 'enu' ? 0 : rooftopZ(txEnuPos);
-      const txThreePos = enuToThree({ ...txEnuPos, z: txBaseZ + current.tx.height });
+      const txThreePos = enuToThree({ ...current.tx.enu, z: getDeviceElevation(current.tx, current.buildings) });
 
       // Draw tower pedestal structure
       const towerBaseGeom = new THREE.CylinderGeometry(0.5, 3, Math.abs(txThreePos.y), 4);
       const towerBaseMat = new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.8, roughness: 0.2 });
       const towerMesh = new THREE.Mesh(towerBaseGeom, towerBaseMat);
-      towerMesh.position.set(txThreePos.x, (txBaseZ + current.tx.height) / 2, txThreePos.z);
+      towerMesh.position.set(txThreePos.x, txThreePos.y / 2, txThreePos.z);
       towerMesh.castShadow = true;
       transmitterGroup.add(towerMesh);
 
@@ -871,14 +860,9 @@ export function ThreeStudio({
 
       // Draw Receiver Terminal (RX). During mobility playback, use the selected
       // solved sample directly so animation does not mutate the editable Rx state.
-      const rxEnuPos = current.activeMode === 'playback' && current.mobilityRxPosition
-        ? { ...current.mobilityRxPosition, z: 0 }
-        : { ...current.rx.enu };
-      const rxBaseZ = current.rx.heightReference === 'enu' ? 0 : rooftopZ(rxEnuPos);
-      const rxHeight = current.activeMode === 'playback' && current.mobilityRxPosition
-        ? current.mobilityRxPosition.z
-        : rxBaseZ + current.rx.height;
-      const rxThreePos = enuToThree({ ...rxEnuPos, z: rxHeight });
+      const rxEnuPos = (current.activeMode === 'playback' && current.mobilityRxPosition) ||
+        { ...current.rx.enu, z: getDeviceElevation(current.rx, current.buildings) };
+      const rxThreePos = enuToThree(rxEnuPos);
 
       // Clean glowing reception dome
       const deviceGeom = new THREE.SphereGeometry(1.2, 16, 16);
@@ -887,10 +871,10 @@ export function ThreeStudio({
       deviceMesh.position.copy(rxThreePos);
       receiverGroup.add(deviceMesh);
 
-      const devicePoleGeom = new THREE.CylinderGeometry(0.2, 0.2, Math.abs(rxHeight), 8);
+      const devicePoleGeom = new THREE.CylinderGeometry(0.2, 0.2, Math.abs(rxThreePos.y), 8);
       const devicePoleMat = new THREE.MeshStandardMaterial({ color: 0x475569 });
       const devicePoleMesh = new THREE.Mesh(devicePoleGeom, devicePoleMat);
-      devicePoleMesh.position.set(rxThreePos.x, rxHeight / 2, rxThreePos.z);
+      devicePoleMesh.position.set(rxThreePos.x, rxThreePos.y / 2, rxThreePos.z);
       receiverGroup.add(devicePoleMesh);
 
       // Name label (e.g. "Rx 1") floating above the active receiver.
@@ -901,31 +885,30 @@ export function ThreeStudio({
       // ── Markers for the OTHER (non-active) transmitters & receivers ───────
       // The active Tx/Rx already render above with full tower/device geometry;
       // here we add simpler poles+domes so every device in the list is visible.
-      const drawMarker = (enu: ENUVector, height: number, color: number, name: string, labelColor: string) => {
-        const baseZ = rooftopZ(enu);
-        const top = enuToThree({ ...enu, z: baseZ + height });
+      const drawMarker = (device: Transmitter | Receiver, color: number, labelColor: string) => {
+        const top = enuToThree({ ...device.enu, z: getDeviceElevation(device, current.buildings) });
         const pole = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.3, 0.3, baseZ + height, 8),
+          new THREE.CylinderGeometry(0.3, 0.3, Math.abs(top.y), 8),
           new THREE.MeshStandardMaterial({ color: 0x475569, metalness: 0.6, roughness: 0.4 }),
         );
-        pole.position.set(top.x, (baseZ + height) / 2, top.z);
+        pole.position.set(top.x, top.y / 2, top.z);
         const dome = new THREE.Mesh(
           new THREE.SphereGeometry(1.3, 16, 16),
           new THREE.MeshBasicMaterial({ color }),
         );
         dome.position.copy(top);
-        const label = makeLabelSprite(name, labelColor);
+        const label = makeLabelSprite(device.name, labelColor);
         label.position.set(top.x, top.y + 6, top.z);
         return [pole, dome, label];
       };
 
       (current.txs ?? []).forEach((t) => {
         if (t.id === current.activeTxId) return; // active already drawn
-        drawMarker(t.enu, t.height, 0xf87171, t.name, '#d9aaa2').forEach((m) => transmitterGroup.add(m)); // soft red
+        transmitterGroup.add(...drawMarker(t, 0xf87171, '#d9aaa2')); // soft red
       });
       (current.rxs ?? []).forEach((r) => {
         if (r.id === current.activeRxId) return;
-        drawMarker(r.enu, r.height, 0x60a5fa, r.name, '#a9c2c9').forEach((m) => receiverGroup.add(m)); // soft blue
+        receiverGroup.add(...drawMarker(r, 0x60a5fa, '#a9c2c9')); // soft blue
       });
     }
 
