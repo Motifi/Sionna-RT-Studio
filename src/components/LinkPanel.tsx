@@ -20,6 +20,7 @@ interface LinkPanelProps {
   onSelectPair: (txId: string, rxId: string) => void;
   paths: PropagationPath[];
   metrics: ChannelMetrics;
+  hasResult: boolean;
   onSolve: () => void;
   solving: boolean;
   solveError: string;
@@ -29,14 +30,6 @@ interface LinkPanelProps {
 // Channel Impulse Response Taps Chart
 function CIRChart({ paths }: { paths: PropagationPath[] }) {
   const { t } = useI18n();
-  if (paths.length === 0) {
-    return (
-      <div className="h-[140px] flex items-center justify-center bg-slate-50 border border-slate-100 rounded-lg text-slate-600 text-[14px]">
-        {t('Resolved path delays and powers appear here after calculation.', '链路计算后，解析出的路径时延和功率会显示在这里。')}
-      </div>
-    );
-  }
-
   const minDelay = 0;
   const maxDelay = Math.max(...paths.map((p) => p.delayNs)) * 1.15 || 500;
   const minPower = -120;
@@ -127,6 +120,7 @@ export function LinkPanel({
   onSelectPair,
   paths,
   metrics,
+  hasResult,
   onSolve,
   solving,
   solveError,
@@ -137,10 +131,10 @@ export function LinkPanel({
     <div className="panel p-4 flex flex-col gap-4">
       <div className="flex items-center gap-1.5 justify-between">
         <div className="flex items-center gap-1.5">
-          <Zap className="w-4 h-4 text-[#cc785c] animate-pulse" />
-          <h3 className="panel-title">{t("Propagation Physics KPIs", "传播链路指标")}</h3>
+          <Zap aria-hidden="true" className="w-4 h-4 text-[#cc785c]" />
+          <h3 className="panel-title">{t('Link diagnostics', '链路诊断')}</h3>
         </div>
-        <span
+        {hasResult && <span
           className={`text-[11px] px-2.5 py-0.5 rounded font-bold border  ${
             metrics.losStatus === 'LOS'
               ? 'bg-[#5f7f5a]/10 border-[#5f7f5a]/30 text-[#5f7f5a]'
@@ -148,8 +142,34 @@ export function LinkPanel({
           }`}
         >
           {t("Link: ", "链路 ")}{metrics.losStatus}
-        </span>
+        </span>}
       </div>
+
+      <div className="grid grid-cols-2 gap-2">
+        <label className="flex min-w-0 flex-col gap-1 text-xs font-semibold">
+          AP
+          <select id="select-diagnostic-tx" className="min-w-0 rounded border border-[var(--line)] bg-white px-2 py-1.5 text-sm"
+            value={activeTxId} onChange={event => onSelectPair(event.target.value, activeRxId)}>
+            {txs.map(device => <option key={device.id} value={device.id}>{device.name}</option>)}
+          </select>
+        </label>
+        <label className="flex min-w-0 flex-col gap-1 text-xs font-semibold">
+          UE
+          <select id="select-diagnostic-rx" className="min-w-0 rounded border border-[var(--line)] bg-white px-2 py-1.5 text-sm"
+            value={activeRxId} onChange={event => onSelectPair(activeTxId, event.target.value)}>
+            {rxs.map(device => <option key={device.id} value={device.id}>{device.name}</option>)}
+          </select>
+        </label>
+      </div>
+      <button id="btn-solve-link" type="button" onClick={onSolve} disabled={solving || matrixLoading || !backendOnline}
+        className="btn-signal flex w-full cursor-pointer items-center justify-center gap-2 px-3 py-2 text-sm disabled:cursor-not-allowed">
+        <Zap aria-hidden="true" className={`h-4 w-4 ${solving ? 'animate-pulse' : ''}`} />
+        {solving ? t('Tracing rays…', '正在追踪射线…') : t('Run selected link', '计算所选链路')}
+      </button>
+      {!backendOnline && <p className="text-xs text-slate-600">{t('Solver is offline.', '求解器离线。')}</p>}
+      {solveError && <p role="alert" className="rounded border border-red-200 bg-red-50 p-2 text-xs text-red-700">
+        {solveError}
+      </p>}
 
       {/* ALL-PAIRS LINK MATRIX — RX power for every Tx→Rx pair.
           Click a cell to focus that pair (shows its multipath in 3D). */}
@@ -223,104 +243,83 @@ export function LinkPanel({
         </div>
       )}
 
-      {/* Run real Sionna RT solve on demand */}
-      <button
-        id="btn-solve-link"
-        onClick={onSolve}
-        disabled={solving || matrixLoading || !backendOnline}
-        className="w-full btn-signal text-[14px] font-bold py-2.5 px-3 rounded uppercase tracking-widest flex items-center justify-center gap-2 transition shadow-sm cursor-pointer border-none"
-      >
-        <Zap className={`w-4 h-4 ${solving ? 'animate-pulse' : ''}`} />
-        {solving ? t('Tracing rays (Sionna RT)…', "正在追踪射线（Sionna RT）…") : backendOnline ? t('Solve Selected Link · Sionna RT', "计算所选链路 · Sionna RT") : t('Backend offline', "后端离线")}
-      </button>
-      {solveError && (
-        <div className="text-[12px] text-red-400 bg-red-500/10 border border-red-500/30 rounded px-2.5 py-1.5 font-mono">
-          {solveError}
-        </div>
-      )}
-      {paths.length === 0 && !solving && !solveError && (
-        <div className="text-[12px] text-slate-600 text-center -mt-1">
-          {t('Select an AP and a UE in Scene devices to calculate their link.', '在「场景设备」中选中一个 AP 和一个 UE，即可计算这对设备的链路。')}
-        </div>
-      )}
+      {hasResult && <>
+        <div className="grid grid-cols-3 gap-2.5">
+          <div className="flex flex-col gap-0.5 bg-[#f5f3ec] p-3 rounded border border-[#e3e0d6]">
+            <span className="text-[11px] text-[#6b6862] font-bold">{t("RX Power", "接收功率")}</span>
+            <span className="text-[15px] font-bold text-[#141413] font-mono">
+              {metrics.totalRxPowerDbm.toFixed(1)} <span className="text-[11px] font-normal text-slate-600">dBm</span>
+            </span>
+            <span className="text-[11px] text-[#5f7f5a] font-bold font-mono">
+              {(Math.pow(10, metrics.totalRxPowerDbm / 10) * 1e6).toFixed(4)} μW
+            </span>
+          </div>
 
-      {/* Core Numerical results meters */}
-      <div className="grid grid-cols-3 gap-2.5">
-        <div className="flex flex-col gap-0.5 bg-[#f5f3ec] p-3 rounded border border-[#e3e0d6]">
-          <span className="text-[11px] text-[#6b6862] font-bold">{t("RX Power", "接收功率")}</span>
-          <span className="text-[15px] font-bold text-[#141413] font-mono">
-            {metrics.totalRxPowerDbm.toFixed(1)} <span className="text-[11px] font-normal text-slate-600">dBm</span>
-          </span>
-          <span className="text-[11px] text-[#5f7f5a] font-bold font-mono">
-            {(Math.pow(10, metrics.totalRxPowerDbm / 10) * 1e6).toFixed(4)} μW
-          </span>
+          <div className="flex flex-col gap-0.5 bg-[#f5f3ec] p-3 rounded border border-[#e3e0d6]">
+            <span className="text-[11px] text-[#6b6862] font-bold">{t("Delay Spread", "时延扩展")}</span>
+            <span className="text-[15px] font-bold text-[#141413] font-mono">
+              {metrics.rmsDelaySpreadValid === false
+                ? t('N/A', "不适用")
+                : <>{metrics.rmsDelaySpreadNs.toFixed(1)} <span className="text-[11px] font-normal text-slate-600">ns</span></>}
+            </span>
+            <span className="text-[11px] text-slate-600 font-semibold uppercase">{t("Multipath", "多径")}</span>
+          </div>
+
+          <div className="flex flex-col gap-0.5 bg-[#f5f3ec] p-3 rounded border border-[#e3e0d6]">
+            <span className="text-[11px] text-[#6b6862] font-bold">{t("Active Rays", "有效路径")}</span>
+            <span className="text-[15px] font-bold text-[#141413] font-mono">
+              {metrics.numPaths} <span className="text-[11px] font-normal text-slate-600">{t("resolved", "已解析")}</span>
+            </span>
+            <span className="text-[11px] text-slate-600 font-semibold uppercase">{t("Bounces", "交互次数")}</span>
+          </div>
         </div>
 
-        <div className="flex flex-col gap-0.5 bg-[#f5f3ec] p-3 rounded border border-[#e3e0d6]">
-          <span className="text-[11px] text-[#6b6862] font-bold">{t("Delay Spread", "时延扩展")}</span>
-          <span className="text-[15px] font-bold text-[#141413] font-mono">
-            {metrics.rmsDelaySpreadValid === false
-              ? t('N/A', "不适用")
-              : <>{metrics.rmsDelaySpreadNs.toFixed(1)} <span className="text-[11px] font-normal text-slate-600">ns</span></>}
-          </span>
-          <span className="text-[11px] text-slate-600 font-semibold uppercase">{t("Multipath", "多径")}</span>
-        </div>
+        {paths.length > 0 ? <CIRChart paths={paths} /> :
+          <p role="status" className="text-sm text-slate-600">{t('The solver found no paths for this link.', '求解器未找到这条链路的传播路径。')}</p>}
 
-        <div className="flex flex-col gap-0.5 bg-[#f5f3ec] p-3 rounded border border-[#e3e0d6]">
-          <span className="text-[11px] text-[#6b6862] font-bold">{t("Active Rays", "有效路径")}</span>
-          <span className="text-[15px] font-bold text-[#141413] font-mono">
-            {metrics.numPaths} <span className="text-[11px] font-normal text-slate-600">{t("resolved", "已解析")}</span>
-          </span>
-          <span className="text-[11px] text-slate-600 font-semibold uppercase">{t("Bounces", "交互次数")}</span>
-        </div>
-      </div>
+        {paths.length > 0 && <div className="mt-1 flex flex-col gap-1.5">
+          <h4 className="eyebrow flex items-center gap-1.5">
+            <Waves className="w-3.5 h-3.5 text-[#cc785c]" />
+            {t("Resolved Ray Propagation Paths", "已解析的传播路径")}
+          </h4>
 
-      {/* Discrete Tap Scatter representation */}
-      <CIRChart paths={paths} />
-
-      {/* Ray paths resolved table breakdown */}
-      <div className="flex flex-col gap-1.5 mt-1">
-        <h4 className="eyebrow flex items-center gap-1.5">
-          <Waves className="w-3.5 h-3.5 text-[#cc785c]" />
-          {t("Resolved Ray Propagation Paths", "已解析的传播路径")}
-        </h4>
-
-        <div className="max-h-[145px] overflow-y-auto border border-[#e3e0d6] rounded text-[13px] text-[#141413] bg-[#f5f3ec]">
-          <table className="w-full text-left font-mono">
-            <thead className="bg-[#ffffff] border-b border-[#e3e0d6] text-slate-600 text-[11px] uppercase font-bold sticky top-0">
-              <tr>
-                <th className="py-2 px-3">{t("Path Type", "路径类型")}</th>
-                <th className="py-2 px-2">{t("Dist", "距离")}</th>
-                <th className="py-2 px-2">{t("Delay", "时延")}</th>
-                <th className="py-2 px-3 text-right">{t("Rx Power", "接收功率")}</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[#e3e0d6]">
-              {paths.map((p, idx) => (
-                <tr key={p.id} className="hover:bg-[#ebe7dc]/50 duration-105 font-semibold">
-                  <td className="py-1.5 px-3 flex items-center gap-1.5">
-                    <span
-                      className={`w-1.5 h-1.5 rounded-full ${p.type === 'LOS' ? 'bg-[#5f7f5a]' : 'bg-[#cc785c]'}`}
-                    />
-                    <span className="font-sans font-bold text-slate-800">
-                      {p.type === 'LOS' ? t('LOS Link', '视距路径') : t(`Reflection (W_${idx})`, `反射路径（W_${idx}）`)}
-                    </span>
-                  </td>
-                  <td className="py-1.5 px-2 text-slate-600">{p.distance.toFixed(0)}m</td>
-                  <td className="py-1.5 px-2 text-slate-600">{p.delayNs.toFixed(0)}ns</td>
-                  <td
-                    className={`py-1.5 px-3 text-right ${
-                      p.receivedPowerDbm > -65 ? 'text-[#5f7f5a]' : p.receivedPowerDbm > -90 ? 'text-[#4a727e]' : 'text-slate-600'
-                    }`}
-                  >
-                    {p.receivedPowerDbm.toFixed(1)} dBm
-                  </td>
+          <div className="max-h-[145px] overflow-y-auto border border-[#e3e0d6] rounded text-[13px] text-[#141413] bg-[#f5f3ec]">
+            <table className="w-full text-left font-mono">
+              <thead className="bg-[#ffffff] border-b border-[#e3e0d6] text-slate-600 text-[11px] uppercase font-bold sticky top-0">
+                <tr>
+                  <th className="py-2 px-3">{t("Path Type", "路径类型")}</th>
+                  <th className="py-2 px-2">{t("Dist", "距离")}</th>
+                  <th className="py-2 px-2">{t("Delay", "时延")}</th>
+                  <th className="py-2 px-3 text-right">{t("Rx Power", "接收功率")}</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
+              </thead>
+              <tbody className="divide-y divide-[#e3e0d6]">
+                {paths.map((p, idx) => (
+                  <tr key={p.id} className="hover:bg-[#ebe7dc]/50 duration-105 font-semibold">
+                    <td className="py-1.5 px-3 flex items-center gap-1.5">
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full ${p.type === 'LOS' ? 'bg-[#5f7f5a]' : 'bg-[#cc785c]'}`}
+                      />
+                      <span className="font-sans font-bold text-slate-800">
+                        {p.type === 'LOS' ? t('LOS Link', '视距路径') : t(`Reflection (W_${idx})`, `反射路径（W_${idx}）`)}
+                      </span>
+                    </td>
+                    <td className="py-1.5 px-2 text-slate-600">{p.distance.toFixed(0)}m</td>
+                    <td className="py-1.5 px-2 text-slate-600">{p.delayNs.toFixed(0)}ns</td>
+                    <td
+                      className={`py-1.5 px-3 text-right ${
+                        p.receivedPowerDbm > -65 ? 'text-[#5f7f5a]' : p.receivedPowerDbm > -90 ? 'text-[#4a727e]' : 'text-slate-600'
+                      }`}
+                    >
+                      {p.receivedPowerDbm.toFixed(1)} dBm
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>}
+      </>}
     </div>
   );
 }

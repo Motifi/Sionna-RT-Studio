@@ -266,7 +266,7 @@ def _get_csi_run(run_id: str) -> CsiRun:
     with _csi_runs_lock:
         run = _csi_runs.get(run_id)
     if run is None:
-        raise HTTPException(status_code=404, detail="This CSI run has expired. Compute it again in Preview")
+        raise HTTPException(status_code=404, detail="This CSI run has expired. Compute it again in Simulation")
     return run
 
 

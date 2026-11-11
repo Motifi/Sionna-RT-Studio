@@ -4,24 +4,26 @@
  */
 
 import React, { useState, useEffect, useLayoutEffect, useRef } from 'react';
+import { Activity, List, RadioTower, Settings2, SlidersHorizontal, Waves } from 'lucide-react';
 import { GeoAnchor, Transmitter, Receiver, BuildingFootprint, PropagationPath, RadioMapGrid, ChannelMetrics, MatrixCell, SolverOptions, DEFAULT_SOLVER_OPTIONS, MaterialConfig, CoverageMetric, MobilityCombineMode, TrajectoryPoint, defaultMaterialConfig } from './types';
 import { ColormapName } from './lib/colormaps';
 import { antennaPortCount, FULL_CSI_SIZE_LIMIT, estimateCsiSize } from './lib/csiSize';
 import { MeshImportPanel } from './components/MeshImportPanel';
-import { SceneWorkbench } from './components/SceneWorkbench';
+import { SceneInspector, SceneObjectList, SceneToolbar } from './components/SceneWorkbench';
 import { physicalSceneInputs, useSceneEditor, withFootprint } from './sceneEditor';
 import { ThreeStudio } from './components/ThreeStudio';
 import { TopNav } from './components/TopNav';
 import { WorkflowNav } from './components/WorkflowNav';
 import { MapSelector } from './components/MapSelector';
-import { SolverControls } from './components/SolverControls';
+import { CsiGridControls, DeviceRfControls, SolverControls } from './components/SolverControls';
 import { LinkPanel } from './components/LinkPanel';
-import { CoveragePanel } from './components/CoveragePanel';
-import { PlanningControls } from './components/PlanningControls';
+import { CoverageLegend, CoveragePanel } from './components/CoveragePanel';
+import { FronthaulControl, RouteControls, TrajectorySimulationControls } from './components/PlanningControls';
 import { CsiPreviewPanel } from './components/CsiPreviewPanel';
 import { GeographyPanel } from './components/GeographyPanel';
 import { AnalysisPanel } from './components/AnalysisPanel';
 import { ExportPanel } from './components/ExportPanel';
+import { SimulationDownloads } from './components/SimulationDownloads';
 import { DevicePanel } from './components/DevicePanel';
 import type { PlacementMode, ENUVector, SolverRoof } from './types';
 import { useI18n, type LocalizedText } from './i18n';
@@ -31,8 +33,8 @@ import {
   enuToLatLon,
   fetchOSMBuildings,
 } from './utils';
-import { solveLink, solveRadioMap, readBackendHealth, inspectScene, createCsiRun, inspectCsiLink, readSolverRoofs } from './api';
-import type { BackendHealth, SceneInspection, SolverMesh, CsiRun, CsiRunMode, CsiRunOutput, CsiSelection, CsiLinkPreview, HandoverConfig } from './api';
+import { ApiRequestError, solveLink, solveRadioMap, readBackendHealth, inspectScene, createCsiRun, inspectCsiLink, readSolverRoofs } from './api';
+import type { BackendHealth, SceneInspection, CsiRun, CsiRunMode, CsiRunOutput, CsiSelection, CsiLinkPreview, HandoverConfig } from './api';
 import {
   clearAutosavedProject,
   loadAutosavedProject,
@@ -58,7 +60,14 @@ const EMPTY_METRICS: ChannelMetrics = {
 
 const EMPTY_TRACK: TrajectoryPoint[] = [];
 const EMPTY_PATHS: PropagationPath[] = [];
-const EMPTY_MESHES: SolverMesh[] = [];
+type SimulationTask = 'csi' | 'coverage' | 'diagnostics';
+type CompactDock = 'objects' | 'inspector' | 'closed';
+
+const SIMULATION_TASKS = [
+  { id: 'csi', en: 'CSI', zh: 'CSI', icon: Waves },
+  { id: 'coverage', en: 'Coverage', zh: '覆盖', icon: RadioTower },
+  { id: 'diagnostics', en: 'Link diagnostics', zh: '链路诊断', icon: Activity },
+] as const;
 
 function sampleTrajectory(points: TrajectoryPoint[], intervalMs: number, speedKmh: number, absolute: boolean) {
   const arc = [0];
@@ -354,10 +363,17 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     () => initialProject?.display.workspace ?? 'scene',
   );
 
-  // Active Studio Modes
-  const [activeMode, setActiveMode] = useState<'link' | 'heatmap' | 'playback'>(
-    () => initialProject?.display.activeMode ?? 'link',
+  const [simulationTask, setSimulationTask] = useState<SimulationTask>(
+    () => initialProject?.display.activeMode === 'heatmap' ? 'coverage' : 'csi',
   );
+  const activeMode = simulationTask === 'coverage' ? 'heatmap' : 'link';
+  const [visitedDiagnostics, setVisitedDiagnostics] = useState(false);
+  const [downloadTask, setDownloadTask] = useState<'coverage' | 'diagnostics' | null>(null);
+  const [sceneDock, setSceneDock] = useState<CompactDock>('objects');
+  const [deviceDock, setDeviceDock] = useState<CompactDock>('objects');
+  const [deploymentSelection, setDeploymentSelection] = useState<'tx' | 'rx'>('tx');
+  const [showSceneDevices, setShowSceneDevices] = useState(false);
+  const [focusObject, setFocusObject] = useState<{ id: string }>();
   const [placementMode, setPlacementMode] = useState<PlacementMode>('none');
   const [showOutlines, setShowOutlines] = useState(
     () => initialProject?.display.showOutlines ?? true,
@@ -367,8 +383,8 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   ); // overlay rays on coverage
 
   // Coverage Map State
-  const [radioMap, setRadioMap] = useState<RadioMapGrid | null>(null);
   const [loadingHeatmap, setLoadingHeatmap] = useState(false);
+  const [coverageIssue, setCoverageIssue] = useState<LocalizedText | null>(null);
   // Interference-aware coverage controls (Sionna RadioMapSolver rss/sinr).
   const [coverageMetric, setCoverageMetric] = useState<CoverageMetric>(
     () => initialProject?.coverage.metric ?? 'power',
@@ -454,7 +470,6 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   // Pairs; false once the user focuses a single pair (cell click / Solve Link),
   // so a fresh single-link solve isn't drowned out by every pair's rays.
   const [matrixRaysVisible, setMatrixRaysVisible] = useState(false);
-  const [previewSource, setPreviewSource] = useState<'csi' | 'legacy'>('csi');
   const sceneRevision = useRef(0);
   const activePair = useRef({ txId: activeTxId, rxId: activeRxId });
   activePair.current = { txId: activeTxId, rxId: activeRxId };
@@ -482,7 +497,6 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     const revision = sceneRevision.current;
     setSolving(true);
     setSolveError(null);
-    setPreviewSource('legacy');
     try {
       const res = await solveLink(tx, rx, buildings, freqGhz, maxDepth, solverOptions, materialList);
       if (revision !== sceneRevision.current || activePair.current.txId !== tx.id || activePair.current.rxId !== rx.id) return;
@@ -490,6 +504,7 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
       setMetrics(res.metrics);
       setMatrixRaysVisible(false); // focus the 3D scene on this single link
     } catch (e: any) {
+      if (revision !== sceneRevision.current || activePair.current.txId !== tx.id || activePair.current.rxId !== rx.id) return;
       const detail = e instanceof Error ? ` (${e.message})` : '';
       setSolveError([`Link solve failed${detail}`, `链路求解失败${detail}`]);
     } finally {
@@ -502,7 +517,6 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     const revision = sceneRevision.current;
     setMatrixLoading(true);
     setSolveError(null);
-    setPreviewSource('legacy');
     const next: Record<string, MatrixCell> = {};
     const total = txs.length * rxs.length;
     let done = 0;
@@ -524,6 +538,7 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
         setMetrics(act.metrics);
       }
     } catch (e: any) {
+      if (revision !== sceneRevision.current) return;
       const detail = e instanceof Error ? ` (${e.message})` : '';
       setSolveError([`Link matrix solve failed${detail}`, `链路矩阵求解失败${detail}`]);
     } finally {
@@ -541,20 +556,30 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
 
   // Selecting a matrix cell focuses that Tx→Rx pair and shows its multipath.
   const handleSelectPair = (txId: string, rxId: string) => {
-    setPreviewSource('legacy');
     setActiveTxId(txId);
     setActiveRxId(rxId);
     const cell = matrix[`${txId}|${rxId}`];
     if (!cell && txId === activeTxId && rxId === activeRxId) return;
+    setSolveError(null);
     setPaths(cell?.paths ?? []);
     setMetrics(cell?.metrics ?? EMPTY_METRICS);
     setMatrixRaysVisible(false);
   };
 
   // ── Device list management (add / remove / select) ──────────────────────
-  const startPlacement = (mode: 'add-tx' | 'add-rx') => {
-    setWorkspace('planning');
+  const startPlacement = (mode: PlacementMode) => {
+    if (mode === 'add-tx' || mode === 'add-rx') {
+      setDeploymentSelection(mode === 'add-tx' ? 'tx' : 'rx');
+    }
     setPlacementMode(mode);
+  };
+
+  const selectDevice = (kind: 'tx' | 'rx', id: string) => {
+    setPlacementMode('none');
+    setDeploymentSelection(kind);
+    setDeviceDock('inspector');
+    if (kind === 'tx') handleSelectPair(id, activeRxId);
+    else handleSelectPair(activeTxId, id);
   };
 
   const placeDevice = (mode: Exclude<PlacementMode, 'none'>, enu: ENUVector) => {
@@ -569,10 +594,12 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
       const added = positionDevice({ ...tx, id: `tx_${suffix}`, name: nextDeviceName(txs, 'Tx') }, enu, anchor);
       setTxs(prev => [...prev, added]);
       setActiveTxId(added.id);
+      setDeploymentSelection('tx');
     } else {
       const added = positionDevice({ ...rx, id: `rx_${suffix}`, name: nextDeviceName(rxs, 'Rx') }, enu, anchor);
       setRxs(prev => [...prev, added]);
       setActiveRxId(added.id);
+      setDeploymentSelection('rx');
     }
   };
   const removeTx = (id: string) => {
@@ -611,11 +638,15 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   const sceneEditRevision = useRef(buildings);
   sceneEditRevision.current = buildings;
   const editor = useSceneEditor(buildings, anchor, setBuildings, handleAnchorChange, initialProject?.scene.hiddenLayers);
+  const selectedSceneObjectId = editor.selected?.id;
+  useEffect(() => {
+    if (selectedSceneObjectId) setSceneDock('inspector');
+  }, [selectedSceneObjectId]);
   const [osmMode, setOsmMode] = useState<'replace' | 'merge'>('replace');
   const [inspection, setInspection] = useState<{ input: object; result: SceneInspection } | null>(null);
   const [inspectionIssue, setInspectionIssue] = useState('');
   const inspectionInput = React.useMemo(() => ({ buildings, freqGhz, materialList }), [buildings, freqGhz, materialList]);
-  const currentInspection = inspection?.input === inspectionInput ? inspection.result : null;
+  const currentInspection = backendOnline && inspection?.input === inspectionInput ? inspection.result : null;
   const [roofInspection, setRoofInspection] = useState<{ buildings: BuildingFootprint[]; roofs: SolverRoof[] } | null>(null);
   const solverRoofs = roofInspection?.buildings === buildings ? roofInspection.roofs : undefined;
   useEffect(() => {
@@ -657,6 +688,9 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     editor.commit([]);
     editor.select(null);
     editor.chooseTool('select');
+    editor.setSolverMesh(false);
+    setSceneDock('objects');
+    setFocusObject(undefined);
   };
 
   const useStarterScene = () => {
@@ -666,6 +700,33 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     editor.commit(PRELOADED_BUILDINGS.map(object => ({ ...object, source: 'template' })), INITIAL_ANCHOR);
     editor.select(null);
     editor.chooseTool('select');
+    editor.setSolverMesh(false);
+    setSceneDock('objects');
+    setFocusObject(undefined);
+  };
+
+  const selectSceneObject = (id: string | null) => {
+    editor.chooseTool('select');
+    editor.select(id);
+    if (id) setSceneDock('inspector');
+  };
+
+  const locateSceneObject = (id: string) => {
+    selectSceneObject(id);
+    const object = buildings.find(building => building.id === id);
+    if (object) {
+      editor.setHiddenLayers(editor.hiddenLayers.filter(layer => layer !== object.category));
+      setFocusObject({ id });
+    }
+  };
+
+  const toggleSceneInspection = () => {
+    editor.chooseTool('select');
+    editor.setSolverMesh(!editor.solverMesh);
+    if (!editor.solverMesh) {
+      editor.setTop(false);
+      setSceneDock('inspector');
+    }
   };
 
   // OVERPASS GIS DOWNLOAD PIPELINE
@@ -938,7 +999,8 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     setCsiResult(null);
     setCsiSelection(null);
     setCsiIssue(null);
-    setPreviewSource('csi');
+    setCsiReceiverId(null);
+    setExpiredRunId(null);
     gisRequest.current++;
     setGisLoading(false);
     setDownloadProgress(['', '']);
@@ -946,7 +1008,13 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     setMapAnchor(imported.scene.anchor);
     setBuildings(imported.scene.buildings);
     editor.reset();
+    editor.setSolverMesh(false);
+    editor.setTop(false);
     editor.setHiddenLayers(imported.scene.hiddenLayers ?? []);
+    setFocusObject(undefined);
+    setSceneDock('objects');
+    setDeviceDock('objects');
+    setDeploymentSelection('tx');
     setTxs(imported.devices.transmitters);
     setRxs(imported.devices.receivers);
     setActiveTxId(imported.devices.activeTxId);
@@ -970,7 +1038,9 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     setMobilitySpeedKmh(imported.mobility.speedKmh);
     setMobilityIntervalMs(imported.mobility.intervalMs);
     setWorkspace(imported.display.workspace);
-    setActiveMode(imported.display.activeMode);
+    setSimulationTask(imported.display.activeMode === 'heatmap' ? 'coverage' : 'csi');
+    setVisitedDiagnostics(false);
+    setDownloadTask(null);
     setShowOutlines(imported.display.showOutlines);
     setShowRaysOnHeatmap(imported.display.showRaysOnHeatmap);
     setRmColormap(imported.display.radioMapColormap);
@@ -983,7 +1053,10 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     setMetrics(EMPTY_METRICS);
     setMatrix({});
     setMatrixRaysVisible(false);
-    setRadioMap(null);
+    coverageRequest.current++;
+    setCoverageResult(null);
+    setCoverageIssue(null);
+    setLoadingHeatmap(false);
     setSolveError(null);
   };
 
@@ -991,6 +1064,8 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   const [csiOutput, setCsiOutput] = useState<CsiRunOutput>('cir_cfr');
   const [csiRunning, setCsiRunning] = useState<CsiRunMode | null>(null);
   const [csiIssue, setCsiIssue] = useState<LocalizedText | null>(null);
+  const [csiReceiverId, setCsiReceiverId] = useState<string | null>(null);
+  const [expiredRunId, setExpiredRunId] = useState<string | null>(null);
   const [csiSelection, setCsiSelection] = useState<CsiSelection | null>(null);
   const [csiLink, setCsiLink] = useState<CsiLinkPreview | null>(null);
   const [csiLinkLoading, setCsiLinkLoading] = useState(false);
@@ -1022,7 +1097,8 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   currentCsiKey.current = keyForCsi;
   const csiRun = csiResult?.run ?? null;
   const csiStale = !!csiResult && csiResult.key !== keyForCsi(csiResult.run.mode, csiResult.run.rxIds[0]);
-  const currentRunId = csiStale ? null : csiRun?.runId;
+  const csiExpired = !!csiRun && csiRun.runId === expiredRunId;
+  const currentRunId = csiStale || csiExpired ? null : csiRun?.runId;
 
   useEffect(() => {
     setCsiLink(null);
@@ -1033,7 +1109,11 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     setCsiLinkLoading(true);
     inspectCsiLink(currentRunId, csiSelection).then(
       link => { if (current) setCsiLink(link); },
-      error => { if (current) setCsiLinkError(error instanceof Error ? error.message : String(error)); },
+      error => {
+        if (!current) return;
+        if (error instanceof ApiRequestError && error.status === 404) setExpiredRunId(currentRunId);
+        else setCsiLinkError(error instanceof Error ? error.message : String(error));
+      },
     ).finally(() => { if (current) setCsiLinkLoading(false); });
     return () => { current = false; };
   }, [currentRunId, csiSelection]);
@@ -1044,12 +1124,14 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   const rxArraysMatch = sameArrays(rxs);
   const unavailableReason = !backendOnline ? t('Solver is offline.', '求解器离线。') : undefined;
   const txArrayReason = txArraysMatch ? undefined : t(
-    'This CSI tensor needs matching AP array sizes. Static mixed-array CIR is available in advanced export.',
-    '统一 CSI 张量要求各 AP 阵列等尺寸。静态混合阵列可使用高级导出中的逐链路 CIR。',
+    'This CSI tensor needs matching AP array sizes. Generate per-link CIR for mixed arrays in Link diagnostics.',
+    '统一 CSI 张量要求各 AP 阵列等尺寸。混合阵列可在链路诊断生成逐链路 CIR。',
   );
+  const trajectoryReceiver = rxs.find(device => device.id === csiReceiverId) ?? rx;
+  const simulationRoute = Object.hasOwn(trajectoriesByRxId, trajectoryReceiver.id) ? trajectoriesByRxId[trajectoryReceiver.id] : EMPTY_TRACK;
   const route = React.useMemo(
-    () => sampleTrajectory(trajectoryPoints, mobilityIntervalMs, mobilitySpeedKmh, rx.heightReference === 'enu'),
-    [trajectoryPoints, mobilityIntervalMs, mobilitySpeedKmh, rx.heightReference],
+    () => sampleTrajectory(simulationRoute, mobilityIntervalMs, mobilitySpeedKmh, trajectoryReceiver.heightReference === 'enu'),
+    [simulationRoute, mobilityIntervalMs, mobilitySpeedKmh, trajectoryReceiver.heightReference],
   );
   const txPorts = antennaPortCount(tx.antennaArraySize, solverOptions.txPolarization);
   const rxPorts = antennaPortCount(rx.antennaArraySize, solverOptions.rxPolarization);
@@ -1057,43 +1139,44 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     ? estimateCsiSize([1, rxs.length, rxPorts, txs.length, txPorts, csiGrid.numSubcarriers])
     : null;
   const trajectoryEstimate = txArraysMatch && route.timeSeconds.length > 1
-    ? estimateCsiSize([route.timeSeconds.length, 1, rxPorts, txs.length, txPorts, csiGrid.numSubcarriers])
+    ? estimateCsiSize([route.timeSeconds.length, 1, antennaPortCount(trajectoryReceiver.antennaArraySize, solverOptions.rxPolarization),
+        txs.length, txPorts, csiGrid.numSubcarriers])
     : null;
   const tooLargeReason = (bytes: number | undefined) => csiOutput === 'cir_cfr' && (bytes ?? 0) > FULL_CSI_SIZE_LIMIT
     ? t('The CFR alone exceeds the limit. Try CIR only with these settings.', '仅 CFR 就超过上限。可保留当前设置，试用「仅 CIR」。')
     : undefined;
   const staticDisabledReason = unavailableReason ?? txArrayReason ?? (!rxArraysMatch
     ? t(
-        'This CSI tensor needs matching UE array sizes. Use the advanced per-link CIR export for mixed arrays.',
-        '统一 CSI 张量要求各 UE 阵列等尺寸。混合阵列可使用高级逐链路 CIR 导出。',
+        'This CSI tensor needs matching UE array sizes. Generate per-link CIR for mixed arrays in Link diagnostics.',
+        '统一 CSI 张量要求各 UE 阵列等尺寸。混合阵列可在链路诊断生成逐链路 CIR。',
       )
     : tooLargeReason(staticEstimate?.cfrBytes));
   const trajectoryDisabledReason = unavailableReason ?? txArrayReason ?? (route.waypoints.length < 2
-    ? t('Draw a nonzero trajectory for the selected UE in Planning.', '请先在规划页为所选 UE 绘制一条有长度的轨迹。')
+    ? t('Draw a route with at least two distinct points for this UE.', '请为这个 UE 绘制至少包含两个不同控制点的轨迹。')
     : tooLargeReason(trajectoryEstimate?.cfrBytes));
 
   const handleCsiRun = async (mode: CsiRunMode) => {
     if (csiRunning || (mode === 'static' ? staticDisabledReason : trajectoryDisabledReason)) return;
     const request = ++csiRequest.current;
-    const key = keyForCsi(mode, rx.id);
+    const receiver = mode === 'trajectory' ? trajectoryReceiver : rx;
+    const key = keyForCsi(mode, receiver.id);
     setCsiRunning(mode);
     setCsiIssue(null);
-    setActiveMode('link');
     try {
       const run = await createCsiRun({
-        ...csiCommon, mode, output: csiOutput, rxs: mode === 'static' ? rxs : [rx],
+        ...csiCommon, mode, output: csiOutput, rxs: mode === 'static' ? rxs : [receiver],
         ...(mode === 'trajectory' ? {
           ...route, speedKmh: mobilitySpeedKmh, combineMode: mobilityCombineMode, handover: handoverConfig,
         } : {}),
       });
       if (request !== csiRequest.current) return;
-      if (key !== currentCsiKey.current(mode, rx.id)) {
+      if (key !== currentCsiKey.current(mode, receiver.id)) {
         setCsiIssue(['Inputs changed during tracing. Run CSI again with the current settings.', '追踪期间输入已改变，请使用当前配置重新计算 CSI。']);
         return;
       }
       setCsiResult({ run, key });
-      setPreviewSource('csi');
-      setCsiSelection({ txId: run.txIds.includes(tx.id) ? tx.id : run.txIds[0], rxId: run.rxIds.includes(rx.id) ? rx.id : run.rxIds[0], sampleIndex: 0 });
+      setExpiredRunId(null);
+      setCsiSelection({ txId: run.txIds.includes(tx.id) ? tx.id : run.txIds[0], rxId: run.rxIds.includes(receiver.id) ? receiver.id : run.rxIds[0], sampleIndex: 0 });
     } catch (error) {
       if (request !== csiRequest.current) return;
       const detail = error instanceof Error ? error.message : String(error);
@@ -1104,22 +1187,27 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   };
 
   const coverageInputs = React.useMemo(() => ({
-    txs, buildings, anchor, freqGhz, maxDepth, solverOptions, materialList,
+    txs, geometryKey, anchor, freqGhz, maxDepth, solverOptions, materialList,
     coverageMetric, coverageBandwidthMhz, coverageNoiseFigureDb, coverageHeight, coverageRes,
     coverageSamplesPerTx, radioMapSeed,
   }), [
-    txs, buildings, anchor, freqGhz, maxDepth, solverOptions, materialList,
+    txs, geometryKey, anchor, freqGhz, maxDepth, solverOptions, materialList,
     coverageMetric, coverageBandwidthMhz, coverageNoiseFigureDb, coverageHeight, coverageRes,
     coverageSamplesPerTx, radioMapSeed,
   ]);
   const currentCoverageInputs = useRef(coverageInputs);
   currentCoverageInputs.current = coverageInputs;
-  useEffect(() => { setRadioMap(null); }, [coverageInputs]);
+  const coverageRequest = useRef(0);
+  const [coverageResult, setCoverageResult] = useState<{ input: typeof coverageInputs; grid: RadioMapGrid } | null>(null);
+  const coverageStale = !!coverageResult && coverageResult.input !== coverageInputs;
+  const radioMap = coverageStale ? null : coverageResult?.grid ?? null;
 
   // Coverage uses RadioMapSolver and the strongest server across all Tx.
   const handleRunHeatmap = async (resolution: number, height: number, samplesPerTx: number, seed: number) => {
+    if (loadingHeatmap || !backendOnline) return;
+    const request = ++coverageRequest.current;
     setLoadingHeatmap(true);
-    setSolveError(null);
+    setCoverageIssue(null);
     try {
       const grid = await solveRadioMap(
         txs, buildings, freqGhz, resolution, height, maxDepth, solverOptions, materialList,
@@ -1131,242 +1219,284 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
           seed,
         },
       );
-      if (coverageInputs !== currentCoverageInputs.current) return;
-      setRadioMap(grid);
-    } catch (err: any) {
-      if (coverageInputs !== currentCoverageInputs.current) return;
-      console.error(err);
-      const detail = err instanceof Error ? ` (${err.message})` : '';
-      setSolveError([`Coverage map failed${detail}`, `覆盖图求解失败${detail}`]);
+      if (request !== coverageRequest.current) return;
+      if (coverageInputs !== currentCoverageInputs.current) {
+        setCoverageIssue(['Inputs changed during calculation. Run coverage again with the current settings.',
+          '计算期间输入已变化，请用当前设置重新计算覆盖。']);
+        return;
+      }
+      setCoverageResult({ input: coverageInputs, grid });
+    } catch (error) {
+      if (request !== coverageRequest.current || coverageInputs !== currentCoverageInputs.current) return;
+      const detail = error instanceof Error ? ` (${error.message})` : '';
+      setCoverageIssue([`Coverage map failed${detail}`, `覆盖图求解失败${detail}`]);
     } finally {
-      setLoadingHeatmap(false);
+      if (request === coverageRequest.current) setLoadingHeatmap(false);
     }
   };
 
   const openWorkspace = (next: StudioWorkspace) => {
+    if (next === workspace) return;
+    if (workspace === 'scene') editor.chooseTool('select');
     setPlacementMode('none');
+    setDownloadTask(null);
     setWorkspace(next);
   };
-  const previewing = workspace === 'preview';
-  const showingCsi = previewSource === 'csi' && !!csiRun;
-  const showingCsiSelection = previewing && showingCsi && currentRunId && csiSelection;
-  const trajectoryView = showingCsiSelection && activeMode !== 'heatmap' && csiRun?.mode === 'trajectory';
-  const previewPosition = trajectoryView && csiSelection
-    ? csiRun?.rxPositions[csiSelection.sampleIndex]?.[0] : undefined;
-  const viewedTx = showingCsiSelection ? txs.find(device => device.id === showingCsiSelection.txId) ?? tx : tx;
-  const viewedRx = showingCsiSelection ? rxs.find(device => device.id === showingCsiSelection.rxId) ?? rx : rx;
-  const previewPaths = showingCsi ? (csiStale ? EMPTY_PATHS : csiLink?.paths ?? EMPTY_PATHS) : paths;
-  const shownPaths = previewing ? previewPaths : EMPTY_PATHS;
-  const rfControls = {
-    tx, rx, onTxUpdate: handleTxUpdate, onRxUpdate: handleRxUpdate, freqGhz, setFreqGhz,
-    maxDepth, setMaxDepth, solverOptions, setSolverOptions,
+
+  const openSimulation = (task: SimulationTask, openDownloads = false) => {
+    openWorkspace('preview');
+    setSimulationTask(task);
+    if (task === 'diagnostics') setVisitedDiagnostics(true);
+    setDownloadTask(openDownloads && task !== 'csi' ? task : null);
   };
-  const exportDevices = txs.map(device => [device.id, Object.hasOwn(fronthaulMbpsByTxId, device.id)
-    ? fronthaulMbpsByTxId[device.id] : null] as const);
-  const currentFronthaul = Object.fromEntries(exportDevices);
-  const nextButton = 'btn-signal cursor-pointer rounded px-3 py-2 text-sm font-semibold';
+
+  const openDeploymentRoute = () => {
+    openWorkspace('planning');
+    selectDevice('rx', trajectoryReceiver.id);
+  };
+
+  const previewing = workspace === 'preview';
+  const deploying = workspace === 'planning';
+  const editingScene = workspace === 'scene';
+  const showingCsi = previewing && simulationTask === 'csi';
+  const showingCoverage = previewing && simulationTask === 'coverage';
+  const showingDiagnostics = previewing && simulationTask === 'diagnostics';
+  const csiPaths = currentRunId ? csiLink?.paths ?? EMPTY_PATHS : EMPTY_PATHS;
+  const hasDiagnosticRays = matrixPaths.length > 0 || paths.length > 0;
+  const hasSavedRays = hasDiagnosticRays || csiPaths.length > 0;
+  const overlayCsi = showingCoverage && !!radioMap && showRaysOnHeatmap && !hasDiagnosticRays && csiPaths.length > 0;
+  const showingCsiSelection = (showingCsi || overlayCsi) && currentRunId ? csiSelection : null;
+  const selectedTrajectorySample = !!showingCsiSelection && csiRun?.mode === 'trajectory';
+  const trajectoryView = showingCsi && selectedTrajectorySample;
+  const previewPosition = selectedTrajectorySample && showingCsiSelection
+    ? csiRun?.rxPositions[showingCsiSelection.sampleIndex]?.[0] : undefined;
+  const viewedTx = txs.find(device => device.id === showingCsiSelection?.txId) ?? tx;
+  const viewedRx = rxs.find(device => device.id === showingCsiSelection?.rxId) ?? rx;
+  const shownPaths = showingCsiSelection ? csiPaths
+    : showingDiagnostics || showingCoverage ? paths : EMPTY_PATHS;
+  const selectedDevice = deploymentSelection === 'tx' ? tx : rx;
+  const currentFronthaul = Object.fromEntries(txs.map(({ id }) =>
+    [id, Object.hasOwn(fronthaulMbpsByTxId, id) ? fronthaulMbpsByTxId[id] : null]));
+  const downloadProps = { tx, rx, txs, rxs, buildings, paths, radioMap, freqGhz, maxDepth, solverOptions,
+    materials: materialList, csiGrid, backendOnline };
+  const activeDock = editingScene ? sceneDock : deviceDock;
+  const setDock = editingScene ? setSceneDock : setDeviceDock;
+  const compactControls = (
+    <div className="studio-compact-only gap-1" role="group" aria-label={t('Side panels', '侧栏')}>
+      <button type="button" className="studio-tool" aria-pressed={activeDock === 'objects'}
+        onClick={() => setDock(activeDock === 'objects' ? 'closed' : 'objects')}>
+        <List aria-hidden="true" className="h-4 w-4" />
+        {editingScene ? t('Objects', '对象') : t('Devices', '设备')}
+      </button>
+      <button type="button" className="studio-tool" aria-pressed={activeDock === 'inspector'}
+        onClick={() => setDock(activeDock === 'inspector' ? 'closed' : 'inspector')}>
+        <SlidersHorizontal aria-hidden="true" className="h-4 w-4" />
+        {editingScene && editor.solverMesh ? t('Report', '检查报告') : t('Properties', '属性')}
+      </button>
+    </div>
+  );
+
+  const simulationSidebar = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    simulationSidebar.current?.scrollTo({ top: 0 });
+  }, [simulationTask]);
 
   return (
-    <div id="sionna-rt-studio-app-frame" className="min-h-screen md:h-screen md:overflow-hidden text-[var(--text-hi)] flex flex-col font-sans">
+    <div id="sionna-rt-studio-app-frame" className="studio-frame text-[var(--text-hi)]">
       <TopNav health={health} autosaveStatus={autosaveStatus} onRetryAutosave={retryAutosave}
+        projectState={projectState} onImportProject={handleImportProject} onResetProject={handleResetProject}
         onReplaceUnreadableAutosave={unreadableAutosave ? handleReplaceUnreadableAutosave : undefined}
         recoveryError={recoveryError ? t(...recoveryError) : undefined} />
-      <main className={`flex-1 md:min-h-0 grid grid-cols-1 gap-4 p-4 w-full ${workspace === 'export' ? '' : 'md:grid-cols-[minmax(290px,37%)_minmax(0,1fr)] lg:grid-cols-[400px_minmax(0,1fr)]'}`}>
-        <aside hidden={workspace === 'export'} className="min-w-0 md:min-h-0 md:overflow-y-auto md:pr-1">
-          <div className="flex flex-col gap-4">
-            {workspace === 'scene' && <>
-              <div className="panel p-4 flex flex-wrap items-center justify-between gap-2">
-                <h1 className="panel-title">{t('Scene setup', '仿真场景')}</h1>
-                <button type="button" className={nextButton} onClick={() => openWorkspace('planning')}>
-                  {t('Continue to Planning', '下一步 · 规划')}
-                </button>
-                <button id="btn-use-starter-scene" type="button" className="text-sm text-[var(--accent-deep)] cursor-pointer underline underline-offset-2" onClick={useStarterScene}>
-                  {t('Use the built-in street scene', '使用内置街区')}
-                </button>
-                <button type="button" className="text-sm text-[var(--accent-deep)] cursor-pointer underline" onClick={openBlankScene}>
-                  {t('Start blank scene', '从空白场景开始')}
-                </button>
-              </div>
-              <SceneWorkbench editor={editor} objects={buildings} anchor={anchor} inspection={currentInspection}
-                inspectionError={!backendOnline && editor.solverMesh ? t('Solver mesh unavailable while solver is offline.', '求解器离线，无法查看求解网格。') : inspectionIssue} />
-              <MeshImportPanel online={backendOnline} onImport={(objects, replace) => {
+      <main className="studio-main" data-workspace={workspace} data-dock={activeDock}>
+        {editingScene && <>
+          <div className="studio-toolbar">
+            <SceneToolbar editor={editor} onOpenBlank={openBlankScene} onUseStarter={useStarterScene}
+              compactControls={compactControls} onToggleInspection={toggleSceneInspection}
+              osmImport={<MapSelector anchor={mapAnchor} setAnchor={setMapAnchor} onDownloadOSM={handleDownloadOSM}
+                mode={osmMode} onModeChange={setOsmMode} isLoading={gisLoading} downloadProgress={downloadProgress} />}
+              meshImport={<MeshImportPanel online={backendOnline} onImport={(objects, replace) => {
                 if (!replace && objects.length === 0) return;
                 const imported = objects.map(object => withFootprint(object, object.enuPoints, anchor));
                 saveImportedProject();
                 editor.commit(replace ? imported : [...buildings, ...imported]);
-                editor.select(imported[0]?.id ?? null);
-                editor.chooseTool('select');
-              }} />
-              <label className="panel p-3 flex items-center gap-2 text-xs">
-                {t('OSM import mode', 'OSM 导入方式')}
-                <select value={osmMode} onChange={event => setOsmMode(event.target.value === 'merge' ? 'merge' : 'replace')}>
-                  <option value="replace">{t('Replace scene', '替换场景')}</option>
-                  <option value="merge">{t('Merge new objects', '合并新对象')}</option>
-                </select>
-              </label>
-              <MapSelector
-                anchor={mapAnchor} setAnchor={setMapAnchor}
-                tx={tx} rx={rx} txs={txs} rxs={rxs}
-                onTxUpdate={handleTxUpdate} onRxUpdate={handleRxUpdate}
-                onDownloadOSM={handleDownloadOSM} onResetProject={handleResetProject}
-                isLoading={gisLoading} downloadProgress={downloadProgress}
-                trajectoryPoints={EMPTY_TRACK} editableDevices={false}
-              />
-              <SolverControls
-                {...rfControls} section="scene"
-                bandwidthMhz={coverageBandwidthMhz} onBandwidthChange={setCoverageBandwidthMhz}
-                noiseFigureDb={coverageNoiseFigureDb} onNoiseFigureChange={setCoverageNoiseFigureDb}
-                csiSettings={csiSettings} onCsiSettingsChange={setCsiSettings}
-              />
-              <details className="panel p-3">
-                <summary className="cursor-pointer font-semibold">{t('Geometry and radio materials', '几何与无线材质')}</summary>
-                <GeographyPanel buildings={buildings} anchor={anchor} materialIds={materialIds}
-                  materialConfigs={materialList} onMaterialChange={updateMaterial} />
-              </details>
-            </>}
-            {workspace === 'planning' && <>
-              <div className="panel p-4 flex flex-wrap items-center justify-between gap-2">
-                <h1 className="panel-title">{t('Devices and routes', '设备与轨迹规划')}</h1>
-                <button type="button" className={nextButton} onClick={() => openWorkspace('preview')}>
-                  {t('Continue to Preview', '下一步 · 预览')}
-                </button>
-              </div>
-              <DevicePanel
-                txs={txs} rxs={rxs} activeTxId={activeTxId} activeRxId={activeRxId}
-                onSelectTx={(id) => handleSelectPair(id, activeRxId)}
-                onSelectRx={(id) => handleSelectPair(activeTxId, id)}
-                onAddTx={() => startPlacement('add-tx')} onAddRx={() => startPlacement('add-rx')}
-                onRemoveTx={removeTx} onRemoveRx={removeRx}
-              />
-              <PlanningControls
-                tx={tx} rx={rx} anchor={anchor} trajectoryPoints={trajectoryPoints}
-                fronthaulMbps={currentFronthaul[tx.id]}
-                onFronthaulChange={(value) => setFronthaul(prev => ({ ...prev, [tx.id]: value }))}
-                speedKmh={mobilitySpeedKmh} intervalMs={mobilityIntervalMs}
-                onSpeedChange={setMobilitySpeedKmh} onIntervalChange={setMobilityIntervalMs}
-                onClearTrajectory={() => setTrajectoryPoints([])} onTrajectoryChange={setTrajectoryPoints}
-              />
-              <SolverControls {...rfControls} section="planning" />
-            </>}
-            {previewing && <>
-              <div className="panel flex gap-2 p-2" aria-label={t('Preview type', '预览类型')}>
-                <button id="btn-preview-csi" type="button" aria-pressed={activeMode !== 'heatmap'}
-                  className={activeMode !== 'heatmap' ? nextButton : 'px-3 py-2 text-sm cursor-pointer'} onClick={() => setActiveMode('link')}>
-                  {t('Links and CSI', '链路与 CSI')}
-                </button>
-                <button id="btn-preview-coverage" type="button" aria-pressed={activeMode === 'heatmap'}
-                  className={activeMode === 'heatmap' ? nextButton : 'px-3 py-2 text-sm cursor-pointer'} onClick={() => setActiveMode('heatmap')}>
-                  {t('Coverage', '覆盖图')}
-                </button>
-              </div>
-              {activeMode !== 'heatmap' ? <>
-                <CsiPreviewPanel
-                  run={csiRun} stale={csiStale} running={csiRunning}
-                  error={csiIssue ? t(...csiIssue) : ''}
-                  staticDisabledReason={staticDisabledReason} trajectoryDisabledReason={trajectoryDisabledReason}
-                  trajectoryReceiverName={rx.name}
-                  staticEstimate={staticEstimate} trajectoryEstimate={trajectoryEstimate}
-                  output={csiOutput} onOutputChange={output => {
-                    setCsiOutput(output);
-                    setCsiIssue(null);
-                  }}
-                  onRun={handleCsiRun} selection={csiSelection}
-                  onSelect={selection => {
-                    setPreviewSource('csi');
-                    setCsiSelection(selection);
-                  }}
-                  link={csiLink} linkLoading={csiLinkLoading} linkError={csiLinkError}
-                  onOpenExport={() => openWorkspace('export')}
-                />
-                <details className="panel p-3 text-sm">
-                  <summary className="cursor-pointer font-semibold">{t('Trajectory metrics and A3 options', '轨迹指标与 A3 设置')}</summary>
-                  <div className="grid gap-2 pt-3">
-                    <label className="flex justify-between gap-2">
-                      {t('Power metric', '功率统计')}
-                      <select value={mobilityCombineMode} onChange={event => setMobilityCombineMode(event.target.value as MobilityCombineMode)}>
-                        <option value="best_server">{t('Strongest AP', '最强 AP')}</option>
-                        <option value="sum">{t('Sum power', '功率相加')}</option>
-                      </select>
-                    </label>
-                    <label className="flex justify-between gap-2">
-                      {t('Hysteresis (dB)', '迟滞（dB）')}
-                      <input type="range" min="0" max="15" step="0.5" value={handoverConfig.hysteresisDb}
-                        onChange={event => setHandoverConfig({ ...handoverConfig, hysteresisDb: Number(event.target.value) })} />
-                      <span>{handoverConfig.hysteresisDb.toFixed(1)}</span>
-                    </label>
-                    <label className="flex justify-between gap-2">
-                      {t('Time-to-trigger (ms)', '触发时间（ms）')}
-                      <select value={handoverConfig.timeToTriggerMs}
-                        onChange={event => setHandoverConfig({ ...handoverConfig, timeToTriggerMs: Number(event.target.value) })}>
-                        {[0, 40, 80, 160, 320, 480, 640, 1024].map(ms => <option key={ms} value={ms}>{ms}</option>)}
-                      </select>
-                    </label>
-                  </div>
-                </details>
-                <details className="panel p-3">
-                  <summary className="cursor-pointer font-semibold">{t('Advanced static link analysis', '高级静态链路分析')}</summary>
-                  <LinkPanel txs={txs} rxs={rxs} activeTxId={activeTxId} activeRxId={activeRxId}
-                    matrix={matrix} matrixLoading={matrixLoading} matrixProgress={matrixProgress}
-                    onSolveMatrix={handleSolveMatrix} onSelectPair={handleSelectPair}
-                    paths={paths} metrics={metrics} onSolve={handleSolve} solving={solving}
-                    solveError={solveError} backendOnline={backendOnline} />
-                  <AnalysisPanel tx={tx} rx={rx} paths={paths} metrics={metrics}
-                    freqGhz={freqGhz} radioMap={radioMap} buildings={buildings} maxDepth={maxDepth}
-                    solverOptions={solverOptions} materials={materialList} backendOnline={backendOnline} />
-                </details>
-              </> : <CoveragePanel
-                txCount={txs.length} backendOnline={backendOnline}
-                onRunHeatmap={handleRunHeatmap} heatmapLoading={loadingHeatmap} radioMap={radioMap}
-                coverageMetric={coverageMetric} setCoverageMetric={setCoverageMetric}
-                coverageBandwidthMhz={coverageBandwidthMhz} coverageNoiseFigureDb={coverageNoiseFigureDb}
-                coverageHeight={coverageHeight} setCoverageHeight={setCoverageHeight}
-                coverageRes={coverageRes} setCoverageRes={setCoverageRes}
-                samplesPerTx={coverageSamplesPerTx} setSamplesPerTx={setCoverageSamplesPerTx}
-                radioMapSeed={radioMapSeed} setRadioMapSeed={setRadioMapSeed}
-                showRaysOnHeatmap={showRaysOnHeatmap} setShowRaysOnHeatmap={setShowRaysOnHeatmap}
-                rmColormap={rmColormap} setRmColormap={setRmColormap}
-                rmAutoRange={rmAutoRange} setRmAutoRange={setRmAutoRange}
-                rmVmin={rmVmin} setRmVmin={setRmVmin} rmVmax={rmVmax} setRmVmax={setRmVmax}
-                solveError={solveError}
-              />}
-            </>}
+                selectSceneObject(imported[0]?.id ?? null);
+              }} />} />
           </div>
-        </aside>
+          <aside className="studio-objects" aria-label={t('Scene objects', '场景对象')}>
+            <SceneObjectList editor={editor} objects={buildings} inspection={currentInspection} onSelect={selectSceneObject} />
+          </aside>
+          <aside className="studio-inspector" aria-label={t('Scene properties', '场景属性')}>
+            <SceneInspector editor={editor} objects={buildings} anchor={anchor} inspection={currentInspection}
+              inspectionError={!backendOnline
+                ? t('The solver is offline. Scene editing is available.', '求解器离线，仍可继续编辑场景。')
+                : inspectionIssue}
+              onLocate={locateSceneObject}
+              materialLibrary={<GeographyPanel materialIds={materialIds} materialConfigs={materialList} onMaterialChange={updateMaterial} />} />
+          </aside>
+        </>}
 
-        <section className={workspace === 'export' ? 'hidden' : 'min-w-0 min-h-[420px] md:min-h-0 flex flex-col'}>
+        {deploying && <>
+          <div className="studio-toolbar flex items-center justify-between gap-2 rounded-lg border border-[var(--line)] bg-white px-2.5 py-1.5">
+            <h1 className="flex items-center gap-2 text-sm font-semibold">
+              <RadioTower aria-hidden="true" className="h-4 w-4 text-[var(--accent-deep)]" />
+              {t('Device deployment', '设备部署')}
+            </h1>
+            {compactControls}
+          </div>
+          <aside className="studio-objects" aria-label={t('Devices', '设备')}>
+            <DevicePanel txs={txs} rxs={rxs} activeTxId={activeTxId} activeRxId={activeRxId}
+              selectedKind={deploymentSelection}
+              onSelectTx={id => selectDevice('tx', id)} onSelectRx={id => selectDevice('rx', id)}
+              onRemoveTx={removeTx} onRemoveRx={removeRx} />
+          </aside>
+          <aside className="studio-inspector space-y-2" aria-label={t('Selected device properties', '所选设备属性')}>
+            <DeviceRfControls tx={tx} rx={rx} onTxUpdate={handleTxUpdate} onRxUpdate={handleRxUpdate} kind={deploymentSelection} />
+            <p className="px-2 text-xs text-slate-600 readout">
+              {t('Position EN (m)', '位置 东 / 北（米）')} · {selectedDevice.enu.x.toFixed(1)} / {selectedDevice.enu.y.toFixed(1)}
+            </p>
+            {deploymentSelection === 'tx'
+              ? <div key={tx.id}>
+                  <FronthaulControl value={currentFronthaul[tx.id]} onChange={value =>
+                    setFronthaul(prev => ({ ...prev, [tx.id]: value }))} />
+                </div>
+              : <RouteControls tx={tx} rx={rx} anchor={anchor} trajectoryPoints={trajectoryPoints} onTrajectoryChange={setTrajectoryPoints} />}
+          </aside>
+        </>}
+
+        {previewing && (
+          <div className="studio-toolbar flex flex-wrap items-center justify-between gap-x-3 gap-y-1 rounded-lg border border-[var(--line)] bg-white px-2.5 py-1.5">
+            <div className="flex flex-wrap gap-1" role="group" aria-label={t('Simulation task', '仿真任务')}>
+              {SIMULATION_TASKS.map(({ id, en, zh, icon: Icon }) => (
+                <button key={id} id={`btn-preview-${id}`} type="button" className="studio-tool"
+                  aria-pressed={simulationTask === id} onClick={() => openSimulation(id)}>
+                  <Icon aria-hidden="true" className="h-4 w-4" /> {t(en, zh)}
+                </button>
+              ))}
+            </div>
+            <details className="relative ml-auto">
+              <summary id="simulation-settings-trigger" className="studio-tool list-none [&::-webkit-details-marker]:hidden">
+                <Settings2 aria-hidden="true" className="h-4 w-4" />
+                {t('Shared settings', '共享设置')}
+                <span className="readout ml-1 text-xs font-normal text-slate-600">{freqGhz} GHz · {coverageBandwidthMhz} MHz</span>
+              </summary>
+              <div className="absolute right-0 z-20 mt-1 max-h-[65dvh] w-[min(380px,calc(100vw-28px))] overflow-y-auto rounded-xl bg-white shadow-lg">
+                <SolverControls freqGhz={freqGhz} setFreqGhz={setFreqGhz} maxDepth={maxDepth} setMaxDepth={setMaxDepth}
+                  solverOptions={solverOptions} setSolverOptions={setSolverOptions}
+                  bandwidthMhz={coverageBandwidthMhz} onBandwidthChange={setCoverageBandwidthMhz}
+                  noiseFigureDb={coverageNoiseFigureDb} onNoiseFigureChange={setCoverageNoiseFigureDb} />
+              </div>
+            </details>
+          </div>
+        )}
+
+        <section className="studio-viewport" hidden={workspace === 'export'} aria-label={t('3D viewport', '三维视口')}>
           <ThreeStudio
-            sceneEditor={workspace === 'scene' ? editor : undefined}
-            physicalMeshes={workspace === 'scene' && editor.solverMesh ? currentInspection?.meshes ?? EMPTY_MESHES : undefined}
+            sceneEditor={editingScene ? editor : undefined}
+            onSelectSceneObject={selectSceneObject} focusObject={editingScene ? focusObject : undefined}
+            physicalMeshes={editingScene && editor.solverMesh ? currentInspection?.meshes : undefined}
             solverRoofs={solverRoofs}
             buildings={buildings} anchor={anchor} tx={viewedTx} rx={viewedRx} txs={txs} rxs={rxs}
             activeTxId={viewedTx.id} activeRxId={viewedRx.id}
-            paths={shownPaths} matrixPaths={previewing && !showingCsi ? matrixPaths : undefined}
-            showRaysOnHeatmap={showRaysOnHeatmap} radioMap={previewing ? radioMap : null}
+            paths={shownPaths} matrixPaths={showingDiagnostics || showingCoverage ? matrixPaths : undefined}
+            showRaysOnHeatmap={showRaysOnHeatmap} radioMap={showingCoverage ? radioMap : null}
             rmColormap={rmColormap} rmAutoRange={rmAutoRange} rmVmin={rmVmin} rmVmax={rmVmax}
-            onPlaceDevice={placeDevice} editing={workspace === 'planning'} visible={workspace !== 'export'}
-            activeMode={trajectoryView ? 'playback' : previewing && activeMode === 'heatmap' ? 'heatmap' : 'link'}
-            placementMode={workspace === 'planning' ? placementMode : 'none'} setPlacementMode={setPlacementMode}
+            onPlaceDevice={placeDevice} onSelectDevice={selectDevice} deploymentSelection={deploymentSelection}
+            editing={deploying} visible={workspace !== 'export'}
+            showDevices={!editingScene || showSceneDevices} onToggleSceneDevices={() => setShowSceneDevices(visible => !visible)}
+            activeMode={trajectoryView ? 'playback' : showingCoverage ? 'heatmap' : 'link'}
+            placementMode={deploying ? placementMode : 'none'} setPlacementMode={startPlacement}
             showOutlines={showOutlines} setShowOutlines={setShowOutlines}
             mobilityRxPosition={previewPosition ? { x: previewPosition[0], y: previewPosition[1], z: previewPosition[2] } : null}
-            trajectoryPoints={workspace === 'planning' || trajectoryView
+            trajectoryPoints={deploying || trajectoryView
               ? (Object.hasOwn(trajectoriesByRxId, viewedRx.id) ? trajectoriesByRxId[viewedRx.id] : EMPTY_TRACK) : EMPTY_TRACK}
             setTrajectoryPoints={setTrajectoryPoints}
           />
+          {showingCoverage && radioMap && (
+            <div className="pointer-events-none absolute bottom-2 right-2 z-10">
+              <CoverageLegend radioMap={radioMap} colormap={rmColormap} autoRange={rmAutoRange} vmin={rmVmin} vmax={rmVmax} />
+            </div>
+          )}
         </section>
 
-        {workspace === 'export' && (
-          <section className="min-w-0 md:min-h-0 md:overflow-y-auto">
-            <ExportPanel
-              buildings={buildings} anchor={anchor} paths={paths}
-              txs={txs} rxs={rxs} tx={tx} rx={rx} freqGhz={freqGhz} maxDepth={maxDepth}
-              solverOptions={solverOptions} radioMap={radioMap} materials={materialList}
-              projectState={projectState} autosaveStatus={autosaveStatus}
-              onImportProject={handleImportProject} onResetProject={handleResetProject}
-              csiRun={csiRun} csiStale={csiStale} csiGrid={csiGrid} fronthaulMbpsByTxId={currentFronthaul}
-              onOpenPreview={() => openWorkspace('preview')}
+        <aside ref={simulationSidebar} className="studio-results" hidden={!previewing}
+          aria-label={t('Simulation controls and results', '仿真设置与结果')}>
+          <div hidden={simulationTask !== 'csi'}>
+            <CsiPreviewPanel
+              run={csiRun} stale={csiStale} expired={csiExpired} running={csiRunning} active={showingCsi}
+              error={csiIssue ? t(...csiIssue) : ''}
+              staticDisabledReason={staticDisabledReason} trajectoryDisabledReason={trajectoryDisabledReason}
+              mixedArrays={{ static: !txArraysMatch || !rxArraysMatch, trajectory: !txArraysMatch }}
+              staticEstimate={staticEstimate} trajectoryEstimate={trajectoryEstimate}
+              trajectoryReceiver={<label className="flex items-center justify-between gap-2 text-sm">
+                {t('Moving UE', '移动 UE')}
+                <select id="select-csi-trajectory-rx" value={trajectoryReceiver.id}
+                  onChange={event => setCsiReceiverId(event.target.value)}
+                  className="rounded border border-[var(--line)] bg-white px-2 py-1">
+                  {rxs.map(device => <option key={device.id} value={device.id}>{device.name}</option>)}
+                </select>
+              </label>}
+              gridControls={<details className="rounded border border-[var(--line)] bg-[var(--ink-750)] p-2 text-sm">
+                <summary id="csi-grid-settings-trigger" className="cursor-pointer font-semibold">{t('Frequency grid and delay', '频率网格与时延')}</summary>
+                <CsiGridControls settings={csiSettings} onChange={setCsiSettings} bandwidthMhz={coverageBandwidthMhz} />
+              </details>}
+              trajectoryControls={<TrajectorySimulationControls speedKmh={mobilitySpeedKmh} intervalMs={mobilityIntervalMs}
+                combineMode={mobilityCombineMode} handover={handoverConfig} onSpeedChange={setMobilitySpeedKmh}
+                onIntervalChange={setMobilityIntervalMs} onCombineChange={setMobilityCombineMode} onHandoverChange={setHandoverConfig} />}
+              output={csiOutput} onOutputChange={output => {
+                setCsiOutput(output);
+                setCsiIssue(null);
+              }}
+              onRun={handleCsiRun} selection={csiSelection} onSelect={setCsiSelection}
+              link={csiLink} linkLoading={csiLinkLoading} linkError={csiLinkError}
+              onOpenTrajectory={route.waypoints.length < 2 ? openDeploymentRoute : undefined}
+              onOpenDiagnostics={() => openSimulation('diagnostics', true)}
+              onOpenExport={() => openWorkspace('export')}
             />
-          </section>
-        )}
+          </div>
+          <div hidden={simulationTask !== 'coverage'} className="space-y-2">
+            <CoveragePanel
+              txCount={txs.length} backendOnline={backendOnline}
+              onRunHeatmap={handleRunHeatmap} heatmapLoading={loadingHeatmap} radioMap={radioMap} stale={coverageStale}
+              coverageMetric={coverageMetric} setCoverageMetric={setCoverageMetric}
+              coverageBandwidthMhz={coverageBandwidthMhz} coverageNoiseFigureDb={coverageNoiseFigureDb}
+              coverageHeight={coverageHeight} setCoverageHeight={setCoverageHeight}
+              coverageRes={coverageRes} setCoverageRes={setCoverageRes}
+              samplesPerTx={coverageSamplesPerTx} setSamplesPerTx={setCoverageSamplesPerTx}
+              radioMapSeed={radioMapSeed} setRadioMapSeed={setRadioMapSeed}
+              showRaysOnHeatmap={showRaysOnHeatmap} setShowRaysOnHeatmap={setShowRaysOnHeatmap} hasSavedRays={hasSavedRays}
+              rmColormap={rmColormap} setRmColormap={setRmColormap}
+              rmAutoRange={rmAutoRange} setRmAutoRange={setRmAutoRange}
+              rmVmin={rmVmin} setRmVmin={setRmVmin} rmVmax={rmVmax} setRmVmax={setRmVmax}
+              solveError={coverageIssue ? t(...coverageIssue) : ''}
+            />
+            <SimulationDownloads {...downloadProps} kind="coverage" expanded={downloadTask === 'coverage'} />
+          </div>
+          {visitedDiagnostics && (
+            <div hidden={simulationTask !== 'diagnostics'} className="space-y-2">
+              <LinkPanel txs={txs} rxs={rxs} activeTxId={activeTxId} activeRxId={activeRxId}
+                matrix={matrix} matrixLoading={matrixLoading} matrixProgress={matrixProgress}
+                onSolveMatrix={handleSolveMatrix} onSelectPair={handleSelectPair}
+                paths={paths} metrics={metrics} hasResult={metrics !== EMPTY_METRICS} onSolve={handleSolve} solving={solving}
+                solveError={solveError} backendOnline={backendOnline} />
+              <SimulationDownloads {...downloadProps} kind="diagnostics" expanded={downloadTask === 'diagnostics'} />
+              <details className="panel p-3">
+                <summary className="cursor-pointer text-sm font-semibold">{t('Advanced link analysis', '高级链路分析')}</summary>
+                <div className="pt-2">
+                  <AnalysisPanel tx={tx} rx={rx} paths={paths} metrics={metrics}
+                    freqGhz={freqGhz} radioMap={radioMap} buildings={buildings} maxDepth={maxDepth}
+                    solverOptions={solverOptions} materials={materialList} backendOnline={backendOnline} />
+                </div>
+              </details>
+            </div>
+          )}
+        </aside>
+
+        <section className="studio-export" hidden={workspace !== 'export'}>
+          <ExportPanel {...downloadProps} anchor={anchor}
+            csiRun={csiRun} csiStale={csiStale} csiExpired={csiExpired} onCsiExpired={setExpiredRunId}
+            fronthaulMbpsByTxId={currentFronthaul} onOpenPreview={() => openSimulation('csi')}
+            onOpenDiagnostics={() => openSimulation('diagnostics', true)} onOpenCoverage={() => openSimulation('coverage', true)} />
+        </section>
       </main>
       <WorkflowNav activeWorkspace={workspace} onSelect={openWorkspace} />
     </div>

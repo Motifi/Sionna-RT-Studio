@@ -196,6 +196,13 @@ async function errorDetail(res: Response): Promise<string> {
   return res.statusText || `Request failed (${res.status})`;
 }
 
+export class ApiRequestError extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(message);
+    this.name = 'ApiRequestError';
+  }
+}
+
 async function postJson<T>(url: string, body: unknown, timeoutMs = SOLVE_TIMEOUT_MS): Promise<T> {
   return withRequestTimeout(timeoutMs, async (signal) => {
     const res = await fetch(url, {
@@ -226,7 +233,7 @@ async function postForBlob(
       signal,
     });
     if (!res.ok) {
-      throw new Error(await errorDetail(res));
+      throw new ApiRequestError(res.status, await errorDetail(res));
     }
     const blob = await res.blob();
     const cd = res.headers.get('Content-Disposition') || '';
@@ -247,7 +254,7 @@ export function inspectCsiLink(runId: string, selection: CsiSelection): Promise<
   });
   return withRequestTimeout(POLL_TIMEOUT_MS, async (signal) => {
     const res = await fetch(`/api/csi-runs/${encodeURIComponent(runId)}/preview?${query}`, { signal });
-    if (!res.ok) throw new Error(await errorDetail(res));
+    if (!res.ok) throw new ApiRequestError(res.status, await errorDetail(res));
     return await res.json() as CsiLinkPreview;
   });
 }

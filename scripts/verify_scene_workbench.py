@@ -120,13 +120,24 @@ def verify(origin, output):
         env = {**os.environ, "SRTS_MITSUBA_VARIANT": health["variant"]}
         subprocess.run([sys.executable, str(path / "load_scene.py")], cwd=path, env=env, check=True)
         with np.load(path / "cir.npz") as replay:
-            for source, target in (("a", "a"), ("tau_geometric", "tau"), ("h_freq", "h")):
-                actual, expected_array = studio[source][0], replay[target]
-                if source == "a":
-                    actual = actual[..., None]
-                elif source == "h_freq":
-                    expected_array = expected_array[..., 0, :]
-                np.testing.assert_allclose(actual, expected_array, rtol=2e-5, atol=1e-10 if source != "tau_geometric" else 1e-12)
+            # PathSolver can enumerate paths in a different order on replay.
+            # These fixtures have distinct delays. Use the same permutation for
+            # each delay and all of its complex antenna-port coefficients.
+            studio_tau = studio["tau_geometric"][0]
+            replay_tau = replay["tau"]
+            studio_order = np.argsort(studio_tau, axis=-1)
+            replay_order = np.argsort(replay_tau, axis=-1)
+            np.testing.assert_allclose(
+                np.take_along_axis(studio_tau, studio_order, axis=-1),
+                np.take_along_axis(replay_tau, replay_order, axis=-1),
+                rtol=2e-5, atol=1e-12,
+            )
+            np.testing.assert_allclose(
+                np.take_along_axis(studio["a"][0], studio_order[:, None, :, None, :], axis=-1),
+                np.take_along_axis(replay["a"][..., 0], replay_order[:, None, :, None, :], axis=-1),
+                rtol=2e-5, atol=1e-10,
+            )
+            np.testing.assert_allclose(studio["h_freq"][0], replay["h"][..., 0, :], rtol=2e-5, atol=1e-10)
 
     # Import a centimetre-based OBJ wall using Y-up axes, then solve against
     # the compiled triangles. This uses the same upload endpoint as Scene.

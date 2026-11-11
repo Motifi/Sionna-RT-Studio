@@ -39,7 +39,7 @@ MAX_DEPTH = 3
 # Hard cap on cells for the ray-traced channel-grid export. Cells are solved in
 # chunked PathSolver dispatches (chunkSize receivers each), so GPU memory is
 # bounded by the chunk — this cap guards total runtime and output size. Keep in
-# sync with CHANNEL_GRID_MAX_CELLS in src/components/ExportPanel.tsx.
+# sync with CHANNEL_GRID_MAX_CELLS in src/components/SimulationDownloads.tsx.
 MAX_CHANNEL_GRID_CELLS = 16384
 # Coverage returns one JSON object per cell and allocates metrics per Tx × cell.
 MAX_RADIO_MAP_CELLS = 250_000

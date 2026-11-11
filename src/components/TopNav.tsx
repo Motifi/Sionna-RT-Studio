@@ -3,10 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import { useEffect, useRef, useState, type ChangeEvent } from 'react';
+import { ChevronDown, FileDown, FileUp, FolderOpen, RotateCcw } from 'lucide-react';
 import type { BackendHealth } from '../api';
-import type { ProjectAutosaveStatus } from '../project';
+import { createProjectDocument, type ProjectAutosaveStatus, type StudioProjectState } from '../project';
 import { AboutStudio } from './AboutStudio';
-import { useI18n } from '../i18n';
+import { downloadFile } from './downloadFile';
+import { useI18n, type LocalizedText } from '../i18n';
 
 const LOGO_URL = new URL('../../assets/logo-app-bone.png', import.meta.url).href;
 
@@ -16,15 +19,86 @@ interface TopNavProps {
   onRetryAutosave: () => void;
   onReplaceUnreadableAutosave?: () => void;
   recoveryError?: string;
+  projectState: StudioProjectState;
+  onImportProject: (text: string) => void;
+  onResetProject: () => void;
 }
 
-export function TopNav({ health, autosaveStatus, onRetryAutosave, onReplaceUnreadableAutosave, recoveryError }: TopNavProps) {
+export function TopNav({
+  health, autosaveStatus, onRetryAutosave, onReplaceUnreadableAutosave, recoveryError,
+  projectState, onImportProject, onResetProject,
+}: TopNavProps) {
   const { t, locale, setLocale } = useI18n();
+  const projectMenu = useRef<HTMLDetailsElement>(null);
+  const projectInput = useRef<HTMLInputElement>(null);
+  const [projectImporting, setProjectImporting] = useState(false);
+  const [projectMessage, setProjectMessage] = useState<{ kind: 'success' | 'error'; text: LocalizedText } | null>(null);
+
+  useEffect(() => {
+    const dismissOutside = (event: PointerEvent) => {
+      const menu = projectMenu.current;
+      if (menu?.open && event.target instanceof Node && !menu.contains(event.target)) menu.open = false;
+    };
+    const dismissOnEscape = (event: KeyboardEvent) => {
+      const menu = projectMenu.current;
+      if (!menu?.open || event.key !== 'Escape') return;
+      menu.open = false;
+      menu.querySelector('summary')?.focus();
+    };
+    document.addEventListener('pointerdown', dismissOutside);
+    document.addEventListener('keydown', dismissOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', dismissOutside);
+      document.removeEventListener('keydown', dismissOnEscape);
+    };
+  }, []);
+
+  const saveProjectFile = () => {
+    try {
+      downloadFile(
+        `${JSON.stringify(createProjectDocument(projectState), null, 2)}\n`,
+        'sionna_rt_studio_project.json',
+        'application/json',
+      );
+      setProjectMessage({ kind: 'success', text: ['Project file exported.', '项目文件已导出。'] });
+    } catch (error) {
+      const detail = error instanceof Error ? ` ${error.message}` : '';
+      setProjectMessage({
+        kind: 'error',
+        text: [`Could not export the project file.${detail}`, `无法导出项目文件。${detail}`],
+      });
+    }
+  };
+
+  const importProjectFile = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file || projectImporting) return;
+    setProjectImporting(true);
+    setProjectMessage(null);
+    try {
+      onImportProject(await file.text());
+      setProjectMessage({
+        kind: 'success',
+        text: [`Loaded ${file.name}. Computed results were cleared.`, `已载入 ${file.name}。已清除旧的计算结果。`],
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? ` ${error.message}` : '';
+      setProjectMessage({
+        kind: 'error',
+        text: [`Could not import the project file.${detail}`, `无法导入项目文件。${detail}`],
+      });
+    } finally {
+      setProjectImporting(false);
+    }
+  };
+
+  const menuAction = 'flex w-full cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-left text-sm font-semibold hover:bg-[var(--ink-750)] disabled:cursor-wait disabled:opacity-60';
 
   return (
     <header className="sticky top-0 z-50 shrink-0 border-b border-[var(--line)] bg-[var(--page)]/95 backdrop-blur-md">
-      <div className="flex items-center justify-between gap-3 px-3 sm:px-6">
-        <div className="flex shrink-0 items-center gap-2.5 py-1.5">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 px-3 sm:px-6">
+        <div className="flex min-w-0 items-center gap-2.5 py-1.5">
           <img
             src={LOGO_URL}
             alt={t('SionnaRT Studio wireless digital twin', 'SionnaRT Studio 无线仿真实验台')}
@@ -32,6 +106,46 @@ export function TopNav({ health, autosaveStatus, onRetryAutosave, onReplaceUnrea
             draggable={false}
           />
           <span className="hidden readout text-[12px] text-[var(--text-lo)] sm:inline">{health?.appVersion ? `v${health.appVersion}` : ''}</span>
+          <details ref={projectMenu}>
+            <summary id="project-menu-trigger" className="btn-quiet flex cursor-pointer list-none items-center gap-1.5 px-2 py-1.5 text-sm [&::-webkit-details-marker]:hidden">
+              <FolderOpen size={15} aria-hidden="true" />
+              {t('Project', '项目')}
+              <ChevronDown size={14} aria-hidden="true" />
+            </summary>
+            <div className="absolute inset-x-3 top-full z-20 grid gap-1 rounded-lg border border-[var(--line)] bg-white p-2 shadow-lg sm:inset-x-auto sm:left-6 sm:w-72">
+              <button id="btn-export-project" type="button" className={menuAction} onClick={saveProjectFile}>
+                <FileDown size={16} aria-hidden="true" />
+                {t('Export project JSON', '导出项目 JSON')}
+              </button>
+              <button id="btn-import-project" type="button" className={menuAction} disabled={projectImporting} onClick={() => projectInput.current?.click()}>
+                <FileUp size={16} aria-hidden="true" />
+                {projectImporting ? t('Importing project…', '正在导入项目…') : t('Import project JSON', '导入项目 JSON')}
+              </button>
+              <input
+                id="input-import-project"
+                ref={projectInput}
+                type="file"
+                accept=".json,application/json"
+                onChange={importProjectFile}
+                className="hidden"
+                aria-label={t('Import SionnaRTStudio project JSON', '导入 SionnaRTStudio 项目 JSON')}
+              />
+              <button
+                id="btn-reset-project"
+                type="button"
+                className={`${menuAction} text-[var(--bad)]`}
+                disabled={projectImporting}
+                onClick={onResetProject}
+              >
+                <RotateCcw size={16} aria-hidden="true" />
+                {t('Reset Studio', '重置实验台')}
+              </button>
+              {projectMessage && <p
+                role={projectMessage.kind === 'error' ? 'alert' : 'status'}
+                className={`border-t border-[var(--line)] px-2 py-1.5 text-xs break-words ${projectMessage.kind === 'error' ? 'text-[var(--bad)]' : 'text-[var(--text-mid)]'}`}
+              >{t(...projectMessage.text)}</p>}
+            </div>
+          </details>
         </div>
 
         <div className="flex shrink-0 items-center gap-2 py-2 select-none">
