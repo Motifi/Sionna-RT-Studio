@@ -2,6 +2,7 @@
 from io import BytesIO
 import json
 from pathlib import PurePosixPath
+import re
 from uuid import uuid4
 import xml.etree.ElementTree as ET
 from zipfile import BadZipFile, ZipFile
@@ -18,12 +19,67 @@ MAX_TRIANGLES = 150_000
 MAX_SHAPES = 256
 STUDIO_GROUND_PATH = PurePosixPath("meshes/ground.ply")
 
+# Match Trimesh's header terminator token and the UTF-8 line breaks used by str.splitlines().
+_PLY_END_HEADER = re.compile(r"(?<!\S)end_header(?!\S)")
+_PLY_LINE_BREAKS = tuple(separator.encode("utf-8") for separator in "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+
 # Prefer canonical UI ids where more than one id refers to the same preset.
 ITU_IDS = {value: key for key, value in MATERIAL_MAP.items()}
 
 
+def _check_ply_limits(data: bytes) -> None:
+    row_limit = MAX_VERTICES + MAX_TRIANGLES
+    declared_rows = 0
+    with BytesIO(data) as stream:
+        if b"ply" not in stream.readline().lower():
+            raise ValueError("Expected a PLY header.")
+        is_ascii = "ascii" in stream.readline().decode("utf-8").lower()
+        for raw in stream:
+            line = raw.decode("utf-8")
+            if _PLY_END_HEADER.search(line):
+                break
+            fields = line.split(maxsplit=3)
+            if not fields:
+                raise ValueError("Empty line in PLY header.")
+            # Trimesh treats a first token containing "element" as a declaration.
+            if "element" not in fields[0]:
+                continue
+            if len(fields) != 3:
+                raise ValueError("Expected an element name and row count in the PLY header.")
+            _, element, length = fields
+            count = int(length)
+            if count < 0:
+                raise ValueError("PLY element counts must be nonnegative.")
+            if (
+                (element == "vertex" and count > MAX_VERTICES)
+                or (element == "face" and count > MAX_TRIANGLES)
+            ):
+                raise ValueError(f"Import is capped at {MAX_VERTICES} vertices and {MAX_TRIANGLES} triangles.")
+            declared_rows += count
+            if is_ascii and declared_rows > row_limit:
+                raise ValueError(f"ASCII PLY is capped at {row_limit} data rows.")
+        else:
+            raise ValueError("PLY header is missing end_header.")
+        start = stream.tell()
+
+    if not is_ascii:
+        return
+    # Trimesh allocates one array per physical row, including trailing blank rows.
+    # Count directly in the bytes and treat CRLF as a single break.
+    rows = sum(data.count(separator, start) for separator in _PLY_LINE_BREAKS)
+    rows -= data.count(b"\r\n", start)
+    if start < len(data) and not data.endswith(_PLY_LINE_BREAKS, start):
+        rows += 1
+    if rows > row_limit:
+        raise ValueError(f"ASCII PLY is capped at {row_limit} data rows.")
+    if rows < declared_rows:
+        raise ValueError("ASCII PLY has fewer data rows than declared.")
+
+
 def _load_mesh(data: bytes, suffix: str) -> trimesh.Trimesh:
     try:
+        if suffix == "ply":
+            _check_ply_limits(data)
         mesh = trimesh.load(BytesIO(data), file_type=suffix, force="mesh", process=False, skip_materials=True)
     except Exception as exc:
         raise ValueError(f"Invalid {suffix.upper()} mesh: {exc}") from exc

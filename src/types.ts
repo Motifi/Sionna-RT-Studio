@@ -37,6 +37,11 @@ export interface BuildingFootprint {
   material: string; // e.g., 'itu_concrete', 'itu_glass', 'itu_brick'
 }
 
+export interface SolverRoof {
+  topZ: number;
+  rings: Pick<ENUVector, 'x' | 'y'>[][]; // Exterior followed by any holes.
+}
+
 export interface Transmitter {
   id: string;
   name: string;

@@ -40,6 +40,25 @@ test('the roof must have a valid area and contain the device strictly inside', (
   assert.equal(getDeviceElevation({ ...device, enu: { ...device.enu, x: 0 } }, [building]), 1);
 });
 
+test('roof-relative markers use the repaired solver footprint when available', () => {
+  const crossed = { ...building, baseZ: 0, height: 8, enuPoints: [
+    { x: 0, y: 0, z: 0 }, { x: 8, y: 8, z: 0 }, { x: 0, y: 8, z: 0 }, { x: 4, y: 0, z: 0 },
+  ] };
+  const roofs = [{ topZ: 8, rings: [[{ x: 8, y: 8 }, { x: 8 / 3, y: 8 / 3 }, { x: 0, y: 8 }]] }];
+  assert.equal(getDeviceElevation({ enu: { x: 2, y: 1, z: 0 }, height: 1.5 }, [crossed], roofs), 1.5);
+  assert.equal(getDeviceElevation({ enu: { x: 3, y: 7, z: 0 }, height: 1.5 }, [crossed], roofs), 9.5);
+  assert.equal(getDeviceElevation({ enu: { x: 1.5, y: 5, z: 0 }, height: 1.5 }, [crossed], roofs), 9.5);
+  assert.equal(getDeviceElevation({ enu: { x: 3, y: 7, z: 0 }, height: 1.5 }, [crossed], []), 1.5);
+});
+
+test('a repaired roof excludes its holes and their boundaries', () => {
+  const hole = [{ x: 1, y: 1 }, { x: 3, y: 1 }, { x: 3, y: 3 }, { x: 1, y: 3 }];
+  const roofs = [{ topZ: 19, rings: [building.enuPoints, hole] }];
+  assert.equal(getDeviceElevation({ enu: { x: 2, y: 2, z: 0 }, height: 1 }, [building], roofs), 1);
+  assert.equal(getDeviceElevation({ enu: { x: 1, y: 2, z: 0 }, height: 1 }, [building], roofs), 1);
+  assert.equal(getDeviceElevation({ enu: { x: 0.5, y: 2, z: 0 }, height: 1 }, [building], roofs), 20);
+});
+
 test('editor IDs can be generated when the browser omits randomUUID on HTTP', () => {
   const original = Object.getOwnPropertyDescriptor(crypto, 'randomUUID');
   Object.defineProperty(crypto, 'randomUUID', { configurable: true, value: undefined });

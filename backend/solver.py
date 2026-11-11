@@ -28,7 +28,7 @@ from .models import (
     Transmitter,
 )
 from .runtime_env import trace_paths_for_runtime
-from .scene_build import build_compiled_scene, build_scene, building_polygon, compile_scene, inspect_scene
+from .scene_build import build_compiled_scene, build_scene, building_roofs, compile_scene, inspect_scene
 from .solver_runtime import solver_runtime
 
 # Sionna InteractionType codes (sionna.rt.constants.InteractionType).
@@ -221,12 +221,9 @@ def _device_z(enu: ENUVector, height: float, buildings: list[BuildingFootprint],
 
     pt = Point(enu.x, enu.y)
     roof = 0.0
-    for b in buildings:
-        if b.category != "building" or b.kind != "building":
-            continue
-        polygon, _ = building_polygon(b)
-        if polygon is not None and polygon.contains(pt):
-            roof = max(roof, b.baseZ + max(b.height, 1.0))
+    for polygon, top in building_roofs(buildings):
+        if top > roof and polygon.contains(pt):
+            roof = top
     return roof + float(height)
 
 

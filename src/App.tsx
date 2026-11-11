@@ -23,7 +23,7 @@ import { GeographyPanel } from './components/GeographyPanel';
 import { AnalysisPanel } from './components/AnalysisPanel';
 import { ExportPanel } from './components/ExportPanel';
 import { DevicePanel } from './components/DevicePanel';
-import type { PlacementMode, ENUVector } from './types';
+import type { PlacementMode, ENUVector, SolverRoof } from './types';
 import { useI18n, type LocalizedText } from './i18n';
 import {
   createIdSuffix,
@@ -31,7 +31,7 @@ import {
   enuToLatLon,
   fetchOSMBuildings,
 } from './utils';
-import { solveLink, solveRadioMap, readBackendHealth, inspectScene, createCsiRun, inspectCsiLink } from './api';
+import { solveLink, solveRadioMap, readBackendHealth, inspectScene, createCsiRun, inspectCsiLink, readSolverRoofs } from './api';
 import type { BackendHealth, SceneInspection, SolverMesh, CsiRun, CsiRunMode, CsiRunOutput, CsiSelection, CsiLinkPreview, HandoverConfig } from './api';
 import {
   clearAutosavedProject,
@@ -616,6 +616,27 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   const [inspectionIssue, setInspectionIssue] = useState('');
   const inspectionInput = React.useMemo(() => ({ buildings, freqGhz, materialList }), [buildings, freqGhz, materialList]);
   const currentInspection = inspection?.input === inspectionInput ? inspection.result : null;
+  const [roofInspection, setRoofInspection] = useState<{ buildings: BuildingFootprint[]; roofs: SolverRoof[] } | null>(null);
+  const solverRoofs = roofInspection?.buildings === buildings ? roofInspection.roofs : undefined;
+  useEffect(() => {
+    if (!backendOnline) return;
+    let current = true;
+    let retryTimer: number | undefined;
+    let retryDelay = 1_000;
+    const refresh = () => {
+      readSolverRoofs(buildings).then(
+        roofs => { if (current) setRoofInspection({ buildings, roofs }); },
+        () => {
+          if (!current) return;
+          retryTimer = window.setTimeout(refresh, retryDelay);
+          retryDelay = Math.min(retryDelay * 2, 10_000);
+        },
+      );
+    };
+    refresh();
+    return () => { current = false; window.clearTimeout(retryTimer); };
+  }, [backendOnline, buildings]);
+
   useEffect(() => {
     if (!backendOnline || workspace !== 'scene') return;
     let cancelled = false;
@@ -1316,6 +1337,7 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
           <ThreeStudio
             sceneEditor={workspace === 'scene' ? editor : undefined}
             physicalMeshes={workspace === 'scene' && editor.solverMesh ? currentInspection?.meshes ?? EMPTY_MESHES : undefined}
+            solverRoofs={solverRoofs}
             buildings={buildings} anchor={anchor} tx={viewedTx} rx={viewedRx} txs={txs} rxs={rxs}
             activeTxId={viewedTx.id} activeRxId={viewedRx.id}
             paths={shownPaths} matrixPaths={previewing && !showingCsi ? matrixPaths : undefined}

@@ -17,6 +17,7 @@ import {
   PropagationPath,
   RadioMapGrid,
   Receiver,
+  SolverRoof,
   SolverOptions,
   Transmitter,
 } from './types';
@@ -195,8 +196,8 @@ async function errorDetail(res: Response): Promise<string> {
   return res.statusText || `Request failed (${res.status})`;
 }
 
-async function postJson<T>(url: string, body: unknown): Promise<T> {
-  return withRequestTimeout(SOLVE_TIMEOUT_MS, async (signal) => {
+async function postJson<T>(url: string, body: unknown, timeoutMs = SOLVE_TIMEOUT_MS): Promise<T> {
+  return withRequestTimeout(timeoutMs, async (signal) => {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -341,6 +342,13 @@ export interface SceneInspection {
 
 export function inspectScene(buildings: BuildingFootprint[], freqGhz: number, materials: MaterialConfig[]) {
   return postJson<SceneInspection>('/api/scene-inspection', { buildings, freqGhz, materials });
+}
+
+export function readSolverRoofs(buildings: BuildingFootprint[]): Promise<SolverRoof[]> {
+  // Only send building footprints. Imported triangle arrays are irrelevant here.
+  const footprints = buildings.filter(b => b.category === 'building' && (b.kind ?? 'building') === 'building')
+    .map(({ id, category, enuPoints, height, baseZ }) => ({ id, category, enuPoints, height, baseZ }));
+  return footprints.length ? postJson<SolverRoof[]>('/api/scene-roofs', footprints, POLL_TIMEOUT_MS) : Promise.resolve([]);
 }
 
 export interface MeshImportResult {

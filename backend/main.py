@@ -101,6 +101,7 @@ from .csi_runs import CsiExportRequest, CsiRun, CsiRunRequest, solve_csi_run
 from .linklevel import compute_link_kpis
 from .linkphy import phy_available, run_pusch_ber_sweep
 from .models import (
+    BuildingFootprint,
     CIRRequest,
     ChannelGridRequest,
     LinkKpiRequest,
@@ -117,7 +118,7 @@ from .models import (
     SolveRequest,
     SolveResponse,
 )
-from .scene_build import inspect_scene
+from .scene_build import inspect_roofs, inspect_scene
 from .scene_export import scene_export_zip
 from .scene_import import MAX_UPLOAD, import_meshes
 from .solver_runtime import package_version, solver_runtime
@@ -200,6 +201,11 @@ def health() -> dict:
 @app.post("/api/scene-inspection")
 def api_scene_inspection(req: SceneInspectionRequest) -> dict:
     return inspect_scene(req.buildings, req.freqGhz, req.materials)
+
+
+@app.post("/api/scene-roofs")
+def api_scene_roofs(buildings: list[BuildingFootprint]) -> list[dict]:
+    return inspect_roofs(buildings)
 
 
 @app.post("/api/mesh-import")

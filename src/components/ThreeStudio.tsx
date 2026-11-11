@@ -9,6 +9,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import type { SolverMesh } from '../api';
 import type { SceneEditor } from '../sceneEditor';
+import type { SolverRoof } from '../types';
 import { BuildingFootprint, GeoAnchor, Transmitter, Receiver, PropagationPath, ENUVector, PlacementMode } from '../types';
 import { cn } from '../lib/utils';
 import { enuToLatLon, getDeviceElevation, isPointInPolygon } from '../utils';
@@ -154,6 +155,7 @@ type DevicePlacement = Exclude<PlacementMode, 'none'>;
 interface ThreeStudioProps {
   sceneEditor?: SceneEditor;
   physicalMeshes?: SolverMesh[];
+  solverRoofs?: SolverRoof[];
   buildings: BuildingFootprint[];
   anchor: GeoAnchor;
   tx: Transmitter;
@@ -194,6 +196,7 @@ function enuToThree(v: ENUVector): THREE.Vector3 {
 export function ThreeStudio({
   sceneEditor,
   physicalMeshes,
+  solverRoofs,
   buildings,
   anchor,
   tx,
@@ -255,7 +258,7 @@ export function ThreeStudio({
 
   // Keep references to access them in render loops & events stably
   const stateRef = useRef({
-    sceneEditor, physicalMeshes,
+    sceneEditor, physicalMeshes, solverRoofs,
     buildings,
     anchor,
     tx,
@@ -286,7 +289,7 @@ export function ThreeStudio({
 
   useEffect(() => {
     stateRef.current = {
-      sceneEditor, physicalMeshes,
+      sceneEditor, physicalMeshes, solverRoofs,
       buildings,
       anchor,
       tx,
@@ -314,7 +317,7 @@ export function ThreeStudio({
       onPlaceDevice,
       visible,
     };
-  }, [sceneEditor, physicalMeshes, buildings, anchor, tx, rx, txs, rxs, activeTxId, activeRxId, paths, matrixPaths, showRaysOnHeatmap, radioMap, rmColormap, rmAutoRange, rmVmin, rmVmax, placementMode, activeMode, cameraMode, showOutlines, drawingTrajectory, mobilityRxPosition, trajectoryPoints, setTrajectoryPoints, onPlaceDevice, visible]);
+  }, [sceneEditor, physicalMeshes, solverRoofs, buildings, anchor, tx, rx, txs, rxs, activeTxId, activeRxId, paths, matrixPaths, showRaysOnHeatmap, radioMap, rmColormap, rmAutoRange, rmVmin, rmVmax, placementMode, activeMode, cameraMode, showOutlines, drawingTrajectory, mobilityRxPosition, trajectoryPoints, setTrajectoryPoints, onPlaceDevice, visible]);
 
   useEffect(() => {
     if (!containerRef.current || !canvasRef.current) return;
@@ -808,9 +811,10 @@ export function ThreeStudio({
       clearGroup(receiverGroup);
 
       const current = stateRef.current;
+      const elevation = (device: Transmitter | Receiver) => getDeviceElevation(device, current.buildings, current.solverRoofs);
 
       // Draw Transmitter Tower (TX)
-      const txThreePos = enuToThree({ ...current.tx.enu, z: getDeviceElevation(current.tx, current.buildings) });
+      const txThreePos = enuToThree({ ...current.tx.enu, z: elevation(current.tx) });
 
       // Draw tower pedestal structure
       const towerBaseGeom = new THREE.CylinderGeometry(0.5, 3, Math.abs(txThreePos.y), 4);
@@ -861,7 +865,7 @@ export function ThreeStudio({
       // Draw Receiver Terminal (RX). During mobility playback, use the selected
       // solved sample directly so animation does not mutate the editable Rx state.
       const rxEnuPos = (current.activeMode === 'playback' && current.mobilityRxPosition) ||
-        { ...current.rx.enu, z: getDeviceElevation(current.rx, current.buildings) };
+        { ...current.rx.enu, z: elevation(current.rx) };
       const rxThreePos = enuToThree(rxEnuPos);
 
       // Clean glowing reception dome
@@ -886,7 +890,7 @@ export function ThreeStudio({
       // The active Tx/Rx already render above with full tower/device geometry;
       // here we add simpler poles+domes so every device in the list is visible.
       const drawMarker = (device: Transmitter | Receiver, color: number, labelColor: string) => {
-        const top = enuToThree({ ...device.enu, z: getDeviceElevation(device, current.buildings) });
+        const top = enuToThree({ ...device.enu, z: elevation(device) });
         const pole = new THREE.Mesh(
           new THREE.CylinderGeometry(0.3, 0.3, Math.abs(top.y), 8),
           new THREE.MeshStandardMaterial({ color: 0x475569, metalness: 0.6, roughness: 0.4 }),
@@ -1168,7 +1172,7 @@ export function ThreeStudio({
           c.physicalMeshes !== p.physicalMeshes || c.sceneEditor?.selected?.id !== p.sceneEditor?.selected?.id ||
           c.sceneEditor?.hiddenLayers !== p.sceneEditor?.hiddenLayers) rebuildBuildings3D();
       if (c.sceneEditor?.draft !== p.sceneEditor?.draft) rebuildDraft();
-      if (first || c.buildings !== p.buildings || c.tx !== p.tx || c.rx !== p.rx || c.txs !== p.txs || c.rxs !== p.rxs ||
+      if (first || c.buildings !== p.buildings || c.solverRoofs !== p.solverRoofs || c.tx !== p.tx || c.rx !== p.rx || c.txs !== p.txs || c.rxs !== p.rxs ||
           c.activeTxId !== p.activeTxId || c.activeRxId !== p.activeRxId ||
           c.activeMode !== p.activeMode || c.mobilityRxPosition !== p.mobilityRxPosition ||
           c.showOutlines !== p.showOutlines) {

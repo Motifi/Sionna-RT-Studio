@@ -6,7 +6,7 @@
  * All RF solving happens on the Sionna RT backend (see api.ts).
  */
 
-import { GeoAnchor, ENUVector, BuildingFootprint, Transmitter, PropagationPath, RadioMapGrid, ChannelGridConfig } from './types';
+import { GeoAnchor, ENUVector, BuildingFootprint, SolverRoof, Transmitter, PropagationPath, RadioMapGrid, ChannelGridConfig } from './types';
 
 // Coordinate Math Constants
 const M_LAT = 110574;
@@ -27,16 +27,54 @@ export function enuToLatLon(enu: ENUVector, anchor: GeoAnchor): { lat: number; l
   return { lat, lon };
 }
 
+type HorizontalPoint = Pick<ENUVector, 'x' | 'y'>;
+
+const coordinateBits = new DataView(new ArrayBuffer(8));
+const implicitMantissaBit = 1n << 52n;
+
+function exactCoordinate(value: number): bigint {
+  // Express the IEEE-754 double in units of 2^-1074, including subnormals.
+  coordinateBits.setFloat64(0, value);
+  const bits = coordinateBits.getBigUint64(0);
+  const exponent = (bits >> 52n) & 0x7ffn;
+  const fraction = bits & (implicitMantissaBit - 1n);
+  const magnitude = exponent === 0n ? fraction : (implicitMantissaBit | fraction) << (exponent - 1n);
+  return bits >> 63n ? -magnitude : magnitude;
+}
+
+function orientationSign(a: HorizontalPoint, b: HorizontalPoint, p: HorizontalPoint): number {
+  const left = (b.x - a.x) * (p.y - a.y);
+  const right = (b.y - a.y) * (p.x - a.x);
+  const determinant = left - right;
+  const errorBound = Math.max(4 * Number.EPSILON * (Math.abs(left) + Math.abs(right)), 4 * Number.MIN_VALUE);
+  if (Number.isFinite(determinant) && Math.abs(determinant) > errorBound) return Math.sign(determinant);
+
+  // Repaired edges can sit within the floating-point error of the query point.
+  // Use the exact sign to distinguish true boundaries from nearby points.
+  const ax = exactCoordinate(a.x), ay = exactCoordinate(a.y);
+  const exact = (exactCoordinate(b.x) - ax) * (exactCoordinate(p.y) - ay) -
+    (exactCoordinate(b.y) - ay) * (exactCoordinate(p.x) - ax);
+  if (exact === 0n) return 0;
+  return exact > 0n ? 1 : -1;
+}
+
 // Match the solver's strict containment rule: roof mounting excludes the boundary.
-export function isPointInPolygon(pt: { x: number; y: number }, poly: ENUVector[]): boolean {
+export function isPointInPolygon(
+  pt: HorizontalPoint,
+  poly: HorizontalPoint[],
+  includeBoundary = false,
+): boolean {
   let inside = false;
   for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
     const a = poly[i], b = poly[j];
-    const dx = b.x - a.x, dy = b.y - a.y;
-    if ((pt.x - a.x) * dy === (pt.y - a.y) * dx &&
-      pt.x >= Math.min(a.x, b.x) && pt.x <= Math.max(a.x, b.x) &&
-      pt.y >= Math.min(a.y, b.y) && pt.y <= Math.max(a.y, b.y)) return false;
-    if ((a.y > pt.y) !== (b.y > pt.y) && pt.x < a.x + dx * (pt.y - a.y) / dy) inside = !inside;
+    if (pt.y < Math.min(a.y, b.y) || pt.y > Math.max(a.y, b.y)) continue;
+    if (a.y === b.y) {
+      if (pt.x >= Math.min(a.x, b.x) && pt.x <= Math.max(a.x, b.x)) return includeBoundary;
+      continue;
+    }
+    const side = orientationSign(a, b, pt);
+    if (side === 0) return includeBoundary;
+    if ((a.y > pt.y) !== (b.y > pt.y) && (side > 0) === (b.y > a.y)) inside = !inside;
   }
   return inside;
 }
@@ -54,9 +92,20 @@ function footprintArea(vertices: ENUVector[]): number {
 export function getDeviceElevation(
   device: Pick<Transmitter, 'enu' | 'height' | 'heightReference'>,
   buildings: BuildingFootprint[],
+  solverRoofs?: SolverRoof[],
 ): number {
   if (device.heightReference === 'enu') return device.height;
   let roof = 0;
+  if (solverRoofs) {
+    for (const { topZ, rings } of solverRoofs) {
+      if (topZ > roof && isPointInPolygon(device.enu, rings[0]) &&
+        !rings.some((ring, index) => index > 0 && isPointInPolygon(device.enu, ring, true))) {
+        roof = topZ;
+      }
+    }
+    return roof + device.height;
+  }
+  // Keep local placement usable while the solver is unavailable or updating.
   for (const building of buildings) {
     if (building.category !== 'building' || (building.kind ?? 'building') !== 'building' ||
       building.height <= 0 || building.enuPoints.length < 3) continue;

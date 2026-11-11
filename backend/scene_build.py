@@ -108,6 +108,26 @@ def building_polygon(footprint: BuildingFootprint):
     return polygon, issues
 
 
+def building_roofs(buildings: list[BuildingFootprint]):
+    """Yield repaired roof polygons and the elevations used for antenna mounting."""
+    for building in buildings:
+        if building.category != "building" or building.kind != "building":
+            continue
+        polygon, _ = building_polygon(building)
+        if polygon is not None:
+            yield polygon, building.baseZ + max(building.height, 1.0)
+
+
+def inspect_roofs(buildings: list[BuildingFootprint]) -> list[dict]:
+    return [
+        {"topZ": top, "rings": [
+            [{"x": x, "y": y} for x, y in ring.coords[:-1]]
+            for ring in (polygon.exterior, *polygon.interiors)
+        ]}
+        for polygon, top in building_roofs(buildings)
+    ]
+
+
 def _object_mesh(obj: BuildingFootprint) -> tuple[trimesh.Trimesh | None, list[str]]:
     if obj.kind == "mesh":
         if obj.mesh is None:
@@ -115,15 +135,7 @@ def _object_mesh(obj: BuildingFootprint) -> tuple[trimesh.Trimesh | None, list[s
         vertices = np.asarray(obj.mesh.vertices).reshape(-1, 3).copy()
         vertices[:, 2] += obj.baseZ
         faces = np.asarray(obj.mesh.triangles).reshape(-1, 3)
-        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-        valid = mesh.nondegenerate_faces()
-        if not valid.any():
-            return None, ["Mesh contains no nondegenerate triangles."]
-        if not valid.all():
-            mesh.update_faces(valid)
-            mesh.remove_unreferenced_vertices()
-            return mesh, [f"Removed {len(valid) - int(valid.sum())} degenerate triangles."]
-        return mesh, []
+        return trimesh.Trimesh(vertices=vertices, faces=faces, process=False), []
     if obj.kind == "wall":
         if len(obj.enuPoints) != 2 or obj.height <= 0:
             return None, ["Wall needs two endpoints and a positive height."]
@@ -144,6 +156,27 @@ def _object_mesh(obj: BuildingFootprint) -> tuple[trimesh.Trimesh | None, list[s
         return mesh, issues
     except Exception as exc:
         return None, [*issues, f"Polygon triangulation failed: {exc}"]
+
+
+def _mesh_at_solver_precision(mesh: trimesh.Trimesh) -> tuple[trimesh.Trimesh | None, list[str]]:
+    # Apply world transforms before rounding to the coordinates written to PLY.
+    # Compile, inspect and export the same surviving triangles.
+    with np.errstate(over="ignore"):
+        vertices = mesh.vertices.astype("<f4")
+    if not np.isfinite(vertices).all():
+        return None, ["Mesh coordinates exceed the solver's float32 range."]
+    # Rounding can also introduce area into a previously collinear face.
+    valid = mesh.nondegenerate_faces()
+    mesh.vertices = vertices
+    valid &= mesh.nondegenerate_faces()
+    if not valid.any():
+        return None, ["Mesh has no nondegenerate triangles at solver precision."]
+    removed = len(valid) - int(valid.sum())
+    if removed:
+        mesh.update_faces(valid)
+        mesh.remove_unreferenced_vertices()
+        return mesh, [f"Removed {removed} degenerate triangle(s) at solver precision."]
+    return mesh, []
 
 
 def _ground_plane(meshes: list[trimesh.Trimesh]) -> trimesh.Trimesh:
@@ -196,6 +229,9 @@ def _compile(objects_json: str, freq_ghz: float, materials_json: str) -> Compile
     for raw in json.loads(objects_json):
         obj = BuildingFootprint.model_validate(raw)
         mesh, issues = _object_mesh(obj)
+        if mesh is not None:
+            mesh, precision_issues = _mesh_at_solver_precision(mesh)
+            issues.extend(precision_issues)
         material = _resolve_material(obj.material)
         if obj.material not in MATERIAL_MAP and obj.material.strip().lower() not in OSM_MATERIAL_ALIASES:
             issues.append(f"Unknown radio material {obj.material!r}; using concrete.")

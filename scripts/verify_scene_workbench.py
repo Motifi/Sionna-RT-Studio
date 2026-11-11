@@ -10,11 +10,13 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import ProxyHandler, Request, build_opener
 import zipfile
 
 import numpy as np
+from shapely.geometry import Point, Polygon
 
 
 def verify(origin, output):
@@ -68,6 +70,15 @@ def verify(origin, output):
     issues = read("scene-inspection", {**clear, "buildings": [repaired, invalid]})["objects"]
     assert issues[0]["status"] == "physical" and len(issues[0]["issues"]) == 3
     assert issues[1]["status"] == "skipped" and issues[1]["issues"]
+
+    collapsed = {"id": "collapsed", "category": "building", "kind": "mesh", "height": 2, "enuPoints": [],
+                 "mesh": {"vertices": [999999.99, 0, 0, 1000000, 0, 0, 999999.99, 0, 2], "triangles": [0, 1, 2]}}
+    collapsed_scene = {**clear, "buildings": [collapsed]}
+    precision = read("scene-inspection", collapsed_scene)
+    assert precision["objects"][0]["status"] == "skipped" and len(precision["meshes"]) == 1
+    assert "solver precision" in " ".join(precision["objects"][0]["issues"])
+    with zipfile.ZipFile(io.BytesIO(request("scene-export", collapsed_scene))) as bundle:
+        assert [name for name in bundle.namelist() if name.endswith(".ply")] == ["meshes/ground.ply"]
 
     def trace(config):
         run = read("csi-runs", {**config, "mode": "static"})
@@ -129,12 +140,37 @@ def verify(origin, output):
     np.testing.assert_allclose(np.asarray(mesh["vertices"]).reshape(-1, 3).max(axis=0), [0, 10, 4])
     assert mesh["material"] == "itu_glass" and not trace(imported_scene)["valid_paths"].any()
 
+    padded_ply = (b"ply\nformat ascii 1.0\nelement vertex 3\nproperty float x\nproperty float y\nproperty float z\n"
+                  b"element face 1\nproperty list uchar int vertex_indices\nend_header\n"
+                  b"0 0 0\n1 0 0\n0 1 0\n3 0 1 2\n" + b"\n" * 250_000)
+    package = io.BytesIO()
+    with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr("scene.xml", '<scene><shape type="ply"><string name="filename" value="mesh.ply"/></shape></scene>')
+        bundle.writestr("mesh.ply", padded_ply)
+    for filename, payload in (("mesh.ply", padded_ply), ("scene.zip", package.getvalue())):
+        upload = Request(origin + "/api/mesh-import?" + urlencode({"filename": filename}), payload)
+        try:
+            with http.open(upload, timeout=10):
+                raise AssertionError("ASCII PLY with too many rows was accepted")
+        except HTTPError as error:
+            assert error.code == 400 and "250000 data rows" in json.load(error)["detail"]
+
     building = {"id": "building", "category": "building", "height": 8, "baseZ": 3,
                 "enuPoints": [point(-24, -3), point(-16, -3), point(-16, 3), point(-24, 3)]}
     elevated = {**clear, "buildings": [building]}
     assert trace(elevated)["tx_positions"][0, 2] == 12.5
     indoor_tx = {**clear["txs"][0], "height": 6, "heightReference": "enu"}
     assert trace({**elevated, "txs": [indoor_tx]})["tx_positions"][0, 2] == 6
+
+    crossed = {**building, "baseZ": 0, "enuPoints": [point(0, 0), point(8, 8), point(0, 8), point(4, 0)]}
+    roof, = read("scene-roofs", [crossed, invalid, blocked["buildings"][0]])
+    exterior, *holes = [[(p["x"], p["y"]) for p in ring] for ring in roof["rings"]]
+    footprint = Polygon(exterior, holes)
+    assert roof["topZ"] == 8 and not footprint.contains(Point(2, 1)) and footprint.contains(Point(3, 7))
+    receivers = [{**device("discarded", 2), "enu": point(2, 1)}, {**device("retained", 3), "enu": point(3, 7)}]
+    repaired_run = trace({**clear, "buildings": [crossed], "rxs": receivers})
+    np.testing.assert_array_equal(repaired_run["rx_positions"].reshape(-1, 3)[:, 2], [1.5, 9.5])
+
     route = read("csi-runs", {
         **clear, "mode": "trajectory", "output": "cir",
         "rxs": [{**clear["rxs"][0], "height": 3, "heightReference": "enu"}],
