@@ -198,6 +198,8 @@ interface OsmClassification {
   material: string;
   levels?: number;
   name?: string;
+  heightSource?: BuildingFootprint['heightSource'];
+  materialSource?: BuildingFootprint['materialSource'];
 }
 
 // Classify a tagged OSM element into a scene feature (or null if not rendered).
@@ -205,18 +207,19 @@ function classifyOsmTags(tags: Record<string, string>, elemId: string | number):
   if (tags.building) {
     // Guard parseFloat/parseInt: tags like height="12'6\"" produce NaN, which
     // would serialize to null and fail backend validation.
-    let height: number | undefined;
-    const tagged = parseFloat(tags.height ?? '');
-    if (Number.isFinite(tagged) && tagged > 0) height = tagged;
-    const levelsRaw = parseInt(tags['building:levels'] ?? '', 10);
+    const tagged = Number(tags.height?.trim().replace(/\s*m$/i, ''));
+    const tagHeight = Number.isFinite(tagged) && tagged > 0 ? tagged : undefined;
+    const levelsRaw = Number(tags['building:levels']);
     const levels = Number.isFinite(levelsRaw) && levelsRaw > 0 ? levelsRaw : undefined;
-    if (height === undefined && levels !== undefined) height = levels * 3.5;
     const attrs = getBuildingAttributes(tags.building, String(elemId));
+    const taggedMaterial = normalizeOsmMaterial(tags['building:material'] || tags.material);
     return {
       category: 'building',
       type: tags.building,
-      height: height ?? attrs.height,
-      material: normalizeOsmMaterial(tags.material || tags['building:material']) || attrs.material,
+      height: tagHeight ?? (levels === undefined ? attrs.height : levels * 3.5),
+      heightSource: tagHeight !== undefined ? 'tag' : levels === undefined ? 'estimated' : 'levels',
+      material: taggedMaterial ?? attrs.material,
+      materialSource: taggedMaterial ? 'tag' : 'estimated',
       levels,
     };
   }
@@ -371,14 +374,21 @@ export function parseOsmElements(
 
   const buildings: BuildingFootprint[] = [];
 
-  const pushFeature = (id: string, nodeIds: number[], cls: OsmClassification) => {
+  const pushFeature = (id: string, nodeIds: number[], cls: OsmClassification, rawTags: Record<string, string>, importIssues: string[] = []) => {
     const polyPoints: { lat: number; lon: number }[] = [];
     for (const nodeId of nodeIds) {
       const n = nodes[nodeId];
       if (n) polyPoints.push(n);
     }
     // Streets need >= 2 points; closed footprints normally have >= 3.
-    if (polyPoints.length < 2) return;
+    if (polyPoints.length < 2 && cls.category !== 'building') return;
+    if (polyPoints.length !== nodeIds.length) importIssues.push('Some referenced OSM nodes are missing.');
+    if (cls.category === 'building' && cls.heightSource !== 'tag' && rawTags.height) {
+      importIssues.push('Unrecognized OSM height; using levels or an estimated height.');
+    }
+    if (cls.category === 'building' && cls.materialSource === 'estimated' && (rawTags['building:material'] || rawTags.material)) {
+      importIssues.push('Unmapped OSM material; using an estimate.');
+    }
 
     // Buildings keep their true footprint — clamping border-straddling
     // buildings to the bbox used to squash them into degenerate prisms.
@@ -393,6 +403,11 @@ export function parseOsmElements(
     buildings.push({
       id,
       name: cls.name,
+      source: 'osm',
+      heightSource: cls.heightSource,
+      materialSource: cls.materialSource,
+      rawTags,
+      importIssues,
       points,
       enuPoints: points.map((p) => latLonToENU(p.lat, p.lon, anchor)),
       height: cls.height,
@@ -408,7 +423,7 @@ export function parseOsmElements(
     if (elem.type !== 'way' || !elem.tags) continue;
     const cls = classifyOsmTags(elem.tags, elem.id);
     if (!cls) continue;
-    pushFeature(`osm_${elem.id}`, elem.nodes ?? [], cls);
+    pushFeature(`osm_${elem.id}`, elem.nodes ?? [], cls, elem.tags);
   }
 
   // Multipolygon building relations: assemble each outer ring into a footprint
@@ -421,8 +436,12 @@ export function parseOsmElements(
       .filter((m: any) => m.type === 'way' && (m.role === 'outer' || !m.role))
       .map((m: any) => wayNodeIds[m.ref])
       .filter((w: number[] | undefined): w is number[] => Array.isArray(w) && w.length >= 2);
-    stitchRings(outerWays).forEach((ring, ri) => {
-      pushFeature(`osm_rel_${elem.id}_${ri}`, ring, cls);
+    const rings = stitchRings(outerWays);
+    const hasHoles = elem.members.some((member: { role: string }) => member.role === 'inner');
+    (rings.length ? rings : [[]]).forEach((ring, ri) => {
+      const issues = hasHoles ? ['Interior rings were omitted.'] : [];
+      if (!ring.length) issues.push('No closed exterior ring could be assembled.');
+      pushFeature(`osm_rel_${elem.id}_${ri}`, ring, cls, elem.tags, issues);
     });
   }
 

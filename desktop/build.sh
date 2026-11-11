@@ -45,6 +45,14 @@ fi
 test -f "$resources/site/index.html"
 cp "$studio"/backend/*.py "$resources/backend/"
 cp "$desktop/studio_server.py" "$studio/LICENSE" "$studio/NOTICE" "$resources/"
+version="$("$python" -c 'import runpy, sys; print(runpy.run_path(sys.argv[1])["APP_VERSION"])' "$studio/backend/version.py")"
+bundled_python=""
+if [[ -n "${SRTS_BUNDLED_PYTHON:-}" ]]; then
+  test -x "$SRTS_BUNDLED_PYTHON/bin/python3.12"
+  ditto "$SRTS_BUNDLED_PYTHON" "$resources/python"
+  bundled_python="python/bin/python3.12"
+  (cd "$resources"; "./$bundled_python" -I -c 'import fastapi, mitsuba, numpy, trimesh, shapely')
+fi
 
 /usr/bin/sips -c 132 132 --cropOffset 0 0 "$studio/assets/logo-app-bone.png" \
   --out "$staging/icon.png" >/dev/null
@@ -67,7 +75,7 @@ icon = b"".join(chunk(kind, (source / f"icon-{size}.png").read_bytes()) for size
 Path(sys.argv[2]).write_bytes(chunk(b"icns", icon))
 PY
 
-"$python" - "$contents/Info.plist" "$python" "$bundle_id" <<'PY'
+"$python" - "$contents/Info.plist" "$python" "$bundle_id" "$version" "$bundled_python" <<'PY'
 import plistlib
 import sys
 
@@ -81,12 +89,12 @@ with open(sys.argv[1], "wb") as info:
         "CFBundleInfoDictionaryVersion": "6.0",
         "CFBundleName": "Sionna RT Studio",
         "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": "1.0.0",
-        "CFBundleVersion": "1",
+        "CFBundleShortVersionString": sys.argv[4],
+        "CFBundleVersion": sys.argv[4],
         "LSMinimumSystemVersion": "14.0",
         "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
         "NSHighResolutionCapable": True,
-        "StudioPythonPath": sys.argv[2],
+        **({"StudioBundledPython": sys.argv[5]} if sys.argv[5] else {"StudioPythonPath": sys.argv[2]}),
     }, info)
 PY
 /usr/bin/plutil -lint "$contents/Info.plist"

@@ -1,17 +1,9 @@
-"""Build a Sionna RT scene from the frontend's building footprints.
+"""Compile Studio objects to the shared ENU triangle mesh used by Sionna RT.
 
-Footprints arrive as ENU polygons (x=E, y=N, meters) + height. We extrude each
-`building` into a watertight prism, add a ground plane, write a Mitsuba scene XML
-with ITU radio-material BSDFs, and `load_scene` it. Scenes are cached by a hash of
-the geometry+frequency so a Solve and a following Heatmap reuse one build.
-
-Transmission/refraction caveat: Sionna RT models each surface as a single flat
-slab and folds the wall thickness into the reflection/transmission coefficients
-(see the Radio Materials docs). Our prisms are closed, so a ray transmitted
-*through* a building crosses two such slabs (entry + exit wall), each consuming a
-ray-tracing bounce. That is reasonable for reflection and LOS occlusion, but the
-``refraction`` toggle is an approximation for thick/solid structures — deep
-penetration is also bounded by ``max_depth``.
+Buildings are closed prisms and a transmitted ray crosses each surface as a
+separate radio slab. Walls use a single surface with the radio material's slab
+thickness. Imported triangles keep their ENU positions. The solver ground is
+derived from physical bounds. Display-only map objects never affect it.
 """
 from __future__ import annotations
 
@@ -20,6 +12,8 @@ import json
 import tempfile
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -90,80 +84,160 @@ def _resolve_material(raw: str | None) -> str:
     return OSM_MATERIAL_ALIASES.get(raw.strip().lower(), "itu_concrete")
 
 
-def _building_prism(footprint: BuildingFootprint) -> trimesh.Trimesh | None:
-    """Extrude an ENU footprint into a Z-up prism (matches scene z-up axes)."""
+def building_polygon(footprint: BuildingFootprint):
+    """Resolve the exact footprint used for extrusion and legacy roof mounting."""
     from shapely.geometry import Polygon
     from shapely.validation import make_valid
 
-    pts = [(p.x, p.y) for p in footprint.enuPoints]
-    if len(pts) < 3:
-        return None
+    if len(footprint.enuPoints) < 3 or footprint.height <= 0:
+        return None, ["Building needs three vertices and a positive height."]
+    polygon = Polygon([(p.x, p.y) for p in footprint.enuPoints])
+    issues = []
+    if not polygon.is_valid:
+        polygon = make_valid(polygon)
+        issues.append("Invalid polygon repaired.")
+    if polygon.geom_type in ("MultiPolygon", "GeometryCollection"):
+        parts = [part for part in polygon.geoms if part.geom_type == "Polygon"]
+        if parts:
+            polygon = max(parts, key=lambda part: part.area)
+            issues.append("Only the largest polygon was retained.")
+    if polygon.geom_type != "Polygon" or polygon.is_empty or polygon.area < 0.5:
+        return None, [*issues, "No polygon with at least 0.5 m² remains."]
+    if footprint.height < 1:
+        issues.append("Building extrusion raised to the 1 m minimum.")
+    return polygon, issues
+
+
+def _object_mesh(obj: BuildingFootprint) -> tuple[trimesh.Trimesh | None, list[str]]:
+    if obj.kind == "mesh":
+        if obj.mesh is None:
+            return None, ["Mesh contains no triangles."]
+        vertices = np.asarray(obj.mesh.vertices).reshape(-1, 3).copy()
+        vertices[:, 2] += obj.baseZ
+        faces = np.asarray(obj.mesh.triangles).reshape(-1, 3)
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        valid = mesh.nondegenerate_faces()
+        if not valid.any():
+            return None, ["Mesh contains no nondegenerate triangles."]
+        if not valid.all():
+            mesh.update_faces(valid)
+            mesh.remove_unreferenced_vertices()
+            return mesh, [f"Removed {len(valid) - int(valid.sum())} degenerate triangles."]
+        return mesh, []
+    if obj.kind == "wall":
+        if len(obj.enuPoints) != 2 or obj.height <= 0:
+            return None, ["Wall needs two endpoints and a positive height."]
+        a, b = obj.enuPoints
+        if np.hypot(a.x - b.x, a.y - b.y) < 0.01:
+            return None, ["Wall endpoints are less than 1 cm apart."]
+        bottom, top = obj.baseZ, obj.baseZ + obj.height
+        return trimesh.Trimesh(
+            vertices=[[a.x, a.y, bottom], [b.x, b.y, bottom], [b.x, b.y, top], [a.x, a.y, top]],
+            faces=[[0, 1, 2], [0, 2, 3]], process=False,
+        ), []
+    polygon, issues = building_polygon(obj)
+    if polygon is None:
+        return None, issues
     try:
-        poly = Polygon(pts)
-        if not poly.is_valid:
-            poly = make_valid(poly)
-        if poly.geom_type == "MultiPolygon":
-            poly = max(poly.geoms, key=lambda g: g.area)
-        if poly.geom_type != "Polygon" or poly.is_empty or poly.area < 0.5:
-            return None
-        mesh = trimesh.creation.extrude_polygon(poly, max(float(footprint.height), 1.0))
-        return mesh if len(mesh.faces) else None
+        mesh = trimesh.creation.extrude_polygon(polygon, max(obj.height, 1.0))
+        mesh.apply_translation([0, 0, obj.baseZ])
+        return mesh, issues
     except Exception as exc:
-        # Loud on purpose: a silent failure here drops the building from the RT
-        # scene, so rays pass through it (no occlusion). Most common cause is a
-        # missing trimesh triangulation engine (see requirements: mapbox_earcut).
-        import sys
-        print(f"[scene_build] WARNING: failed to extrude building "
-              f"{footprint.id!r}: {exc}", file=sys.stderr)
-        return None
+        return None, [*issues, f"Polygon triangulation failed: {exc}"]
 
 
-def _ground_plane(buildings: list[BuildingFootprint]) -> trimesh.Trimesh:
-    xs, ys = [0.0], [0.0]
-    for b in buildings:
-        for p in b.enuPoints:
-            xs.append(p.x)
-            ys.append(p.y)
-    minx, maxx = min(xs) - GROUND_MARGIN_M, max(xs) + GROUND_MARGIN_M
-    miny, maxy = min(ys) - GROUND_MARGIN_M, max(ys) + GROUND_MARGIN_M
-    vertices = np.array(
-        [[minx, miny, 0.0], [maxx, miny, 0.0], [maxx, maxy, 0.0], [minx, maxy, 0.0]],
-        dtype=np.float64,
+def _ground_plane(meshes: list[trimesh.Trimesh]) -> trimesh.Trimesh:
+    bounds = np.asarray([[[0, 0, 0], [0, 0, 0]], *(mesh.bounds for mesh in meshes)])
+    minx, miny = bounds[:, 0, :2].min(axis=0) - GROUND_MARGIN_M
+    maxx, maxy = bounds[:, 1, :2].max(axis=0) + GROUND_MARGIN_M
+    return trimesh.Trimesh(
+        vertices=[[minx, miny, 0], [maxx, miny, 0], [maxx, maxy, 0], [minx, maxy, 0]],
+        faces=[[0, 1, 2], [0, 2, 3]], process=False,
     )
-    faces = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
-    return trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
 
 
-def _geometry_hash(
-    buildings: list[BuildingFootprint],
-    freq_ghz: float,
-    materials: list[MaterialConfig] | None = None,
-) -> str:
-    payload = [
-        {
-            "p": [(round(p.x, 3), round(p.y, 3)) for p in b.enuPoints],
-            "h": round(b.height, 3),
-            "m": b.material,
-            "c": b.category,
+@dataclass
+class CompiledScene:
+    geometry_id: str
+    scene_id: str
+    meshes: list[tuple[str, str, trimesh.Trimesh]]
+    reports: dict[str, dict]
+
+    def inspect(self, buildings: list[BuildingFootprint], *, include_meshes: bool = True) -> dict:
+        result = {
+            "sceneId": self.scene_id,
+            "geometryId": self.geometry_id,
+            "coordinateFrame": "ENU_m",
+            "objects": [
+                {"id": obj.id, "name": obj.name, "source": obj.source,
+                 "heightSource": obj.heightSource, "materialSource": obj.materialSource,
+                 "rawTags": obj.rawTags, **self.reports.get(obj.id, {"status": "visual", "issues": []}),
+                 "issues": [*obj.importIssues, *self.reports.get(obj.id, {}).get("issues", [])]}
+                for obj in buildings
+            ],
         }
-        for b in buildings
-    ]
-    # Material/scattering overrides change the EM response, so they must key the
-    # cache — otherwise an edit would silently reuse a stale scene build.
-    mat_payload = sorted(
-        [
-            cfg.id,
-            round(cfg.scatteringCoefficient, 4),
-            round(cfg.xpdCoefficient, 4),
-            cfg.scatteringPattern,
-            cfg.relativePermittivity,
-            cfg.conductivity,
-            cfg.thickness,
-        ]
-        for cfg in (materials or [])
+        if include_meshes:
+            result["meshes"] = [
+                {"id": ident, "material": material,
+                 # PLY stores float32 vertices. The preview uses those same values.
+                 "vertices": mesh.vertices.astype("<f4").reshape(-1).tolist(),
+                 "triangles": mesh.faces.reshape(-1).tolist()}
+                for ident, material, mesh in self.meshes
+            ]
+        return result
+
+
+@lru_cache(maxsize=_CACHE_MAX)
+def _compile(objects_json: str, freq_ghz: float, materials_json: str) -> CompiledScene:
+    from sionna.rt.radio_materials.itu import ITU_MATERIALS_PROPERTIES
+
+    meshes = []
+    reports = {}
+    for raw in json.loads(objects_json):
+        obj = BuildingFootprint.model_validate(raw)
+        mesh, issues = _object_mesh(obj)
+        material = _resolve_material(obj.material)
+        if obj.material not in MATERIAL_MAP and obj.material.strip().lower() not in OSM_MATERIAL_ALIASES:
+            issues.append(f"Unknown radio material {obj.material!r}; using concrete.")
+        if not any(low <= freq_ghz <= high for low, high in ITU_MATERIALS_PROPERTIES[_itu_value(material)]):
+            issues.append(f"{material} is undefined at {freq_ghz:g} GHz; using concrete.")
+            material = GROUND_MATERIAL
+        if mesh is not None:
+            meshes.append((obj.id, material, mesh))
+        reports[obj.id] = {"status": "physical" if mesh is not None else "skipped",
+                           "material": material if mesh is not None else None, "issues": issues}
+
+    ground = _ground_plane([mesh for _, _, mesh in meshes])
+    meshes.insert(0, ("", GROUND_BSDF_ID, ground))
+    geometry = hashlib.sha256()
+    physics = hashlib.sha256()
+    for _, material, mesh in meshes:
+        vertices = mesh.vertices.astype("<f4")
+        faces = mesh.faces.astype("<u4")
+        geometry.update(np.asarray([len(vertices), len(faces)], dtype="<u4").tobytes())
+        geometry.update(vertices.tobytes())
+        geometry.update(faces.tobytes())
+        physics.update(material.encode() + b"\0")
+    geometry_id = geometry.hexdigest()
+    physics.update(geometry_id.encode())
+    applied = {material for _, material, _ in meshes} | {GROUND_MATERIAL}
+    configs = {cfg["id"]: cfg for cfg in json.loads(materials_json) if cfg["id"] in applied}
+    physics.update(json.dumps(configs, sort_keys=True).encode())
+    return CompiledScene(geometry_id, physics.hexdigest(), meshes, reports)
+
+
+def compile_scene(
+    buildings: list[BuildingFootprint], freq_ghz: float, materials: list[MaterialConfig] | None = None,
+) -> CompiledScene:
+    fields = {"id", "height", "baseZ", "enuPoints", "category", "kind", "material", "mesh"}
+    return _compile(
+        json.dumps([obj.model_dump(include=fields) for obj in buildings if obj.category == "building"]),
+        freq_ghz, json.dumps([cfg.model_dump() for cfg in materials or []]),
     )
-    blob = json.dumps([round(freq_ghz, 6), payload, mat_payload], sort_keys=True).encode()
-    return hashlib.sha1(blob).hexdigest()[:16]
+
+
+def inspect_scene(buildings, freq_ghz, materials, *, include_meshes=True) -> dict:
+    return compile_scene(buildings, freq_ghz, materials).inspect(buildings, include_meshes=include_meshes)
 
 
 def _scattering_pattern(name: str):
@@ -200,7 +274,7 @@ def _apply_materials(scene, materials: list[MaterialConfig]) -> None:
     if not materials:
         return
     rms = scene.radio_materials
-    for cfg in materials:
+    for cfg in {config.id: config for config in materials}.values():
         target_ids = [cfg.id]
         if cfg.id == GROUND_MATERIAL:
             target_ids.append(GROUND_BSDF_ID)
@@ -272,7 +346,7 @@ class _BuiltScene:
         return Path(self._tmpdir.name)
 
 
-_scene_cache: "OrderedDict[str, _BuiltScene]" = OrderedDict()
+_scene_cache: "OrderedDict[tuple[str, float], _BuiltScene]" = OrderedDict()
 
 
 def _build(
@@ -283,7 +357,8 @@ def _build(
     """Return the cached scene holder, building (and caching) it if needed."""
     from sionna.rt import PlanarArray, load_scene
 
-    key = _geometry_hash(buildings, freq_ghz, material_configs)
+    compiled = compile_scene(buildings, freq_ghz, material_configs)
+    key = (compiled.scene_id, freq_ghz)
     cached = _scene_cache.get(key)
     if cached is not None:
         _scene_cache.move_to_end(key)
@@ -297,22 +372,12 @@ def _build(
     mesh_refs: list[tuple[str, str, str]] = []
     materials: set[str] = set()
 
-    # Ground first so reflections off it are available.
-    ground = _ground_plane(buildings)
-    ground.export(mesh_dir / "ground.ply", file_type="ply")
-    mesh_refs.append(("meshes/ground.ply", GROUND_BSDF_ID, "mesh-ground"))
-
-    for i, b in enumerate(buildings):
-        if b.category != "building":
-            continue  # roads/parks/water are visual-only, like the TS solver
-        prism = _building_prism(b)
-        if prism is None:
-            continue
-        name = f"meshes/b{i}.ply"
-        prism.export(mesh_dir / f"b{i}.ply", file_type="ply")
-        material_id = _resolve_material(b.material)
-        materials.add(material_id)
-        mesh_refs.append((name, material_id, f"mesh-b{i}"))
+    for index, (_, material, mesh) in enumerate(compiled.meshes):
+        name = "ground" if index == 0 else f"b{index - 1}"
+        mesh.export(mesh_dir / f"{name}.ply", file_type="ply")
+        if index:
+            materials.add(material)
+        mesh_refs.append((f"meshes/{name}.ply", material, f"mesh-{name}"))
 
     xml_path = _write_scene_xml(scene_dir, mesh_refs, materials)
 

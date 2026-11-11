@@ -21,14 +21,17 @@ because the Sionna/Mitsuba runtime is not re-entrant.
 from __future__ import annotations
 
 import io
-import importlib.metadata
+from contextlib import contextmanager
+from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import platform
 from tempfile import TemporaryDirectory
 import threading
 import time
 import traceback
+from typing import Literal
 import zipfile
 
 # Homebrew LLVM is keg-only. Configure Dr.Jit before importing Mitsuba so
@@ -46,7 +49,10 @@ _GPU_VARIANTS = ("cuda_ad_mono_polarized", "metal_ad_mono_polarized")
 _CPU_VARIANT = "llvm_ad_mono_polarized"
 
 _failures: list[str] = []
-for _candidate in (*_GPU_VARIANTS, _CPU_VARIANT):
+_requested_variant = os.environ.get("SRTS_MITSUBA_VARIANT")
+if _requested_variant and _requested_variant not in (*_GPU_VARIANTS, _CPU_VARIANT):
+    raise ValueError(f"Unsupported SRTS_MITSUBA_VARIANT: {_requested_variant}")
+for _candidate in ([_requested_variant] if _requested_variant else (*_GPU_VARIANTS, _CPU_VARIANT)):
     if _candidate not in mi.variants():
         _failures.append(f"{_candidate}: not compiled into this Mitsuba build")
         continue
@@ -85,10 +91,11 @@ else:
 
 print(f"[startup] Ray tracing via {mi.variant()!r}.")
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from .csi_runs import CsiExportRequest, CsiRun, CsiRunRequest, solve_csi_run
 from .linklevel import compute_link_kpis
@@ -106,10 +113,15 @@ from .models import (
     RadioMapGrid,
     RadioMapRequest,
     SceneExportRequest,
+    SceneInspectionRequest,
     SolveRequest,
     SolveResponse,
 )
+from .scene_build import inspect_scene
 from .scene_export import scene_export_zip
+from .scene_import import MAX_UPLOAD, import_meshes
+from .solver_runtime import package_version, solver_runtime
+from .version import APP_VERSION
 from .solver import (
     _notebook_tau_shape,
     solve_channel_grid,
@@ -119,7 +131,7 @@ from .solver import (
     solve_radiomap,
 )
 
-app = FastAPI(title="SionnaRTStudio Backend", version="1.0.0")
+app = FastAPI(title="SionnaRTStudio Backend", version=APP_VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -130,6 +142,29 @@ app.add_middleware(
 
 # Sionna/Mitsuba is single-threaded; serialize solves.
 _solve_lock = threading.Lock()
+_last_solve: dict | None = None
+_active_solve: dict | None = None
+
+
+@contextmanager
+def _solve_operation(operation: str):
+    global _last_solve, _active_solve
+    with _solve_lock:
+        started = time.perf_counter()
+        _active_solve = {"operation": operation, "status": "running",
+                         "startedAt": datetime.now(timezone.utc).isoformat()}
+        status, error = "succeeded", None
+        try:
+            yield
+        except Exception as exc:
+            status, error = "failed", str(exc)
+            raise
+        finally:
+            _last_solve = {**_active_solve, "status": status, "error": error,
+                           "finishedAt": datetime.now(timezone.utc).isoformat(),
+                           "durationMs": (time.perf_counter() - started) * 1000}
+            _active_solve = None
+
 
 
 def _solve_error(exc: Exception, label: str) -> HTTPException:
@@ -146,35 +181,47 @@ def _solve_error(exc: Exception, label: str) -> HTTPException:
 
 @app.get("/api/health")
 def health() -> dict:
-    variant = mi.variant() or "unset"
-    def version(distribution: str) -> str:
-        try:
-            return importlib.metadata.version(distribution)
-        except importlib.metadata.PackageNotFoundError:
-            return "unknown"
-
     return {
         "ok": True,
         "app": "SionnaRTStudio",
-        "appVersion": "1.0.0",
-        "engine": "Sionna RT",
+        "appVersion": app.version,
+        "desktop": getattr(app.state, "desktop", False),
         "solver": "real ray tracing",
-        "variant": variant,
-        "gpu": variant in _GPU_VARIANTS,
-        "pythonVersion": platform.python_version(),
-        "sionnaRtVersion": version("sionna-rt"),
-        "mitsubaVersion": version("mitsuba"),
-        "drjitVersion": version("drjit"),
-        # Optional Sionna PHY package (full NR PUSCH BER/BLER chain).
+        **solver_runtime(),
+        "gpu": mi.variant() in _GPU_VARIANTS,
+        "fallbackReasons": _failures,
+        "activeSolve": _active_solve,
+        "lastSolve": _last_solve,
         "phy": phy_available(),
-        "sionnaPhyVersion": version("sionna") if phy_available() else None,
+        "sionnaPhyVersion": package_version("sionna") if phy_available() else None,
     }
+
+
+@app.post("/api/scene-inspection")
+def api_scene_inspection(req: SceneInspectionRequest) -> dict:
+    return inspect_scene(req.buildings, req.freqGhz, req.materials)
+
+
+@app.post("/api/mesh-import")
+async def api_mesh_import(request: Request, filename: str = Query(max_length=255),
+                          axes: Literal["enu", "y-up"] = "enu",
+                          scale: float = Query(default=1.0, ge=0.000001, le=1_000_000),
+                          material: str = "itu_concrete") -> dict:
+    payload = bytearray()
+    async for chunk in request.stream():
+        if len(payload) + len(chunk) > MAX_UPLOAD:
+            raise HTTPException(status_code=413, detail="Mesh upload exceeds 32 MiB.")
+        payload.extend(chunk)
+    try:
+        return await run_in_threadpool(import_meshes, bytes(payload), filename, axes, scale, material)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/solve", response_model=SolveResponse)
 def api_solve(req: SolveRequest) -> SolveResponse:
     try:
-        with _solve_lock:
+        with _solve_operation("link"):
             paths, metrics = solve_link(req)
         return SolveResponse(paths=paths, metrics=metrics)
     except Exception as exc:  # surface a clean error to the UI
@@ -184,7 +231,7 @@ def api_solve(req: SolveRequest) -> SolveResponse:
 @app.post("/api/radiomap", response_model=RadioMapGrid)
 def api_radiomap(req: RadioMapRequest) -> RadioMapGrid:
     try:
-        with _solve_lock:
+        with _solve_operation("coverage"):
             return solve_radiomap(req)
     except Exception as exc:
         raise _solve_error(exc, "Radio map failed") from exc
@@ -193,7 +240,7 @@ def api_radiomap(req: RadioMapRequest) -> RadioMapGrid:
 @app.post("/api/mobility", response_model=MobilityResponse)
 def api_mobility(req: MobilityRequest) -> MobilityResponse:
     try:
-        with _solve_lock:
+        with _solve_operation("mobility"):
             started = time.perf_counter()
             steps, execution, handover = solve_mobility(req)
             execution["solveTimeMs"] = (time.perf_counter() - started) * 1000.0
@@ -220,7 +267,7 @@ def _get_csi_run(run_id: str) -> CsiRun:
 @app.post("/api/csi-runs")
 def api_csi_run(req: CsiRunRequest) -> dict:
     try:
-        with _solve_lock:
+        with _solve_operation("csi"):
             run = solve_csi_run(req)
             with _csi_runs_lock:
                 _csi_runs[run.summary["runId"]] = run
@@ -270,7 +317,7 @@ def _phy_job_worker(job_id: str, req: PhyBerRequest) -> None:
 
     try:
         set_progress(0.0, "Ray tracing the link (GPU)")
-        with _solve_lock:  # RT solve only; the CPU sweep runs unlocked
+        with _solve_operation("phy-channel"):  # RT solve only; the CPU sweep runs unlocked
             cir = solve_cir(req)
         snr_points: list[float] = []
         snr = req.snrMinDb
@@ -326,7 +373,7 @@ def api_linkkpi(req: LinkKpiRequest) -> LinkKpiResponse:
     """Shannon-capacity KPIs for one link from its ray-traced CFR (Tier 1 —
     pure NumPy on the solve_cir output, no PHY package)."""
     try:
-        with _solve_lock:
+        with _solve_operation("link-kpi"):
             data = solve_cir(req)
         # KPI reduction is plain NumPy — no GPU/Mitsuba, so run outside the lock.
         kpis = compute_link_kpis(
@@ -359,6 +406,7 @@ def _cir_npz_metadata(d: dict) -> dict:
         "tx_positions": d["tx_positions"],         # ENU [m], effective height
         "rx_positions": d["rx_positions"],
         "synthetic_array": np.asarray(True),
+        "manifest_json": np.asarray(json.dumps(d.get("manifest", {}), ensure_ascii=False)),
     }
 
 
@@ -411,6 +459,8 @@ def _cir_bundle_zip(req: CIRRequest) -> bytes:
         "carrierFrequencyGhz": req.freqGhz,
         "maxDepth": req.maxDepth,
         "normalizeDelays": req.normalizeDelays,
+        "solverRuntime": solver_runtime(),
+        "scene": inspect_scene(req.buildings, req.freqGhz, req.materials, include_meshes=False),
         "solverOptions": req.options.model_dump(),
         "materials": [material.model_dump() for material in req.materials],
         "tensorLayout": {
@@ -553,7 +603,7 @@ def _channel_grid_npz(d: dict) -> bytes:
 def api_channel_grid(req: ChannelGridRequest) -> Response:
     """Per-cell ray-traced CFR export with physical Tx and Rx array axes."""
     try:
-        with _solve_lock:
+        with _solve_operation("channel-grid"):
             data = solve_channel_grid(req)
     except Exception as exc:
         raise _solve_error(exc, "Channel-grid export failed") from exc
@@ -569,7 +619,7 @@ def api_cir(req: CIRRequest) -> Response:
     """Export native Sionna CIR/CFR tensors for one link or the whole scene."""
     try:
         req.validate_format_scope()
-        with _solve_lock:
+        with _solve_operation("cir"):
             data = solve_cir(req)
     except Exception as exc:
         raise _solve_error(exc, "CIR/CFR export failed") from exc
@@ -605,7 +655,7 @@ def api_cir_bundle(req: CIRRequest) -> Response:
     try:
         # Hold the lock for the complete bundle so another request cannot
         # interleave with this deterministic sequence of Sionna solves.
-        with _solve_lock:
+        with _solve_operation("cir-bundle"):
             content = _cir_bundle_zip(req)
     except Exception as exc:
         raise _solve_error(exc, "CIR bundle export failed") from exc

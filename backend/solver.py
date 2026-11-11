@@ -27,7 +27,8 @@ from .models import (
     SolverOptions,
     Transmitter,
 )
-from .scene_build import build_scene
+from .scene_build import building_polygon, build_scene, inspect_scene
+from .solver_runtime import solver_runtime
 
 # Sionna InteractionType codes (sionna.rt.constants.InteractionType).
 _INTERACTION_NAMES = {1: "specular", 2: "diffuse", 4: "refraction", 8: "diffraction"}
@@ -207,20 +208,20 @@ def _trace_paths(scene, max_depth: int, opts: SolverOptions | None):
                         synthetic_array=True)
 
 
-def _device_z(enu: ENUVector, height: float, buildings: list[BuildingFootprint]) -> float:
-    """Antenna height; if the device sits over a building footprint, it's on the roof."""
-    from shapely.geometry import Point, Polygon
+def _device_z(enu: ENUVector, height: float, buildings: list[BuildingFootprint], reference: str = "roof") -> float:
+    """Resolve absolute ENU height or the legacy height above ground/roof."""
+    if reference == "enu":
+        return float(height)
+    from shapely.geometry import Point
 
     pt = Point(enu.x, enu.y)
     roof = 0.0
     for b in buildings:
-        if b.category != "building" or len(b.enuPoints) < 3:
+        if b.category != "building" or b.kind != "building":
             continue
-        try:
-            if Polygon([(p.x, p.y) for p in b.enuPoints]).contains(pt):
-                roof = max(roof, float(b.height))
-        except Exception:
-            continue
+        polygon, _ = building_polygon(b)
+        if polygon is not None and polygon.contains(pt):
+            roof = max(roof, b.baseZ + max(b.height, 1.0))
     return roof + float(height)
 
 
@@ -531,9 +532,9 @@ def _solve_batched(
 def solve_link(req: SolveRequest) -> tuple[list[PropagationPath], ChannelMetrics]:
     scene = build_scene(req.buildings, req.freqGhz, req.materials)
     tx_pos = [float(req.tx.enu.x), float(req.tx.enu.y),
-              _device_z(req.tx.enu, req.tx.height, req.buildings)]
+              _device_z(req.tx.enu, req.tx.height, req.buildings, req.tx.heightReference)]
     rx_pos = [float(req.rx.enu.x), float(req.rx.enu.y),
-              _device_z(req.rx.enu, req.rx.height, req.buildings)]
+              _device_z(req.rx.enu, req.rx.height, req.buildings, req.rx.heightReference)]
     n_tx_ant = _set_tx_array(scene, req.tx.antennaArraySize, req.options)
     _set_rx_array(scene, req.rx.antennaArraySize, req.options)
     beam = _beam_target(tx_pos, req.tx.beamsteeringAzimuth, req.tx.beamsteeringElevation)
@@ -615,12 +616,12 @@ def solve_cir(req) -> dict:
     scene = build_scene(req.buildings, req.freqGhz, getattr(req, "materials", None))
     tx_positions = np.asarray([
         [float(tx.enu.x), float(tx.enu.y),
-         _device_z(tx.enu, tx.height, req.buildings)]
+         _device_z(tx.enu, tx.height, req.buildings, tx.heightReference)]
         for tx in txs
     ], dtype=float)
     rx_positions = np.asarray([
         [float(rx.enu.x), float(rx.enu.y),
-         _device_z(rx.enu, rx.height, req.buildings)]
+         _device_z(rx.enu, rx.height, req.buildings, rx.heightReference)]
         for rx in rxs
     ], dtype=float)
     n_tx_ant = _set_tx_array(scene, tx_size, req.options)
@@ -661,6 +662,11 @@ def solve_cir(req) -> dict:
     a_array = np.asarray(a)
 
     return {
+        "manifest": {
+            "solverRuntime": solver_runtime(),
+            "scene": inspect_scene(req.buildings, req.freqGhz, req.materials, include_meshes=False),
+            "settings": req.model_dump(mode="json", exclude={"buildings"}),
+        },
         "a": a_array,                              # complex CIR coefficients
         "tau": np.asarray(tau, dtype=float),        # delays [s]
         "h": h_array,                              # complex CFR (None for raw CIR)
@@ -721,7 +727,7 @@ def solve_channel_grid(req) -> dict:
     rx_size = req.rx.antennaArraySize if req.rx is not None else (1, 1)
     n_rx_ant = _set_rx_array(scene, rx_size, req.options)
     tx_pos = [float(req.tx.enu.x), float(req.tx.enu.y),
-              _device_z(req.tx.enu, req.tx.height, req.buildings)]
+              _device_z(req.tx.enu, req.tx.height, req.buildings, req.tx.heightReference)]
     beam = _beam_target(tx_pos, req.tx.beamsteeringAzimuth, req.tx.beamsteeringElevation)
 
     num_sc = max(1, int(req.numSubcarriers))
@@ -918,7 +924,7 @@ def _mobility_step(
 def _resolve_tx_specs(txs: list[Transmitter], buildings: list[BuildingFootprint]) -> list[_TxSpec]:
     specs = []
     for tx in txs:
-        pos = [float(tx.enu.x), float(tx.enu.y), _device_z(tx.enu, tx.height, buildings)]
+        pos = [float(tx.enu.x), float(tx.enu.y), _device_z(tx.enu, tx.height, buildings, tx.heightReference)]
         beam = _beam_target(pos, tx.beamsteeringAzimuth, tx.beamsteeringElevation)
         specs.append(_TxSpec(pos=pos, beam=beam, power_dbm=float(tx.powerDbm),
                              id=tx.id, name=tx.name))
@@ -927,21 +933,25 @@ def _resolve_tx_specs(txs: list[Transmitter], buildings: list[BuildingFootprint]
 
 def _mobility_kinematics(
     waypoints: list[ENUVector], rx_height: float, buildings: list[BuildingFootprint], speed_ms: float,
+    reference: str = "roof",
 ) -> tuple[list[list[float]], list[list[float]]]:
     """Resolve antenna position and horizontal velocity for each trajectory sample."""
     positions: list[list[float]] = []
     velocities: list[list[float]] = []
     for i, wp in enumerate(waypoints):
-        positions.append([float(wp.x), float(wp.y), _device_z(wp, rx_height, buildings)])
+        z = _device_z(wp, rx_height, buildings, reference)
+        if reference == "enu":
+            z += wp.z  # waypoint offset relative to the selected UE's absolute altitude
+        positions.append([float(wp.x), float(wp.y), z])
         neighbor = waypoints[i + 1] if i + 1 < len(waypoints) else waypoints[i - 1] if i else None
         velocity = [0.0, 0.0, 0.0]
         if neighbor is not None:
             dx, dy = float(neighbor.x) - float(wp.x), float(neighbor.y) - float(wp.y)
-            norm = math.hypot(dx, dy)
-            if i + 1 == len(waypoints):
-                dx, dy = -dx, -dy  # keep heading direction on the last point
+            dz = float(neighbor.z - wp.z) if reference == "enu" else 0.0
+            norm = math.hypot(dx, dy, dz)
             if norm > 1e-6:
-                velocity = [dx / norm * speed_ms, dy / norm * speed_ms, 0.0]
+                direction = -1.0 if i + 1 == len(waypoints) else 1.0
+                velocity = [component / norm * speed_ms * direction for component in (dx, dy, dz)]
         velocities.append(velocity)
     return positions, velocities
 
@@ -979,7 +989,7 @@ def solve_mobility(req) -> tuple[list, dict, "HandoverAnalysis | None"]:
     tx_specs = _resolve_tx_specs(txs, req.buildings)
     speed_ms = float(req.speedKmh) / 3.6
     wps = req.waypoints
-    rx_positions, velocities = _mobility_kinematics(wps, req.rx.height, req.buildings, speed_ms)
+    rx_positions, velocities = _mobility_kinematics(wps, req.rx.height, req.buildings, speed_ms, req.rx.heightReference)
 
     # Fast path: one GPU dispatch for all (waypoint, Tx) pairs. Defensive fallback
     # to per-(waypoint, Tx) solves if the batched extraction misbehaves.
@@ -1229,7 +1239,7 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
     _clear_devices(scene)
     tx_positions: list[list[float]] = []
     for i, t in enumerate(txs):
-        tz = _device_z(t.enu, t.height, req.buildings)
+        tz = _device_z(t.enu, t.height, req.buildings, t.heightReference)
         pos = [float(t.enu.x), float(t.enu.y), tz]
         tx_positions.append(pos)
         beam = _beam_target(pos, t.beamsteeringAzimuth, t.beamsteeringElevation)

@@ -134,9 +134,11 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
         webView.isHidden = true
         startup.isHidden = false
         startupLabel.stringValue = text("Starting Sionna RT…", "正在启动 Sionna RT…")
+        let bundledPython = (bundle.object(forInfoDictionaryKey: "StudioBundledPython") as? String)
+            .flatMap { bundle.resourceURL?.appendingPathComponent($0).path }
         guard let resources = bundle.resourceURL,
               let python = ProcessInfo.processInfo.environment["SRTS_PYTHON"]
-                  ?? bundle.object(forInfoDictionaryKey: "StudioPythonPath") as? String,
+                  ?? bundledPython ?? bundle.object(forInfoDictionaryKey: "StudioPythonPath") as? String,
               fileManager.isExecutableFile(atPath: python) else {
             startupFailed(text("The Studio Python environment is missing. Rebuild this app from the workspace.",
                                "找不到 Studio 的 Python 环境，请在工作区重新构建应用。"))
@@ -156,6 +158,9 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
         process.arguments = [resources.appendingPathComponent("studio_server.py").path, String(origin.port!)]
         process.currentDirectoryURL = resources
         var environment = ProcessInfo.processInfo.environment
+        environment.removeValue(forKey: "PYTHONHOME")
+        environment.removeValue(forKey: "PYTHONPATH")
+        environment["PYTHONNOUSERSITE"] = "1"
         environment["SRTS_DESKTOP_LAUNCH_TOKEN"] = token
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment["PYTHONUNBUFFERED"] = "1"
@@ -365,7 +370,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
                 } else {
                     let project = try JSONSerialization.jsonObject(with: data) as? [String: Any]
                     result["projectExport"] = project?["format"] as? String == "SionnaRTStudio Project" &&
-                        project?["schemaVersion"] as? Int == 2
+                        project?["schemaVersion"] as? Int == 3
                 }
                 smokeResult = result
                 if let projectExport = result["projectExport"] as? Bool, let csiExport = result["csiExport"] as? Bool {
@@ -465,7 +470,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, WKNavigationDelegate, WK
             legacyInput.files = transfer.files;
             legacyInput.dispatchEvent(new Event('change', {bubbles: true}));
             await waitFor(() => navFor('planning').getAttribute('aria-current') === 'page' &&
-              project()?.schemaVersion === 2 &&
+              project()?.schemaVersion === 3 &&
               project().state.devices.transmitters[0].beamsteeringAzimuth === 37 &&
               project().state.devices.transmitters[0].beamsteeringElevation === -12 &&
               project().state.mobility.trajectoriesByRxId[oldRxId]?.length === 2 &&

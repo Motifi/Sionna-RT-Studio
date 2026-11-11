@@ -7,6 +7,9 @@ import React, { useState, useEffect, useRef } from 'react';
 import { GeoAnchor, Transmitter, Receiver, BuildingFootprint, PropagationPath, RadioMapGrid, ChannelMetrics, MatrixCell, SolverOptions, DEFAULT_SOLVER_OPTIONS, MaterialConfig, CoverageMetric, MobilityCombineMode, TrajectoryPoint, defaultMaterialConfig } from './types';
 import { ColormapName } from './lib/colormaps';
 import { antennaPortCount, FULL_CSI_SIZE_LIMIT, estimateCsiSize } from './lib/csiSize';
+import { MeshImportPanel } from './components/MeshImportPanel';
+import { SceneWorkbench } from './components/SceneWorkbench';
+import { physicalSceneInputs, useSceneEditor, withFootprint } from './sceneEditor';
 import { ThreeStudio } from './components/ThreeStudio';
 import { TopNav } from './components/TopNav';
 import { WorkflowNav } from './components/WorkflowNav';
@@ -27,8 +30,8 @@ import {
   enuToLatLon,
   fetchOSMBuildings,
 } from './utils';
-import { solveLink, solveRadioMap, checkBackend, createCsiRun, inspectCsiLink } from './api';
-import type { CsiRun, CsiRunMode, CsiRunOutput, CsiSelection, CsiLinkPreview, HandoverConfig } from './api';
+import { solveLink, solveRadioMap, readBackendHealth, inspectScene, createCsiRun, inspectCsiLink } from './api';
+import type { BackendHealth, SceneInspection, SolverMesh, CsiRun, CsiRunMode, CsiRunOutput, CsiSelection, CsiLinkPreview, HandoverConfig } from './api';
 import {
   clearAutosavedProject,
   loadAutosavedProject,
@@ -51,13 +54,14 @@ const EMPTY_METRICS: ChannelMetrics = {
 
 const EMPTY_TRACK: TrajectoryPoint[] = [];
 const EMPTY_PATHS: PropagationPath[] = [];
+const EMPTY_MESHES: SolverMesh[] = [];
 
-function sampleTrajectory(points: TrajectoryPoint[], intervalMs: number, speedKmh: number) {
+function sampleTrajectory(points: TrajectoryPoint[], intervalMs: number, speedKmh: number, absolute: boolean) {
   const arc = [0];
   for (let i = 1; i < points.length; i++) {
     const a = points[i - 1].enu;
     const b = points[i].enu;
-    arc.push(arc[i - 1] + Math.hypot(b.x - a.x, b.y - a.y));
+    arc.push(arc[i - 1] + Math.hypot(b.x - a.x, b.y - a.y, absolute ? b.z - a.z : 0));
   }
   const length = arc[arc.length - 1];
   const speed = speedKmh / 3.6;
@@ -336,15 +340,18 @@ export default function App() {
     () => AUTOSAVED_PROJECT?.solver.materialConfigs ?? {},
   );
   const materialIds = React.useMemo(
-    () => Array.from(new Set(buildings.filter((b) => b.category === 'building').map((b) => b.material))),
+    () => Array.from(new Set(['itu_concrete', ...buildings.filter(b => b.category === 'building').map(b => b.material)])).sort(),
     [buildings],
   );
+  const materialIdsKey = materialIds.join('\u001f');
   const materialList = React.useMemo<MaterialConfig[]>(
-    () => materialIds.map((id) => materialConfigs[id] ?? defaultMaterialConfig(id)),
-    [materialIds, materialConfigs],
+    () => materialIdsKey.split('\u001f').map(id => materialConfigs[id] ?? defaultMaterialConfig(id)),
+    [materialIdsKey, materialConfigs],
   );
-  const updateMaterial = (cfg: MaterialConfig) =>
-    setMaterialConfigs((prev) => ({ ...prev, [cfg.id]: cfg }));
+  const updateMaterial = (cfg: MaterialConfig) => {
+    editor.commit(buildings, anchor, () => setMaterialConfigs(materialConfigs));
+    setMaterialConfigs(prev => ({ ...prev, [cfg.id]: cfg }));
+  };
 
   // GIS Data Fetcher States
   const [gisLoading, setGisLoading] = useState(false);
@@ -365,21 +372,23 @@ export default function App() {
   const [solving, setSolving] = useState(false);
   const [solveIssue, setSolveError] = useState<LocalizedText | null>(null);
   const solveError = solveIssue ? t(...solveIssue) : '';
-  const [backendOnline, setBackendOnline] = useState(false);
-  const backendOnlineRef = useRef(backendOnline);
-  backendOnlineRef.current = backendOnline;
-
-  // Probe the backend on mount, then keep polling while it's offline so the
-  // solve buttons recover when the backend is started after the frontend.
+  const [health, setHealth] = useState<BackendHealth | null>(null);
+  const backendOnline = !!health;
   useEffect(() => {
     let cancelled = false;
-    const probe = () => checkBackend().then((ok) => { if (!cancelled) setBackendOnline(ok); });
-    probe();
-    const id = window.setInterval(() => {
-      if (!backendOnlineRef.current) probe();
-    }, 5000);
+    let busy = false;
+    const probe = async () => {
+      if (busy) return;
+      busy = true;
+      const result = await readBackendHealth();
+      if (!cancelled) setHealth(result);
+      busy = false;
+    };
+    void probe();
+    const id = window.setInterval(probe, 2000);
     return () => { cancelled = true; window.clearInterval(id); };
   }, []);
+  const geometryKey = React.useMemo(() => JSON.stringify(physicalSceneInputs(buildings)), [buildings]);
   // All-pairs link matrix (Tx × Rx), keyed `${txId}|${rxId}`.
   const [matrix, setMatrix] = useState<Record<string, MatrixCell>>({});
   const [matrixLoading, setMatrixLoading] = useState(false);
@@ -400,7 +409,7 @@ export default function App() {
     setMatrix({});
     setMatrixRaysVisible(false);
   }, [
-    buildings,
+    geometryKey,
     // Every device edit (position, power, antenna, beam — active or not) flows
     // through setTxs/setRxs, so the two arrays cover all device-driven staleness.
     // Mobility ray-traces every Tx and the radio map uses every Tx.
@@ -423,11 +432,9 @@ export default function App() {
       setPaths(res.paths);
       setMetrics(res.metrics);
       setMatrixRaysVisible(false); // focus the 3D scene on this single link
-      setBackendOnline(true);
     } catch (e: any) {
       const detail = e instanceof Error ? ` (${e.message})` : '';
       setSolveError([`Link solve failed${detail}`, `链路求解失败${detail}`]);
-      checkBackend().then(setBackendOnline); // a solve error != backend offline
     } finally {
       setSolving(false);
     }
@@ -459,11 +466,9 @@ export default function App() {
         setPaths(act.paths);
         setMetrics(act.metrics);
       }
-      setBackendOnline(true);
     } catch (e: any) {
       const detail = e instanceof Error ? ` (${e.message})` : '';
       setSolveError([`Link matrix solve failed${detail}`, `链路矩阵求解失败${detail}`]);
-      checkBackend().then(setBackendOnline);
     } finally {
       setMatrixLoading(false);
       setMatrixProgress('');
@@ -546,12 +551,43 @@ export default function App() {
     ])));
   };
 
+  const sceneEditRevision = useRef(buildings);
+  sceneEditRevision.current = buildings;
+  const editor = useSceneEditor(buildings, anchor, setBuildings, handleAnchorChange, AUTOSAVED_PROJECT?.scene.hiddenLayers);
+  const [osmMode, setOsmMode] = useState<'replace' | 'merge'>('replace');
+  const [inspection, setInspection] = useState<{ input: object; result: SceneInspection } | null>(null);
+  const [inspectionIssue, setInspectionIssue] = useState('');
+  const inspectionInput = React.useMemo(() => ({ buildings, freqGhz, materialList }), [buildings, freqGhz, materialList]);
+  const currentInspection = inspection?.input === inspectionInput ? inspection.result : null;
+  useEffect(() => {
+    if (!backendOnline || workspace !== 'scene') return;
+    let cancelled = false;
+    setInspectionIssue('');
+    const timer = window.setTimeout(() => {
+      inspectScene(inspectionInput.buildings, inspectionInput.freqGhz, inspectionInput.materialList).then(
+        result => { if (!cancelled) setInspection({ input: inspectionInput, result }); },
+        error => { if (!cancelled) setInspectionIssue(String(error)); },
+      );
+    }, 180);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [backendOnline, workspace, inspectionInput]);
+
+  const openBlankScene = () => {
+    gisRequest.current++;
+    setGisLoading(false);
+    setDownloadProgress(['', '']);
+    editor.commit([]);
+    editor.select(null);
+    editor.chooseTool('select');
+  };
+
   const useStarterScene = () => {
     gisRequest.current++;
     setGisLoading(false);
     setDownloadProgress(['', '']);
-    handleAnchorChange(INITIAL_ANCHOR);
-    setBuildings(PRELOADED_BUILDINGS);
+    editor.commit(PRELOADED_BUILDINGS.map(object => ({ ...object, source: 'template' })), INITIAL_ANCHOR);
+    editor.select(null);
+    editor.chooseTool('select');
   };
 
   // OVERPASS GIS DOWNLOAD PIPELINE
@@ -576,13 +612,27 @@ export default function App() {
       );
       if (request !== gisRequest.current) return;
 
+      if (sceneEditRevision.current !== buildings) {
+        setDownloadProgress(['Scene changed during download. Import again to apply the map.', '下载期间场景已修改。请重新导入地图。']);
+        return;
+      }
       if (loadedBuildings.length === 0) {
         setDownloadProgress(['No buildings found in this area. Keeping the current scene.', '所选区域未找到建筑，保留当前场景。']);
         return;
       }
 
-      handleAnchorChange(selectedAnchor);
-      setBuildings(loadedBuildings);
+      if (osmMode === 'merge') {
+        const known = new Set(buildings.map(object => object.id));
+        const added = loadedBuildings.filter(object => !known.has(object.id)).map(object =>
+          withFootprint(object, object.points.map(p => latLonToENU(p.lat, p.lon, anchor)), anchor),
+        );
+        editor.commit([...buildings, ...added]);
+        setDownloadProgress([`Merged ${added.length} new map features.`, `已合并 ${added.length} 个新地图要素。`]);
+        return;
+      }
+      editor.commit(loadedBuildings, selectedAnchor);
+      editor.select(null);
+      editor.chooseTool('select');
       setDownloadProgress([`Imported ${loadedBuildings.length} map features.`, `已导入 ${loadedBuildings.length} 个地图要素。`]);
     } catch (e: any) {
       if (request !== gisRequest.current) return;
@@ -613,7 +663,7 @@ export default function App() {
   const resettingRef = useRef(false);
 
   const projectState = React.useMemo<StudioProjectState>(() => ({
-    scene: { anchor, buildings },
+    scene: { coordinateFrame: 'ENU_m', anchor, buildings, hiddenLayers: editor.hiddenLayers },
     devices: {
       transmitters: txs,
       receivers: rxs,
@@ -655,7 +705,7 @@ export default function App() {
       radioMapVmax: rmVmax,
     },
   }), [
-    anchor, buildings, txs, rxs, activeTxId, activeRxId, fronthaulMbpsByTxId, csiSettings, freqGhz, maxDepth,
+    anchor, buildings, editor.hiddenLayers, txs, rxs, activeTxId, activeRxId, fronthaulMbpsByTxId, csiSettings, freqGhz, maxDepth,
     solverOptions, materialConfigs, coverageMetric, coverageBandwidthMhz,
     coverageNoiseFigureDb, coverageHeight, coverageRes, coverageSamplesPerTx,
     radioMapSeed, trajectoriesByRxId, mobilityCombineMode, handoverConfig,
@@ -715,6 +765,8 @@ export default function App() {
     setAnchor(imported.scene.anchor);
     setMapAnchor(imported.scene.anchor);
     setBuildings(imported.scene.buildings);
+    editor.reset();
+    editor.setHiddenLayers(imported.scene.hiddenLayers ?? []);
     setTxs(imported.devices.transmitters);
     setRxs(imported.devices.receivers);
     setActiveTxId(imported.devices.activeTxId);
@@ -771,10 +823,14 @@ export default function App() {
     normalizeDelays: csiSettings.normalizeDelays,
   }), [csiSettings]);
   const csiCommon = React.useMemo(() => ({
-    txs, buildings, freqGhz, maxDepth, options: solverOptions, materials: materialList,
+    txs, buildings, anchor, freqGhz, maxDepth, options: solverOptions, materials: materialList,
     systemBandwidthMhz: coverageBandwidthMhz, noiseFigureDb: coverageNoiseFigureDb, ...csiGrid,
-  }), [txs, buildings, freqGhz, maxDepth, solverOptions, materialList, coverageBandwidthMhz, coverageNoiseFigureDb, csiGrid]);
-  const sharedCsiKey = React.useMemo(() => JSON.stringify([anchor, csiCommon]), [anchor, csiCommon]);
+  }), [txs, buildings, anchor, freqGhz, maxDepth, solverOptions, materialList, coverageBandwidthMhz, coverageNoiseFigureDb, csiGrid]);
+  const sharedCsiKey = React.useMemo(() => JSON.stringify([
+    anchor, geometryKey, txs, freqGhz, maxDepth, solverOptions, materialList,
+    coverageBandwidthMhz, coverageNoiseFigureDb, csiGrid,
+  ]), [anchor, geometryKey, txs, freqGhz, maxDepth, solverOptions, materialList,
+    coverageBandwidthMhz, coverageNoiseFigureDb, csiGrid]);
   const keyForCsi = (mode: CsiRunMode, rxId: string) => mode === 'static'
     ? sharedCsiKey + JSON.stringify(rxs)
     : sharedCsiKey + JSON.stringify([
@@ -812,8 +868,8 @@ export default function App() {
     '统一 CSI 张量要求各 AP 阵列等尺寸。静态混合阵列可使用高级导出中的逐链路 CIR。',
   );
   const route = React.useMemo(
-    () => sampleTrajectory(trajectoryPoints, mobilityIntervalMs, mobilitySpeedKmh),
-    [trajectoryPoints, mobilityIntervalMs, mobilitySpeedKmh],
+    () => sampleTrajectory(trajectoryPoints, mobilityIntervalMs, mobilitySpeedKmh, rx.heightReference === 'enu'),
+    [trajectoryPoints, mobilityIntervalMs, mobilitySpeedKmh, rx.heightReference],
   );
   const txPorts = antennaPortCount(tx.antennaArraySize, solverOptions.txPolarization);
   const rxPorts = antennaPortCount(rx.antennaArraySize, solverOptions.rxPolarization);
@@ -897,13 +953,11 @@ export default function App() {
       );
       if (coverageInputs !== currentCoverageInputs.current) return;
       setRadioMap(grid);
-      setBackendOnline(true);
     } catch (err: any) {
       if (coverageInputs !== currentCoverageInputs.current) return;
       console.error(err);
       const detail = err instanceof Error ? ` (${err.message})` : '';
       setSolveError([`Coverage map failed${detail}`, `覆盖图求解失败${detail}`]);
-      checkBackend().then(setBackendOnline); // a solve error != backend offline
     } finally {
       setLoadingHeatmap(false);
     }
@@ -934,7 +988,7 @@ export default function App() {
 
   return (
     <div id="sionna-rt-studio-app-frame" className="min-h-screen md:h-screen md:overflow-hidden text-[var(--text-hi)] flex flex-col font-sans">
-      <TopNav backendOnline={backendOnline} />
+      <TopNav health={health} />
       <main className={`flex-1 md:min-h-0 grid grid-cols-1 gap-4 p-4 w-full ${workspace === 'export' ? '' : 'md:grid-cols-[minmax(290px,37%)_minmax(0,1fr)] lg:grid-cols-[400px_minmax(0,1fr)]'}`}>
         <aside hidden={workspace === 'export'} className="min-w-0 md:min-h-0 md:overflow-y-auto md:pr-1">
           <div className="flex flex-col gap-4">
@@ -947,7 +1001,25 @@ export default function App() {
                 <button id="btn-use-starter-scene" type="button" className="text-sm text-[var(--accent-deep)] cursor-pointer underline underline-offset-2" onClick={useStarterScene}>
                   {t('Use the built-in street scene', '使用内置街区')}
                 </button>
+                <button type="button" className="text-sm text-[var(--accent-deep)] cursor-pointer underline" onClick={openBlankScene}>
+                  {t('Start blank scene', '从空白场景开始')}
+                </button>
               </div>
+              <SceneWorkbench editor={editor} objects={buildings} anchor={anchor} inspection={currentInspection}
+                inspectionError={!backendOnline && editor.solverMesh ? t('Solver mesh unavailable while solver is offline.', '求解器离线，无法查看求解网格。') : inspectionIssue} />
+              <MeshImportPanel online={backendOnline} onImport={(objects, replace) => {
+                const imported = objects.map(object => withFootprint(object, object.enuPoints, anchor));
+                editor.commit(replace ? imported : [...buildings, ...imported]);
+                editor.select(imported[0].id);
+                editor.chooseTool('select');
+              }} />
+              <label className="panel p-3 flex items-center gap-2 text-xs">
+                {t('OSM import mode', 'OSM 导入方式')}
+                <select value={osmMode} onChange={event => setOsmMode(event.target.value === 'merge' ? 'merge' : 'replace')}>
+                  <option value="replace">{t('Replace scene', '替换场景')}</option>
+                  <option value="merge">{t('Merge new objects', '合并新对象')}</option>
+                </select>
+              </label>
               <MapSelector
                 anchor={mapAnchor} setAnchor={setMapAnchor}
                 tx={tx} rx={rx} txs={txs} rxs={rxs}
@@ -1079,6 +1151,8 @@ export default function App() {
 
         <section className={workspace === 'export' ? 'hidden' : 'min-w-0 min-h-[420px] md:min-h-0 flex flex-col'}>
           <ThreeStudio
+            sceneEditor={workspace === 'scene' ? editor : undefined}
+            physicalMeshes={workspace === 'scene' && editor.solverMesh ? currentInspection?.meshes ?? EMPTY_MESHES : undefined}
             buildings={buildings} anchor={anchor} tx={viewedTx} rx={viewedRx} txs={txs} rxs={rxs}
             activeTxId={viewedTx.id} activeRxId={viewedRx.id}
             paths={shownPaths} matrixPaths={previewing && !showingCsi ? matrixPaths : undefined}

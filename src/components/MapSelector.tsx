@@ -115,6 +115,7 @@ export function MapSelector({
       center: [anchor.latitude, anchor.longitude],
       zoom: 16,
       zoomControl: true,
+      zoomAnimation: false,
     });
 
     mapRef.current = map;
@@ -223,7 +224,7 @@ export function MapSelector({
     }
 
     // Frame the selection: fit the box (with padding) so resizing is visible.
-    mapRef.current.fitBounds(bounds, { padding: [24, 24], animate: true });
+    mapRef.current.fitBounds(bounds, { padding: [24, 24], animate: false });
   }, [anchor, boxSizeM]);
 
   // Handle marker position changes on external props updates (e.g., from 3D dragging)

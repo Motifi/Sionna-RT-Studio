@@ -8,8 +8,6 @@ import unittest
 import numpy as np
 
 from backend.models import CIRRequest, ENUVector, PropagationPath, Receiver, Transmitter
-from backend.scene_build import _geometry_hash
-from backend.models import BuildingFootprint, MaterialConfig
 from backend.solver import (
     _az_el,
     _beam_target,
@@ -280,26 +278,6 @@ class TestCoverageStats(unittest.TestCase):
         s = _coverage_stats(np.array([]), "sinr", 0.0)
         self.assertEqual(s.servedPercent, 0.0)
         self.assertEqual(s.unit, "dB")
-
-
-class TestGeometryHash(unittest.TestCase):
-    def _building(self, height: float = 10.0, material: str = "itu_concrete"):
-        return BuildingFootprint(
-            id="b1", category="building", height=height, material=material,
-            enuPoints=[ENUVector(x=0, y=0, z=0), ENUVector(x=10, y=0, z=0),
-                       ENUVector(x=10, y=10, z=0)],
-        )
-
-    def test_stable_for_identical_input(self):
-        self.assertEqual(_geometry_hash([self._building()], 28.0),
-                         _geometry_hash([self._building()], 28.0))
-
-    def test_changes_with_geometry_frequency_and_materials(self):
-        base = _geometry_hash([self._building()], 28.0)
-        self.assertNotEqual(base, _geometry_hash([self._building(height=12.0)], 28.0))
-        self.assertNotEqual(base, _geometry_hash([self._building()], 3.5))
-        override = [MaterialConfig(id="itu_concrete", scatteringCoefficient=0.4)]
-        self.assertNotEqual(base, _geometry_hash([self._building()], 28.0, override))
 
 
 if __name__ == "__main__":

@@ -482,32 +482,30 @@ export function SolverControls({
                 </span>
               </div>
 
-              <div className="flex flex-col gap-1">
-                <span className="text-[12px] text-slate-600 font-bold">{t('TX Tower Height', '发射天线高度')}: {txHeight} m</span>
-                <input
-                  type="range"
-                  id="slider-tx-height"
-                  min="1"
-                  max="40"
-                  step="0.5"
-                  className="accent-[#cc785c] cursor-ew-resize"
-                  value={txHeight}
-                  onChange={(e) => setTxHeight(parseFloat(e.target.value))}
-                />
+              <div className="flex flex-col gap-1 text-xs">
+                <label>{t('TX height reference', '发射端高度基准')}
+                  <select className="ml-2" value={tx.heightReference ?? 'roof'} onChange={event =>
+                    onTxUpdate({ ...tx, heightReference: event.target.value === 'enu' ? 'enu' : 'roof' })}>
+                    <option value="roof">{t('Above ground or roof', '地面或屋顶以上')}</option>
+                    <option value="enu">{t('Absolute ENU elevation', 'ENU 绝对标高')}</option>
+                  </select>
+                </label>
+                <label htmlFor="slider-tx-height">{t('TX antenna height (m)', '发射天线高度（米）')}</label>
+                <NumberField id="slider-tx-height" value={txHeight} onChange={setTxHeight} step="any"
+                  min={tx.heightReference === 'enu' ? undefined : 0} className="rounded border border-slate-200 px-2 py-1" />
               </div>
 
-              <div className="flex flex-col gap-1">
-                <span className="text-[12px] text-slate-600 font-bold">{t('RX Device Height', '接收设备高度')}: {rxHeight} m</span>
-                <input
-                  type="range"
-                  id="slider-rx-height"
-                  min="1"
-                  max="10"
-                  step="0.5"
-                  className="accent-[#cc785c] cursor-ew-resize"
-                  value={rxHeight}
-                  onChange={(e) => setRxHeight(parseFloat(e.target.value))}
-                />
+              <div className="flex flex-col gap-1 text-xs">
+                <label>{t('RX height reference', '接收端高度基准')}
+                  <select className="ml-2" value={rx.heightReference ?? 'roof'} onChange={event =>
+                    onRxUpdate({ ...rx, heightReference: event.target.value === 'enu' ? 'enu' : 'roof' })}>
+                    <option value="roof">{t('Above ground or roof', '地面或屋顶以上')}</option>
+                    <option value="enu">{t('Absolute ENU elevation', 'ENU 绝对标高')}</option>
+                  </select>
+                </label>
+                <label htmlFor="slider-rx-height">{t('RX device height (m)', '接收设备高度（米）')}</label>
+                <NumberField id="slider-rx-height" value={rxHeight} onChange={setRxHeight} step="any"
+                  min={rx.heightReference === 'enu' ? undefined : 0} className="rounded border border-slate-200 px-2 py-1" />
               </div>
             </div>
           </>

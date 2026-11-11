@@ -12,7 +12,7 @@ import {
   Transmitter,
 } from './types';
 
-export const PROJECT_SCHEMA_VERSION = 2;
+export const PROJECT_SCHEMA_VERSION = 3;
 // Keep the existing storage key so an upgrade can read and migrate the autosave.
 export const PROJECT_STORAGE_KEY = 'sionna-rt-studio.project.v1';
 
@@ -32,8 +32,10 @@ export const DEFAULT_CSI_SETTINGS: StudioCsiSettings = {
 
 export interface StudioProjectState {
   scene: {
+    coordinateFrame: 'ENU_m';
     anchor: GeoAnchor;
     buildings: BuildingFootprint[];
+    hiddenLayers?: BuildingFootprint['category'][];
   };
   devices: {
     transmitters: Transmitter[];
@@ -108,6 +110,7 @@ const isTransmitter = (value: unknown): value is Transmitter =>
   isFiniteNumber(value.latitude) &&
   isFiniteNumber(value.longitude) &&
   isFiniteNumber(value.height) &&
+  (value.heightReference === undefined || value.heightReference === 'roof' || value.heightReference === 'enu') &&
   isVector(value.enu) &&
   isFiniteNumber(value.powerDbm) &&
   isArraySize(value.antennaArraySize) &&
@@ -121,6 +124,7 @@ const isReceiver = (value: unknown): value is Receiver =>
   isFiniteNumber(value.latitude) &&
   isFiniteNumber(value.longitude) &&
   isFiniteNumber(value.height) &&
+  (value.heightReference === undefined || value.heightReference === 'roof' || value.heightReference === 'enu') &&
   isVector(value.enu) &&
   isArraySize(value.antennaArraySize);
 
@@ -137,7 +141,20 @@ const isBuilding = (value: unknown): value is BuildingFootprint =>
   isFiniteNumber(value.height) &&
   ['building', 'infrastructure', 'terrain', 'water'].includes(String(value.category)) &&
   typeof value.type === 'string' &&
-  typeof value.material === 'string';
+  typeof value.material === 'string' &&
+  (value.kind === undefined || ['building', 'wall', 'mesh'].includes(String(value.kind))) &&
+  (value.baseZ === undefined || isFiniteNumber(value.baseZ)) &&
+  (value.source === undefined || ['template', 'osm', 'manual', 'import'].includes(String(value.source))) &&
+  (value.heightSource === undefined || ['tag', 'levels', 'estimated', 'manual'].includes(String(value.heightSource))) &&
+  (value.materialSource === undefined || ['tag', 'estimated', 'manual'].includes(String(value.materialSource))) &&
+  (value.rawTags === undefined || (isRecord(value.rawTags) && Object.values(value.rawTags).every(tag => typeof tag === 'string'))) &&
+  (value.importIssues === undefined || (Array.isArray(value.importIssues) && value.importIssues.every(issue => typeof issue === 'string'))) &&
+  (value.kind === 'mesh'
+    ? isRecord(value.mesh) && Array.isArray(value.mesh.vertices) && Array.isArray(value.mesh.triangles) &&
+      value.mesh.vertices.length >= 9 && value.mesh.vertices.length % 3 === 0 &&
+      value.mesh.vertices.every(isFiniteNumber) && value.mesh.triangles.length >= 3 && value.mesh.triangles.length % 3 === 0 &&
+      value.mesh.triangles.every(index => Number.isInteger(index) && index >= 0 && index < (value.mesh as { vertices: number[] }).vertices.length / 3)
+    : value.mesh === undefined);
 
 const isTrajectoryPoint = (value: unknown): value is TrajectoryPoint =>
   isRecord(value) &&
@@ -191,9 +208,12 @@ const isProjectState = (value: unknown): value is StudioProjectState => {
   const receivers = devices.receivers;
   const materialConfigs = solver.materialConfigs;
 
-  return isAnchor(scene.anchor) &&
+  return scene.coordinateFrame === 'ENU_m' && isAnchor(scene.anchor) &&
     Array.isArray(scene.buildings) &&
     scene.buildings.every(isBuilding) &&
+    new Set(scene.buildings.map(object => object.id)).size === scene.buildings.length &&
+    (scene.hiddenLayers === undefined || (Array.isArray(scene.hiddenLayers) &&
+      scene.hiddenLayers.every(layer => ['building', 'infrastructure', 'terrain', 'water'].includes(layer)))) &&
     Array.isArray(transmitters) &&
     transmitters.length > 0 &&
     transmitters.every(isTransmitter) &&
@@ -280,10 +300,13 @@ export function parseProjectDocument(value: string | unknown): StudioProjectDocu
   if (!isRecord(parsed) || parsed.format !== 'SionnaRTStudio Project') {
     throw new Error('This is not a SionnaRTStudio project file.');
   }
-  if (parsed.schemaVersion !== 1 && parsed.schemaVersion !== PROJECT_SCHEMA_VERSION) {
+  if (parsed.schemaVersion !== 1 && parsed.schemaVersion !== 2 && parsed.schemaVersion !== PROJECT_SCHEMA_VERSION) {
     throw new Error(`Unsupported project schema version: ${String(parsed.schemaVersion)}.`);
   }
-  const state = parsed.schemaVersion === 1 ? migrateV1(parsed.state) : parsed.state;
+  let state = parsed.schemaVersion === 1 ? migrateV1(parsed.state) : parsed.state;
+  if (parsed.schemaVersion < PROJECT_SCHEMA_VERSION && isRecord(state) && isRecord(state.scene)) {
+    state = { ...state, scene: { ...state.scene, coordinateFrame: 'ENU_m' } };
+  }
   if (typeof parsed.savedAtUtc !== 'string' || !isProjectState(state)) {
     throw new Error('The project file is incomplete or contains invalid settings.');
   }
@@ -293,7 +316,18 @@ export function parseProjectDocument(value: string | unknown): StudioProjectDocu
 export function loadAutosavedProject(): StudioProjectDocument | null {
   try {
     const saved = window.localStorage.getItem(PROJECT_STORAGE_KEY);
-    return saved ? parseProjectDocument(saved) : null;
+    if (!saved) return null;
+    const original = JSON.parse(saved);
+    const project = parseProjectDocument(original);
+    if (original.schemaVersion < PROJECT_SCHEMA_VERSION) {
+      const backupKey = `${PROJECT_STORAGE_KEY}.pre-v3`;
+      try {
+        if (!localStorage.getItem(backupKey)) localStorage.setItem(backupKey, saved);
+      } catch {
+        // The existing project can still be read at the browser quota.
+      }
+    }
+    return project;
   } catch (error) {
     console.warn('Could not restore the autosaved SionnaRTStudio project.', error);
     return null;

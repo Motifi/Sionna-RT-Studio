@@ -11,6 +11,7 @@ import {
   CoverageMetric,
   DEFAULT_SOLVER_OPTIONS,
   ENUVector,
+  GeoAnchor,
   MaterialConfig,
   MobilityCombineMode,
   PropagationPath,
@@ -116,6 +117,7 @@ export type CsiRunMode = 'static' | 'trajectory';
 export type CsiRunOutput = 'cir_cfr' | 'cir';
 
 export interface CsiRunRequest extends CIRExportOptions {
+  anchor?: GeoAnchor;
   mode: CsiRunMode;
   output?: CsiRunOutput;
   txs: Transmitter[];
@@ -258,15 +260,103 @@ export function exportCsiRun(
   }, 'sionna_rt_studio_csi.zip');
 }
 
-export async function checkBackend(): Promise<boolean> {
+export interface SolverActivity {
+  operation: string;
+  status: 'running' | 'succeeded' | 'failed';
+  startedAt: string;
+  finishedAt?: string;
+  durationMs?: number;
+  error?: string;
+}
+
+export interface BackendHealth {
+  appVersion: string;
+  desktop?: boolean;
+  backend: string | null;
+  variant: string;
+  deviceModel: string | null;
+  pythonVersion: string;
+  sionnaRtVersion: string | null;
+  mitsubaVersion: string | null;
+  drjitVersion: string | null;
+  fallbackReasons: string[];
+  activeSolve: SolverActivity | null;
+  lastSolve: SolverActivity | null;
+}
+
+export async function readBackendHealth(): Promise<BackendHealth | null> {
   try {
     return await withRequestTimeout(HEALTH_TIMEOUT_MS, async (signal) => {
-      const res = await fetch('/api/health', { signal });
-      return res.ok;
+      const res = await fetch('/api/health', { signal, cache: 'no-store' });
+      return res.ok ? await res.json() : null;
     });
   } catch {
-    return false;
+    return null;
   }
+}
+
+export interface UpdateStatus {
+  currentVersion: string;
+  checkedAt?: string;
+  checking: boolean;
+  status: 'not_checked' | 'available' | 'up_to_date' | 'no_stable_release' | 'no_compatible_asset' |
+    'offline' | 'timeout' | 'http_error' | 'invalid_response';
+  version?: string;
+  notes?: string;
+  releasesUrl: string;
+  releaseUrl?: string;
+  asset?: { name: string; size: number; minimumOs: string; url: string };
+}
+
+export function readUpdateStatus(manual = false) {
+  return withRequestTimeout(HEALTH_TIMEOUT_MS, async signal => {
+    const response = await fetch(manual ? '/api/updates/check' : '/api/updates', {
+      signal, cache: 'no-store', method: manual ? 'POST' : 'GET',
+    });
+    if (!response.ok) throw new Error(await errorDetail(response));
+    return await response.json() as UpdateStatus;
+  });
+}
+
+export interface SolverMesh {
+  id: string;
+  material: string;
+  vertices: number[];
+  triangles: number[];
+}
+
+export interface SceneObjectReport {
+  id: string;
+  status: 'physical' | 'visual' | 'skipped';
+  material?: string;
+  issues: string[];
+}
+
+export interface SceneInspection {
+  sceneId: string;
+  geometryId: string;
+  meshes: SolverMesh[];
+  objects: SceneObjectReport[];
+}
+
+export function inspectScene(buildings: BuildingFootprint[], freqGhz: number, materials: MaterialConfig[]) {
+  return postJson<SceneInspection>('/api/scene-inspection', { buildings, freqGhz, materials });
+}
+
+export interface MeshImportResult {
+  objects: BuildingFootprint[];
+  issues: string[];
+  vertexCount: number;
+  triangleCount: number;
+}
+
+export function importMesh(file: File, axes: string, scale: number, material: string) {
+  const query = new URLSearchParams({ filename: file.name, axes, scale: String(scale), material });
+  return withRequestTimeout(SOLVE_TIMEOUT_MS, async (signal) => {
+    const response = await fetch(`/api/mesh-import?${query}`, { method: 'POST', body: file, signal });
+    if (!response.ok) throw new Error(await errorDetail(response));
+    return await response.json() as MeshImportResult;
+  });
 }
 
 export function solveLink(
@@ -563,11 +653,13 @@ export function exportScene(
   options: SolverOptions,
   scene: SceneExportOptions,
   materials: MaterialConfig[] = [],
+  anchor?: GeoAnchor,
 ): Promise<{ blob: Blob; filename: string }> {
   return postForBlob('/api/scene-export', {
     txs,
     rxs,
     buildings,
+    anchor,
     freqGhz,
     maxDepth,
     options,

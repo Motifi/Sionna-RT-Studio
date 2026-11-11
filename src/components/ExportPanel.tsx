@@ -7,7 +7,7 @@ import { useI18n, type LocalizedText } from '../i18n';
 import React, { useLayoutEffect, useRef, useState } from 'react';
 import { Transmitter, Receiver, BuildingFootprint, GeoAnchor, PropagationPath, RadioMapGrid, SolverOptions, MaterialConfig, ChannelGridConfig } from '../types';
 import { exportGeoJSON, exportOBJ3D, exportPropagationCSV, exportCoverageChannelGrid } from '../utils';
-import { exportCIR, CIRFormat, exportCIRBundle, exportChannelGrid, exportCsiRun, exportScene } from '../api';
+import { exportCIR, CIRFormat, exportCIRBundle, exportChannelGrid, exportCsiRun, exportScene, readBackendHealth } from '../api';
 import type { CIRExportOptions, CsiRun } from '../api';
 import { antennaPortCount, formatCsiBytes } from '../lib/csiSize';
 import { createProjectDocument, StudioProjectState } from '../project';
@@ -192,7 +192,7 @@ export function ExportPanel({
   const handleExportManifest = async () => {
     setManifestBusy(true);
     try {
-      const sceneInputSha256 = await sha256Hex(buildings);
+      const [sceneInputSha256, health] = await Promise.all([sha256Hex(buildings), readBackendHealth()]);
       const featureCounts = buildings.reduce<Record<string, number>>((counts, feature) => {
         counts[feature.category] = (counts[feature.category] ?? 0) + 1;
         return counts;
@@ -202,7 +202,7 @@ export function ExportPanel({
         generatedAtUtc: new Date().toISOString(),
         application: {
           name: 'SionnaRTStudio',
-          version: '1.0.0',
+          version: health?.appVersion ?? null,
           engine: 'Sionna RT',
         },
         coordinateConvention: {
@@ -356,6 +356,7 @@ export function ExportPanel({
         solverOptions,
         csiGrid,
         materials,
+        anchor,
       );
       triggerDownload(blob, filename);
     } catch (error) {
@@ -832,17 +833,13 @@ export function ExportPanel({
           <button
             id="btn-export-sionna-scene"
             onClick={handleExportScene}
-            disabled={sceneBusy || buildings.length === 0}
+            disabled={sceneBusy}
             className="mt-auto w-full bg-[var(--accent)] hover:bg-[var(--accent-deep)] disabled:bg-slate-100 disabled:text-slate-400 text-white text-[14px] font-bold py-2 px-3 rounded flex items-center justify-center gap-1.5 transition cursor-pointer border border-transparent disabled:cursor-not-allowed"
           >
             {sceneBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <FileDown className="w-4 h-4" />}
             {sceneBusy ? t('Building scene…', "正在构建场景…") : t('Scene + load_scene.py (.zip)', "场景和 load_scene.py（.zip）")}
           </button>
-          {buildings.length === 0 && (
-            <p className="text-[11px] text-slate-500 font-medium leading-normal -mt-1">
-              {t("Load building footprints first to build a scene.", "请先载入建筑轮廓，再构建场景。")}
-            </p>
-          )}
+
         </div>
 
         {/* Reproduction manifest: concise inputs/provenance, not a result surrogate. */}

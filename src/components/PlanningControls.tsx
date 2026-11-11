@@ -125,6 +125,19 @@ export function PlanningControls({
               onChange={onIntervalChange} className={inputClass} />
           </label>
         </div>
+        {rx.heightReference === 'enu' && onTrajectoryChange && trajectoryPoints.length > 0 &&
+          <details className="text-xs">
+            <summary>{t('Waypoint offsets from UE elevation (m)', '各控制点相对 UE 标高的偏移（米）')}</summary>
+            <div className="grid grid-cols-2 gap-2 mt-2">
+              {trajectoryPoints.map((point, index) => <label key={index}>
+                {index + 1}
+                <NumberField value={point.enu.z} className={inputClass} step="any"
+                  onChange={z => onTrajectoryChange(trajectoryPoints.map((entry, i) =>
+                    i === index ? { ...entry, enu: { ...entry.enu, z } } : entry,
+                  ))} />
+              </label>)}
+            </div>
+          </details>}
         <div className="flex flex-wrap gap-2">
           {anchor && onTrajectoryChange && (
             <button type="button" id="btn-gen-trajectory" onClick={generateLoop} className={buttonClass}>

@@ -7,20 +7,46 @@ from __future__ import annotations
 
 from typing import List, Literal, Optional, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, FiniteFloat, model_validator
+
+
+class GeoAnchor(BaseModel):
+    latitude: FiniteFloat = Field(ge=-90, le=90)
+    longitude: FiniteFloat = Field(ge=-180, le=180)
 
 
 class ENUVector(BaseModel):
-    x: float  # East (m)
-    y: float  # North (m)
-    z: float  # Up (m)
+    x: FiniteFloat  # East (m)
+    y: FiniteFloat  # North (m)
+    z: FiniteFloat  # Up (m)
+
+
+class TriangleMesh(BaseModel):
+    vertices: list[FiniteFloat] = Field(min_length=9, max_length=300_000)
+    triangles: list[int] = Field(min_length=3, max_length=450_000)
+
+    @model_validator(mode="after")
+    def validate_indices(self):
+        if len(self.vertices) % 3 or len(self.triangles) % 3:
+            raise ValueError("Mesh vertices and triangles must be triples")
+        if any(i < 0 or i >= len(self.vertices) // 3 for i in self.triangles):
+            raise ValueError("Mesh triangle index is out of bounds")
+        return self
 
 
 class BuildingFootprint(BaseModel):
     id: str
     name: Optional[str] = None
     enuPoints: List[ENUVector]
-    height: float
+    height: FiniteFloat
+    kind: Literal["building", "wall", "mesh"] = "building"
+    baseZ: FiniteFloat = 0.0
+    mesh: TriangleMesh | None = None
+    source: Literal["template", "osm", "manual", "import"] | None = None
+    heightSource: Literal["tag", "levels", "estimated", "manual"] | None = None
+    materialSource: Literal["tag", "estimated", "manual"] | None = None
+    rawTags: dict[str, str] = Field(default_factory=dict)
+    importIssues: list[str] = Field(default_factory=list)
     category: Literal["building", "infrastructure", "terrain", "water"]
     material: str = "itu_concrete"
     type: str = ""
@@ -33,7 +59,8 @@ class Transmitter(BaseModel):
     id: str = "tx"
     name: str = "Tx"
     enu: ENUVector
-    height: float = 10.0
+    height: FiniteFloat = 10.0
+    heightReference: Literal["roof", "enu"] = "roof"
     powerDbm: float = 30.0
     antennaArraySize: Tuple[int, int] = (8, 8)  # [horizontal, vertical]
     beamsteeringAzimuth: float = 0.0
@@ -46,7 +73,8 @@ class Receiver(BaseModel):
     id: str = "rx"
     name: str = "Rx"
     enu: ENUVector
-    height: float = 1.5
+    height: FiniteFloat = 1.5
+    heightReference: Literal["roof", "enu"] = "roof"
     antennaArraySize: Tuple[int, int] = (1, 1)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
@@ -164,12 +192,18 @@ class MaterialConfig(BaseModel):
     a custom RadioMaterial replaces the ITU preset for that id.
     """
     id: str
-    scatteringCoefficient: float = 0.0  # S in [0, 1]
-    xpdCoefficient: float = 0.0         # cross-pol discrimination in [0, 1]
+    scatteringCoefficient: FiniteFloat = Field(default=0.0, ge=0, le=1)
+    xpdCoefficient: FiniteFloat = Field(default=0.0, ge=0, le=1)
     scatteringPattern: Literal["none", "lambertian", "directive", "backscattering"] = "none"
-    relativePermittivity: Optional[float] = None
-    conductivity: Optional[float] = None  # S/m
-    thickness: Optional[float] = None     # m
+    relativePermittivity: FiniteFloat | None = Field(default=None, ge=1)
+    conductivity: FiniteFloat | None = Field(default=None, ge=0)  # S/m
+    thickness: FiniteFloat | None = Field(default=None, ge=0)  # m
+
+
+class SceneInspectionRequest(BaseModel):
+    buildings: list[BuildingFootprint]
+    freqGhz: FiniteFloat = Field(gt=0)
+    materials: list[MaterialConfig] = Field(default_factory=list)
 
 
 class SolveRequest(BaseModel):
@@ -427,6 +461,7 @@ class SceneExportRequest(BaseModel):
     txs: Optional[List[Transmitter]] = None
     rxs: Optional[List[Receiver]] = None
     buildings: List[BuildingFootprint]
+    anchor: GeoAnchor | None = None
     freqGhz: float = 28.0
     maxDepth: int = 3
     options: SolverOptions = Field(default_factory=SolverOptions)
