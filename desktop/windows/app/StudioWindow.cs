@@ -147,6 +147,32 @@ internal sealed class StudioWindow : Form
             await Task.Delay(200, token);
         }
 
+        string[] workspaces = ["scene", "planning", "preview", "export", "scene"];
+        foreach (var workspace in workspaces)
+        {
+            var button = $"document.getElementById({JsonSerializer.Serialize("nav-btn-" + workspace)})";
+            await core.ExecuteScriptAsync($"{button}.click()").WaitAsync(TimeSpan.FromSeconds(5), token);
+            var deadline = Stopwatch.StartNew();
+            while (await core.ExecuteScriptAsync($"{button}.getAttribute('aria-current') === 'page'")
+                       .WaitAsync(TimeSpan.FromSeconds(5), token) != "true")
+            {
+                if (deadline.Elapsed > TimeSpan.FromSeconds(5))
+                    throw new InvalidOperationException($"Studio did not open the {workspace} workspace.");
+                await Task.Delay(50, token);
+            }
+        }
+
+        await core.ExecuteScriptAsync("window.dispatchEvent(new Event('sionna-studio-flush-project'))")
+            .WaitAsync(TimeSpan.FromSeconds(5), token);
+        var autosave = Stopwatch.StartNew();
+        const string projectSaved = "document.documentElement.dataset.projectSaveState === 'saved'";
+        while (await core.ExecuteScriptAsync(projectSaved).WaitAsync(TimeSpan.FromSeconds(5), token) != "true")
+        {
+            if (autosave.Elapsed > TimeSpan.FromSeconds(5))
+                throw new InvalidOperationException("Studio did not autosave the project after workspace navigation.");
+            await Task.Delay(50, token);
+        }
+
         using var handler = new HttpClientHandler { UseProxy = false, AllowAutoRedirect = false };
         using var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(5) };
         await using var response = await client.GetStreamAsync(new Uri(origin!, "api/health"), token);
@@ -157,6 +183,8 @@ internal sealed class StudioWindow : Form
             backendPid = backend!.ProcessId,
             uiReady = true,
             webgl2 = true,
+            workspaceNavigation = true,
+            projectAutosave = true,
             health = health.RootElement,
             webViewVersion = core.Environment.BrowserVersionString,
         });

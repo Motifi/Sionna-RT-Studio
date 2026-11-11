@@ -262,6 +262,11 @@ def main():
             report["health"] = health
             report["uiReady"] = ready.get("uiReady")
             report["webgl2"] = ready.get("webgl2")
+            if not args.headless:
+                report["workspaceNavigation"] = ready.get("workspaceNavigation")
+                report["projectAutosave"] = ready.get("projectAutosave")
+                require(report["workspaceNavigation"] is True and report["projectAutosave"] is True,
+                        "Studio did not finish workspace navigation and autosave in WebView2")
             report["backendPid"] = ready["backendPid"]
             require(health.get("ok") is True and health.get("engine") == "Sionna RT", "Studio solver is unhealthy")
             require(b'id="root"' in request(origin, "/"), "The packaged Studio interface is missing")

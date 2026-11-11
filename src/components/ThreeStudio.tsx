@@ -14,14 +14,9 @@ import { BuildingFootprint, GeoAnchor, Transmitter, Receiver, PropagationPath, E
 import { cn } from '../lib/utils';
 import { enuToLatLon, getDeviceElevation, isPointInPolygon } from '../utils';
 import { RadioMapGrid } from '../types';
-import { ColormapName, sampleColormap } from '../lib/colormaps';
-import { Compass, Activity, Camera } from 'lucide-react';
-
-// Sample the selected colormap at t in [0,1] into `out`.
-function colormapColor(name: ColormapName, t: number, out: THREE.Color): THREE.Color {
-  const [r, g, b] = sampleColormap(name, t);
-  return out.setRGB(r, g, b);
-}
+import type { ColormapName } from '../lib/colormaps';
+import { coverageCellValue, coverageDisplayRange, setCoverageColor } from '../lib/coverageDisplay';
+import { Camera, ChevronDown, Eye } from 'lucide-react';
 
 // Free the GPU resources (geometry, materials, textures) held by an object tree.
 // three.js does not release these on remove(), so skipping this leaks VRAM.
@@ -154,6 +149,8 @@ type DevicePlacement = Exclude<PlacementMode, 'none'>;
 
 interface ThreeStudioProps {
   sceneEditor?: SceneEditor;
+  onSelectSceneObject?: (id: string | null) => void;
+  focusObject?: { id: string };
   physicalMeshes?: SolverMesh[];
   solverRoofs?: SolverRoof[];
   buildings: BuildingFootprint[];
@@ -173,6 +170,10 @@ interface ThreeStudioProps {
   rmVmin: number;
   rmVmax: number;
   onPlaceDevice: (mode: DevicePlacement, enu: ENUVector) => void;
+  onSelectDevice: (kind: 'tx' | 'rx', id: string) => void;
+  deploymentSelection: 'tx' | 'rx';
+  showDevices: boolean;
+  onToggleSceneDevices: () => void;
   editing: boolean;
   visible: boolean;
   activeMode: 'link' | 'heatmap' | 'playback';
@@ -195,6 +196,8 @@ function enuToThree(v: ENUVector): THREE.Vector3 {
 
 export function ThreeStudio({
   sceneEditor,
+  onSelectSceneObject,
+  focusObject,
   physicalMeshes,
   solverRoofs,
   buildings,
@@ -214,6 +217,10 @@ export function ThreeStudio({
   rmVmin,
   rmVmax,
   onPlaceDevice,
+  onSelectDevice,
+  deploymentSelection,
+  showDevices,
+  onToggleSceneDevices,
   editing,
   visible,
   activeMode,
@@ -238,11 +245,12 @@ export function ThreeStudio({
   const [pathDrawingMode, setPathDrawingMode] = useState(false);
 
   const [hoveredCoordinate, setHoveredCoordinate] = useState<ENUVector | null>(null);
-  const drawingTrajectory = editing && pathDrawingMode && placementMode === 'none';
+  const drawingTrajectory = editing && deploymentSelection === 'rx' && pathDrawingMode && placementMode === 'none';
 
   useEffect(() => {
-    if (!editing || placementMode !== 'none') setPathDrawingMode(false);
-  }, [editing, placementMode]);
+    if (!editing || deploymentSelection !== 'rx' || placementMode !== 'none') setPathDrawingMode(false);
+  }, [editing, deploymentSelection, placementMode]);
+  useEffect(() => { setPathDrawingMode(false); }, [rx.id]);
 
   useEffect(() => {
     if (placementMode === 'none' && !drawingTrajectory) return;
@@ -258,7 +266,7 @@ export function ThreeStudio({
 
   // Keep references to access them in render loops & events stably
   const stateRef = useRef({
-    sceneEditor, physicalMeshes, solverRoofs,
+    sceneEditor, physicalMeshes, solverRoofs, onSelectSceneObject, focusObject,
     buildings,
     anchor,
     tx,
@@ -278,18 +286,22 @@ export function ThreeStudio({
     placementMode,
     activeMode,
     cameraMode,
+    performanceMode,
     showOutlines,
     drawingTrajectory,
     mobilityRxPosition,
     trajectoryPoints,
     setTrajectoryPoints,
     onPlaceDevice,
+    onSelectDevice,
+    editing,
+    showDevices,
     visible,
   });
 
   useEffect(() => {
     stateRef.current = {
-      sceneEditor, physicalMeshes, solverRoofs,
+      sceneEditor, physicalMeshes, solverRoofs, onSelectSceneObject, focusObject,
       buildings,
       anchor,
       tx,
@@ -309,15 +321,19 @@ export function ThreeStudio({
       placementMode,
       activeMode,
       cameraMode,
+      performanceMode,
       showOutlines,
       drawingTrajectory,
       mobilityRxPosition,
       trajectoryPoints,
       setTrajectoryPoints,
       onPlaceDevice,
+      onSelectDevice,
+      editing,
+      showDevices,
       visible,
     };
-  }, [sceneEditor, physicalMeshes, solverRoofs, buildings, anchor, tx, rx, txs, rxs, activeTxId, activeRxId, paths, matrixPaths, showRaysOnHeatmap, radioMap, rmColormap, rmAutoRange, rmVmin, rmVmax, placementMode, activeMode, cameraMode, showOutlines, drawingTrajectory, mobilityRxPosition, trajectoryPoints, setTrajectoryPoints, onPlaceDevice, visible]);
+  }, [sceneEditor, physicalMeshes, solverRoofs, onSelectSceneObject, focusObject, buildings, anchor, tx, rx, txs, rxs, activeTxId, activeRxId, paths, matrixPaths, showRaysOnHeatmap, radioMap, rmColormap, rmAutoRange, rmVmin, rmVmax, placementMode, activeMode, cameraMode, performanceMode, showOutlines, drawingTrajectory, mobilityRxPosition, trajectoryPoints, setTrajectoryPoints, onPlaceDevice, onSelectDevice, editing, showDevices, visible]);
 
   useEffect(() => {
     if (!containerRef.current || !canvasRef.current) return;
@@ -341,7 +357,7 @@ export function ThreeStudio({
     try {
       renderer = new THREE.WebGLRenderer({
         canvas: canvasRef.current,
-        antialias: performanceMode === 'high',
+        antialias: true,
         alpha: true,
         logarithmicDepthBuffer: true,
         powerPreference: 'high-performance',
@@ -355,8 +371,7 @@ export function ThreeStudio({
     const onContextRestored = () => setCanvasState('active');
     renderer.domElement.addEventListener('webglcontextlost', onContextLost);
     renderer.domElement.addEventListener('webglcontextrestored', onContextRestored);
-    renderer.setSize(width, height);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, performanceMode === 'high' ? 2 : 1));
+    renderer.setSize(width, height, false);
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 
@@ -489,6 +504,7 @@ export function ThreeStudio({
 
       current.buildings.forEach(b => {
         if (current.sceneEditor?.hiddenLayers.includes(b.category)) return;
+        const selected = current.sceneEditor?.selected?.id === b.id;
         if (b.kind === 'mesh' && b.mesh) {
           addTriangleMesh(b.mesh, b.id, b.baseZ);
           return;
@@ -539,12 +555,13 @@ export function ThreeStudio({
             roadGeom.rotateY(angle); // Polar rotate
 
             const roadMat = new THREE.MeshStandardMaterial({
-              color: 0x334155, // Charcoal slate asphalt
+              color: selected ? 0xf59e0b : 0x334155,
               roughness: 0.85,
               metalness: 0.1
             });
 
             const roadMesh = new THREE.Mesh(roadGeom, roadMat);
+            roadMesh.name = b.id;
             roadMesh.position.set(mx, 0.12, mz); // distinct layer height to prevent z-fighting
             roadMesh.receiveShadow = true;
             buildingGroup.add(roadMesh);
@@ -585,12 +602,13 @@ export function ThreeStudio({
           terrainGeom.rotateX(-Math.PI / 2);
 
           const terrainMat = new THREE.MeshStandardMaterial({
-            color: 0x86efac, // Vibrant rich pastel park green for highly distinguishable eco zones
+            color: selected ? 0xf59e0b : 0x86efac,
             roughness: 0.9,
             metalness: 0.05
           });
 
           const terrainMesh = new THREE.Mesh(terrainGeom, terrainMat);
+          terrainMesh.name = b.id;
           terrainMesh.receiveShadow = true;
           terrainMesh.position.y = 0.05;
           buildingGroup.add(terrainMesh);
@@ -623,6 +641,7 @@ export function ThreeStudio({
             // Verify if point is physically inside the park footprint
             if (isPointInPolygon({ x: rx, y: ry }, b.enuPoints)) {
               const treeGroup = new THREE.Group();
+              treeGroup.name = b.id;
               treeGroup.position.set(rx, 0.09, -ry);
 
               // Wood trunk
@@ -668,7 +687,7 @@ export function ThreeStudio({
           waterGeom.rotateX(-Math.PI / 2);
 
           const waterMat = new THREE.MeshStandardMaterial({
-            color: 0x0ea5e9, // High-contrast vivid azure glass-blue water surface
+            color: selected ? 0xf59e0b : 0x0ea5e9,
             roughness: 0.05,
             metalness: 0.3,
             transparent: true,
@@ -676,6 +695,7 @@ export function ThreeStudio({
           });
 
           const waterMesh = new THREE.Mesh(waterGeom, waterMat);
+          waterMesh.name = b.id;
           waterMesh.position.y = 0.08;
           buildingGroup.add(waterMesh);
           return;
@@ -717,7 +737,7 @@ export function ThreeStudio({
         // Matte, muted, solid buildings — matches Sionna RT's preview look.
         // Each building gets a distinct earthy tone (deterministic by id).
         const meshMat = new THREE.MeshStandardMaterial({
-          color: current.sceneEditor?.selected?.id === b.id ? 0xf59e0b : buildingColor(b.id),
+          color: selected ? 0xf59e0b : buildingColor(b.id),
           roughness: 0.97,
           metalness: 0.0,
           flatShading: true,
@@ -811,6 +831,7 @@ export function ThreeStudio({
       clearGroup(receiverGroup);
 
       const current = stateRef.current;
+      if (!current.showDevices) return;
       const elevation = (device: Transmitter | Receiver) => getDeviceElevation(device, current.buildings, current.solverRoofs);
 
       // Draw Transmitter Tower (TX)
@@ -820,6 +841,7 @@ export function ThreeStudio({
       const towerBaseGeom = new THREE.CylinderGeometry(0.5, 3, Math.abs(txThreePos.y), 4);
       const towerBaseMat = new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.8, roughness: 0.2 });
       const towerMesh = new THREE.Mesh(towerBaseGeom, towerBaseMat);
+      towerMesh.userData.deviceId = current.tx.id;
       towerMesh.position.set(txThreePos.x, txThreePos.y / 2, txThreePos.z);
       towerMesh.castShadow = true;
       transmitterGroup.add(towerMesh);
@@ -828,11 +850,13 @@ export function ThreeStudio({
       const antennaGeom = new THREE.SphereGeometry(1.5, 16, 16);
       const antennaMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
       const antennaMesh = new THREE.Mesh(antennaGeom, antennaMat);
+      antennaMesh.userData.deviceId = current.tx.id;
       antennaMesh.position.copy(txThreePos);
       transmitterGroup.add(antennaMesh);
 
       // Name label (e.g. "Tx 1") floating above the active transmitter.
       const txLabel = makeLabelSprite(current.tx.name, '#d9aaa2');
+      txLabel.userData.deviceId = current.tx.id;
       txLabel.position.set(txThreePos.x, txThreePos.y + 8, txThreePos.z);
       transmitterGroup.add(txLabel);
 
@@ -864,7 +888,7 @@ export function ThreeStudio({
 
       // Draw Receiver Terminal (RX). During mobility playback, use the selected
       // solved sample directly so animation does not mutate the editable Rx state.
-      const rxEnuPos = (current.activeMode === 'playback' && current.mobilityRxPosition) ||
+      const rxEnuPos = current.mobilityRxPosition ??
         { ...current.rx.enu, z: elevation(current.rx) };
       const rxThreePos = enuToThree(rxEnuPos);
 
@@ -872,17 +896,20 @@ export function ThreeStudio({
       const deviceGeom = new THREE.SphereGeometry(1.2, 16, 16);
       const deviceMat = new THREE.MeshBasicMaterial({ color: 0x3b82f6 });
       const deviceMesh = new THREE.Mesh(deviceGeom, deviceMat);
+      deviceMesh.userData.deviceId = current.rx.id;
       deviceMesh.position.copy(rxThreePos);
       receiverGroup.add(deviceMesh);
 
       const devicePoleGeom = new THREE.CylinderGeometry(0.2, 0.2, Math.abs(rxThreePos.y), 8);
       const devicePoleMat = new THREE.MeshStandardMaterial({ color: 0x475569 });
       const devicePoleMesh = new THREE.Mesh(devicePoleGeom, devicePoleMat);
+      devicePoleMesh.userData.deviceId = current.rx.id;
       devicePoleMesh.position.set(rxThreePos.x, rxThreePos.y / 2, rxThreePos.z);
       receiverGroup.add(devicePoleMesh);
 
       // Name label (e.g. "Rx 1") floating above the active receiver.
       const rxLabel = makeLabelSprite(current.rx.name, '#a9c2c9');
+      rxLabel.userData.deviceId = current.rx.id;
       rxLabel.position.set(rxThreePos.x, rxThreePos.y + 6, rxThreePos.z);
       receiverGroup.add(rxLabel);
 
@@ -903,7 +930,9 @@ export function ThreeStudio({
         dome.position.copy(top);
         const label = makeLabelSprite(device.name, labelColor);
         label.position.set(top.x, top.y + 6, top.z);
-        return [pole, dome, label];
+        const marker = [pole, dome, label];
+        marker.forEach(object => { object.userData.deviceId = device.id; });
+        return marker;
       };
 
       (current.txs ?? []).forEach((t) => {
@@ -977,31 +1006,13 @@ export function ThreeStudio({
       const metric = rm.metric ?? 'power';
       const size = rm.gridSize;
 
-      // Each ground cell carries received power and (for the SINR metric) SINR;
-      // colour by whichever metric the map was computed for.
-      type ValPt = { x: number; y: number; value: number };
-      const valid: ValPt[] = rm.cells
-        .map((c) => ({ x: c.x, y: c.y,
-          value: metric === 'sinr' ? (c.sinr ?? NaN) : c.powerDbm }))
-        .filter((p) => Number.isFinite(p.value) && p.value > -200);
-      if (valid.length === 0) return;
-
-      let vmin = Infinity;
-      let vmax = -Infinity;
-      // Auto-normalize to this map's own min/max. Manual vmin/vmax only applies to
-      // the received-power view (the sliders are calibrated in dBm).
-      const autoStretch = current.rmAutoRange || metric === 'sinr';
-      if (autoStretch) {
-        for (const c of valid) {
-          if (c.value < vmin) vmin = c.value;
-          if (c.value > vmax) vmax = c.value;
-        }
-      } else {
-        // Manual vmin/vmax, like sionna-rt-gui's radio map display sliders.
-        vmin = Math.min(current.rmVmin, current.rmVmax);
-        vmax = Math.max(current.rmVmin, current.rmVmax);
+      const range = coverageDisplayRange(rm, current.rmAutoRange, current.rmVmin, current.rmVmax);
+      if (!range) return;
+      const valid: { x: number; y: number; value: number }[] = [];
+      for (const cell of rm.cells) {
+        const value = coverageCellValue(cell, metric);
+        if (value !== null) valid.push({ x: cell.x, y: cell.y, value });
       }
-      const span = vmax - vmin > 1e-6 ? vmax - vmin : 1;
 
       // Solid cell tiles that tile seamlessly (no gaps), flat on the ground.
       const cellGeom = new THREE.PlaneGeometry(size * 1.02, size * 1.02);
@@ -1025,25 +1036,7 @@ export function ThreeStudio({
         dummy.updateMatrix();
         instMesh.setMatrixAt(idx, dummy.matrix);
 
-        const t0 = (cell.value - vmin) / span;
-        let t = t0;
-        if (autoStretch) {
-          // Auto mode: contrast stretch + brightening gamma so the upper range
-          // pops. Manual vmin/vmax maps linearly, matching sionna-rt-gui.
-          const CONTRAST = 1.7;
-          t = (t0 - 0.5) * CONTRAST + 0.5;
-          t = Math.min(1, Math.max(0, t));
-          t = Math.pow(t, 0.78);
-        } else {
-          t = Math.min(1, Math.max(0, t));
-        }
-        colormapColor(current.rmColormap, t, tmp);
-        if (autoStretch) {
-          const hsl = { h: 0, s: 0, l: 0 };
-          tmp.getHSL(hsl);
-          tmp.setHSL(hsl.h, Math.min(1, hsl.s * 1.3), hsl.l);
-        }
-        instMesh.setColorAt(idx, tmp);
+        instMesh.setColorAt(idx, setCoverageColor(current.rmColormap, cell.value, range, tmp));
       });
 
       instMesh.instanceColor!.needsUpdate = true;
@@ -1092,7 +1085,7 @@ export function ThreeStudio({
       press = null;
       if (e.button !== 0 || dragged) return;
       const current = stateRef.current;
-      if (!current.sceneEditor && current.placementMode === 'none' && !current.drawingTrajectory) return;
+      if (!current.sceneEditor && !current.editing) return;
 
       // Calculate mouse canvas click coords
       const rect = renderer.domElement.getBoundingClientRect();
@@ -1102,12 +1095,25 @@ export function ThreeStudio({
       raycaster.setFromCamera(mouse, camera);
 
       if (current.sceneEditor) {
+        if (current.sceneEditor.tool === 'select') {
+          const hit = raycaster.intersectObjects(buildingGroup.children, true).find(({ object }) =>
+            object.name || object.parent?.name);
+          current.onSelectSceneObject?.(hit?.object.name || hit?.object.parent?.name || null);
+          return;
+        }
         const point = raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0)), new THREE.Vector3());
         if (!point) return;
-        const hit = current.sceneEditor.tool === 'select'
-          ? raycaster.intersectObjects(buildingGroup.children, true).find(result => result.object.name)?.object.name
-          : undefined;
-        current.sceneEditor.click({ x: point.x, y: -point.z, z: 0 }, hit);
+        current.sceneEditor.click({ x: point.x, y: -point.z, z: 0 });
+        return;
+      }
+
+      if (current.placementMode === 'none' && !current.drawingTrajectory) {
+        const hit = raycaster.intersectObjects([transmitterGroup, receiverGroup], true)
+          .find(({ object }) => typeof object.userData.deviceId === 'string');
+        if (hit) {
+          const kind = hit.object.parent === transmitterGroup ? 'tx' : 'rx';
+          current.onSelectDevice(kind, hit.object.userData.deviceId);
+        }
         return;
       }
 
@@ -1150,6 +1156,8 @@ export function ThreeStudio({
 
     renderer.domElement.addEventListener('pointerdown', handlePointerDown);
     renderer.domElement.addEventListener('pointermove', handlePointerMove);
+    const clearCoordinates = () => setHoveredCoordinate(null);
+    renderer.domElement.addEventListener('pointerleave', clearCoordinates);
     renderer.domElement.addEventListener('click', handleContainerClick);
 
     // 11. CENTRALIZED REALTIME ANIMATION DRAW LOOP
@@ -1168,13 +1176,16 @@ export function ThreeStudio({
       const first = prev === null;
       const p = prev ?? ({} as Snapshot);
 
+      if (c.performanceMode !== p.performanceMode) {
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, c.performanceMode === 'high' ? 2 : 0.85));
+      }
       if (c.buildings !== p.buildings || c.showOutlines !== p.showOutlines ||
           c.physicalMeshes !== p.physicalMeshes || c.sceneEditor?.selected?.id !== p.sceneEditor?.selected?.id ||
           c.sceneEditor?.hiddenLayers !== p.sceneEditor?.hiddenLayers) rebuildBuildings3D();
       if (c.sceneEditor?.draft !== p.sceneEditor?.draft) rebuildDraft();
       if (first || c.buildings !== p.buildings || c.solverRoofs !== p.solverRoofs || c.tx !== p.tx || c.rx !== p.rx || c.txs !== p.txs || c.rxs !== p.rxs ||
           c.activeTxId !== p.activeTxId || c.activeRxId !== p.activeRxId ||
-          c.activeMode !== p.activeMode || c.mobilityRxPosition !== p.mobilityRxPosition ||
+          c.activeMode !== p.activeMode || c.mobilityRxPosition !== p.mobilityRxPosition || c.showDevices !== p.showDevices ||
           c.showOutlines !== p.showOutlines) {
         drawNodes3D();
       }
@@ -1194,6 +1205,7 @@ export function ThreeStudio({
 
     let followingTx = false;
     let overhead = false;
+    let lastFocus: ThreeStudioProps['focusObject'];
     const updateCamera = () => {
       const current = stateRef.current;
       const top = !!current.sceneEditor?.top;
@@ -1224,6 +1236,22 @@ export function ThreeStudio({
       if (shouldFollowTx) {
         const txPos = enuToThree({ ...current.tx.enu, z: current.tx.height });
         controls.target.lerp(txPos, 0.1);
+      }
+      if (current.focusObject && current.focusObject !== lastFocus) {
+        lastFocus = current.focusObject;
+        const object = current.buildings.find(building => building.id === lastFocus?.id);
+        if (object?.enuPoints.length) {
+          const bounds = new THREE.Box3();
+          for (const point of object.enuPoints) {
+            bounds.expandByPoint(enuToThree({ ...point, z: object.baseZ ?? 0 }));
+            bounds.expandByPoint(enuToThree({ ...point, z: (object.baseZ ?? 0) + object.height }));
+          }
+          const center = bounds.getCenter(new THREE.Vector3());
+          const distance = Math.max(30, bounds.getSize(new THREE.Vector3()).length() * 1.6);
+          const offset = camera.position.clone().sub(controls.target).setLength(distance);
+          controls.target.copy(center);
+          camera.position.copy(center).add(offset);
+        }
       }
       controls.update();
     };
@@ -1286,7 +1314,7 @@ export function ThreeStudio({
       const h = containerRef.current.clientHeight || 580;
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
-      renderer.setSize(w, h);
+      renderer.setSize(w, h, false);
     });
     resizeObserver.observe(containerRef.current);
 
@@ -1298,6 +1326,7 @@ export function ThreeStudio({
       renderer.domElement.removeEventListener('webglcontextrestored', onContextRestored);
       renderer.domElement.removeEventListener('pointerdown', handlePointerDown);
       renderer.domElement.removeEventListener('pointermove', handlePointerMove);
+      renderer.domElement.removeEventListener('pointerleave', clearCoordinates);
       renderer.domElement.removeEventListener('click', handleContainerClick);
       controls.dispose();
       // Release every GPU resource this effect created.
@@ -1309,7 +1338,7 @@ export function ThreeStudio({
       (gridHelper.material as THREE.Material).dispose();
       renderer.dispose();
     };
-  }, [performanceMode]);
+  }, []);
 
   const placementButtons: { mode: DevicePlacement; label: string; title: string }[] = [
     { mode: 'add-tx', label: t('+ Add AP', '+ 新增 AP'), title: t('Add a transmitter at each scene click', '每点击一个位置，就新增一个发射端（AP / Tx）') },
@@ -1325,188 +1354,115 @@ export function ThreeStudio({
     'move-rx': t(`Click the new location for ${rx.name}. Esc cancels.`, `点击场景移动 ${rx.name}，按 Esc 取消。`),
   }[placementMode];
 
+  const viewButton = 'flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-[var(--ink-750)]';
+  const coordinates = hoveredCoordinate && (
+    <span className="readout">
+      {t('ENU (m)', 'ENU（米）')} · {hoveredCoordinate.x.toFixed(1)}, {hoveredCoordinate.y.toFixed(1)}, {hoveredCoordinate.z.toFixed(1)}
+    </span>
+  );
+
   return (
-    <div id="three-studio-frame" className="relative flex-1 min-h-[420px] bg-slate-50 border border-slate-200 rounded overflow-hidden shadow-xl flex flex-col">
-      {/* 3D Canvas rendering window */}
-      <div ref={containerRef} className="w-full flex-1 relative min-h-[320px]">
+    <div id="three-studio-frame" className="relative flex h-full min-h-0 w-full flex-col overflow-hidden rounded-lg border border-[var(--line)] bg-[#f4f6f8]">
+      <div ref={containerRef} className="relative min-h-0 flex-1">
         <canvas
           ref={canvasRef}
           id="canvas-3d"
-          className={cn('w-full h-full block', (placementHint || drawingTrajectory || (sceneEditor && sceneEditor.tool !== 'select')) && 'cursor-crosshair')}
+          className={cn('absolute inset-0 block h-full w-full', (placementHint || drawingTrajectory || (sceneEditor && sceneEditor.tool !== 'select')) && 'cursor-crosshair')}
           aria-label={t('3D propagation scene', '三维传播场景')}
         />
 
-        {/* Floating coordinate helper & action HUD */}
-        <div className="absolute top-4 left-4 bg-white/95 backdrop-blur-md shadow-lg rounded px-4 py-3.5 border border-slate-200 flex flex-col gap-1 text-slate-800 pointer-events-none z-10 transition-all max-w-xs">
-          <div className="flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-[#5f7f5a] animate-pulse" />
-            <h4 className="eyebrow">{t('3D PROPAGATION FIELD', '三维传播场景')}</h4>
-          </div>
-          <p className="text-xs text-slate-500" role="status">
-            WebGL · {canvasState === 'active' ? t('Rendering', '渲染中') : canvasState === 'unavailable' ? t('Unavailable', '不可用') : t('Starting', '正在启动')}
-          </p>
-          <p className="text-[13px] text-slate-500 font-mono">
-            {hoveredCoordinate
-              ? t(
-                  `ENU m: E ${hoveredCoordinate.x.toFixed(1)}, N ${hoveredCoordinate.y.toFixed(1)}, Alt ${hoveredCoordinate.z.toFixed(1)}`,
-                  `ENU（米）东 ${hoveredCoordinate.x.toFixed(1)}，北 ${hoveredCoordinate.y.toFixed(1)}，高 ${hoveredCoordinate.z.toFixed(1)}`,
-                )
-              : t('Hover to raycast coordinates', '移动指针查看坐标')}
-          </p>
-          {(placementHint || drawingTrajectory) && (
-            <div role="status" className="mt-2 text-[12px] py-1 px-2.5 bg-[#cc785c]/10 text-[#8b4d39] rounded border border-[#cc785c]/30 font-semibold flex items-center gap-1.5">
-              <Compass className="w-3.5 h-3.5 shrink-0 rotate-45" />
-              <span>{placementHint || t('Click the scene to add a waypoint. Esc ends drawing.', '点击场景添加轨迹点，按 Esc 结束。')}</span>
-            </div>
-          )}
-        </div>
-
-        {/* Hovering Toolbar panel */}
-        <div className="absolute bottom-4 left-4 right-4 flex flex-wrap justify-between items-center gap-3 bg-white/95 backdrop-blur-md border border-slate-200 p-2 rounded shadow-lg z-10 pointer-events-auto">
-          {/* Quick Nodes Placement Actions */}
-          <div className="flex flex-wrap items-center gap-2">
-            {editing && placementButtons.map(({ mode, label, title }) => (
-              <button
-                key={mode}
-                id={`btn-${mode}`}
-                type="button"
-                title={title}
-                aria-pressed={placementMode === mode}
-                onClick={() => setPlacementMode(placementMode === mode ? 'none' : mode)}
-                className={cn(
-                  'px-2.5 py-1.5 text-[12px] font-bold rounded transition-colors cursor-pointer border whitespace-nowrap',
-                  placementMode === mode ? 'bg-[#4a727e] text-white border-transparent'
-                    : mode.startsWith('add-') ? 'bg-[#edf3f4] text-[#274c56] border-[#9bb6bd] hover:bg-[#dce9ec]'
-                      : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50',
-                )}
-              >
-                {label}
+        {editing && (
+          <div className="absolute left-2 top-2 z-10 flex max-w-[calc(100%-90px)] flex-wrap gap-1">
+            {placementButtons
+              .filter(({ mode }) => mode.startsWith('add-') || mode === `move-${deploymentSelection}`)
+              .map(({ mode, label, title }) => (
+                <button key={mode} id={`btn-${mode}`} type="button" title={title}
+                  aria-pressed={placementMode === mode} className="studio-tool"
+                  onClick={() => setPlacementMode(placementMode === mode ? 'none' : mode)}>
+                  {label}
+                </button>
+              ))}
+            {deploymentSelection === 'rx' && (
+              <button id="btn-draw-3d-mobility-path" type="button" aria-pressed={drawingTrajectory}
+                className="studio-tool" onClick={() => {
+                  setPlacementMode('none');
+                  setPathDrawingMode(!drawingTrajectory);
+                }}>
+                {drawingTrajectory ? t('Finish route', '结束绘制') : t('Draw route', '绘制轨迹')}
               </button>
-            ))}
-
+            )}
             {placementMode !== 'none' && (
-              <button
-                id="btn-finish-placement"
-                type="button"
-                onClick={() => setPlacementMode('none')}
-                className="px-2.5 py-1.5 text-[12px] font-bold rounded cursor-pointer border bg-white text-slate-700 border-slate-200 hover:bg-slate-50 whitespace-nowrap"
-              >
+              <button id="btn-finish-placement" type="button" className="studio-tool" onClick={() => setPlacementMode('none')}>
                 {placementMode.startsWith('add-') ? t('Done', '完成') : t('Cancel', '取消')}
               </button>
             )}
-
-            <button
-              id="btn-export-scene-screenshot"
-              type="button"
-              title={t('Download the current 3D scene view as a full-resolution PNG', '将当前三维场景保存为原分辨率 PNG')}
-              onClick={() => captureScreenshotRef.current?.()}
-              disabled={screenshotStatus === 'saving'}
-              className={cn(
-                "px-3.5 py-1.5 text-[12px] font-bold rounded flex items-center gap-1.5 transition-all shadow-sm cursor-pointer border",
-                screenshotStatus === 'error'
-                  ? "bg-red-50 text-red-700 border-red-300"
-                  : screenshotStatus === 'saved'
-                    ? "bg-emerald-50 text-emerald-700 border-emerald-300"
-                    : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50 hover:text-slate-900",
-              )}
-            >
-              <Camera className="w-3.5 h-3.5" />
-              {screenshotStatus === 'saving'
-                ? t('Saving…', '正在保存…')
-                : screenshotStatus === 'saved'
-                  ? t('PNG Saved', '已保存 PNG')
-                  : screenshotStatus === 'error'
-                    ? t('Capture Failed', '截图失败')
-                    : t('Screenshot', '截图')}
-            </button>
-
-            {editing && (
-              <>
-                <button
-                  id="btn-draw-3d-mobility-path"
-                  title={t('Click ground or rooftops in the 3D scene to add receiver trajectory waypoints', '点击场景中的地面或屋顶以添加接收终端轨迹点')}
-                  onClick={() => {
-                    setPlacementMode('none');
-                    setPathDrawingMode(!drawingTrajectory);
-                  }}
-                  aria-pressed={drawingTrajectory}
-                  className={cn(
-                    "px-3.5 py-1.5 text-[12px] font-bold rounded flex items-center gap-1.5  transition-all shadow-sm cursor-pointer border",
-                    drawingTrajectory
-                      ? "bg-[#5f7f5a] text-white border-transparent scale-95"
-                      : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50 hover:text-slate-900"
-                  )}
-                >
-                  {t('Draw Path', '绘制轨迹')}
-                </button>
-                <button
-                  id="btn-undo-3d-mobility-path"
-                  title={t('Remove the last receiver trajectory waypoint', '移除最后一个轨迹点')}
-                  onClick={() => setTrajectoryPoints(trajectoryPoints.slice(0, -1))}
-                  disabled={trajectoryPoints.length === 0}
-                  className="px-3.5 py-1.5 text-[12px] font-bold rounded transition shadow-sm cursor-pointer border bg-white text-slate-700 border-slate-200 hover:bg-slate-50 disabled:text-slate-300 disabled:bg-slate-100"
-                >
-                  {t('Undo', '撤销')}
-                </button>
-                <button
-                  id="btn-clear-3d-mobility-path"
-                  title={t('Clear receiver trajectory waypoints', '清除所有轨迹点')}
-                  onClick={() => setTrajectoryPoints([])}
-                  disabled={trajectoryPoints.length === 0}
-                  className="px-3.5 py-1.5 text-[12px] font-bold rounded transition shadow-sm cursor-pointer border bg-white text-slate-700 border-slate-200 hover:bg-slate-50 disabled:text-slate-300 disabled:bg-slate-100"
-                >
-                  {t('Clear', '清除')}
-                </button>
-              </>
+            {drawingTrajectory && (
+              <button id="btn-undo-3d-mobility-path" type="button" className="studio-tool"
+                disabled={trajectoryPoints.length === 0} onClick={() => setTrajectoryPoints(trajectoryPoints.slice(0, -1))}>
+                {t('Undo point', '撤销轨迹点')}
+              </button>
             )}
           </div>
+        )}
 
-          {/* Aesthetic Controls */}
-          <div className="flex items-center gap-1">
-            <button
-              title={t('Blueprint outlines toggle', '切换轮廓线显示')}
-              onClick={() => setShowOutlines(!showOutlines)}
-              className={cn(
-                "p-1.5 border hover:text-slate-900 hover:bg-slate-50 rounded duration-150 cursor-pointer text-[12px] font-bold ",
-                showOutlines ? "border-[#cc785c]/40 bg-[#cc785c]/10 text-[#cc785c]" : "border-slate-200 bg-white text-slate-600"
-              )}
-            >
+        <details className="absolute right-2 top-2 z-10">
+          <summary className="studio-tool list-none" aria-label={t('Viewport settings', '视图设置')}>
+            <Eye aria-hidden="true" className="h-4 w-4" />
+            {t('View', '视图')}
+            <ChevronDown aria-hidden="true" className="h-3 w-3" />
+          </summary>
+          <div className="panel absolute right-0 mt-1 w-48 space-y-0.5 p-1.5 text-sm shadow-md">
+            {sceneEditor ? (
+              <>
+                <label className={viewButton}>
+                  <input type="checkbox" checked={sceneEditor.top} onChange={event => sceneEditor.setTop(event.target.checked)} />
+                  {t('Top view', '俯视')}
+                </label>
+                <label className={viewButton}>
+                  <input type="checkbox" checked={showDevices} onChange={onToggleSceneDevices} />
+                  {t('Reference AP/UE', '参考 AP / UE')}
+                </label>
+              </>
+            ) : (
+              <label className={viewButton}>
+                <input id="btn-camera-mode" type="checkbox" checked={cameraMode === 'lockTx'}
+                  onChange={event => setCameraMode(event.target.checked ? 'lockTx' : 'orbit')} />
+                {t('Follow selected AP', '跟踪所选 AP')}
+              </label>
+            )}
+            <label className={viewButton}>
+              <input type="checkbox" checked={showOutlines} onChange={event => setShowOutlines(event.target.checked)} />
               {t('Outlines', '轮廓线')}
+            </label>
+            <label className={viewButton}>
+              <input type="checkbox" checked={performanceMode === 'high'}
+                onChange={event => setPerformanceMode(event.target.checked ? 'high' : 'eco')} />
+              {t('High quality', '高画质')}
+            </label>
+            <button id="btn-export-scene-screenshot" type="button" className={viewButton}
+              onClick={() => captureScreenshotRef.current?.()} disabled={canvasState !== 'active' || screenshotStatus === 'saving'}>
+              <Camera aria-hidden="true" className="h-4 w-4" />
+              {screenshotStatus === 'saving' ? t('Saving…', '正在保存…')
+                : screenshotStatus === 'saved' ? t('PNG saved', '已保存 PNG')
+                : screenshotStatus === 'error' ? t('Screenshot failed', '截图失败')
+                : t('Save screenshot', '保存截图')}
             </button>
-
-            <button
-              type="button"
-              id="btn-camera-mode"
-              aria-pressed={cameraMode === 'lockTx'}
-              title={cameraMode === 'lockTx'
-                ? t('Restore the previous free view', '恢复跟踪前的自由视角')
-                : t('Track the selected transmitter', '跟踪所选发射端')}
-              onClick={() => setCameraMode(mode => mode === 'orbit' ? 'lockTx' : 'orbit')}
-              className={cn(
-                "p-1.5 border hover:text-slate-900 hover:bg-slate-50 rounded duration-150 cursor-pointer flex items-center gap-1 text-[12px] font-bold ",
-                cameraMode === 'lockTx' ? "border-[#cc785c]/40 bg-[#cc785c]/10 text-[#cc785c]" : "border-slate-200 bg-white text-slate-600"
-              )}
-            >
-              <Compass className={cn("w-3.5 h-3.5", cameraMode === 'lockTx' && "animate-spin")} />
-              {cameraMode === 'lockTx' ? t('Target: TX', '跟踪发射端') : t('Free Camera', '自由视角')}
-            </button>
-
-            <button
-              title={t('Performance profiling settings toggler', '切换渲染性能模式')}
-              onClick={() => setPerformanceMode(performanceMode === 'high' ? 'eco' : 'high')}
-              className="p-1.5 border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 hover:text-slate-900 rounded cursor-pointer shadow-sm text-[12px] font-bold"
-            >
-              {performanceMode === 'high' ? t('🔋 High', '🔋 高画质') : t('🔋 Eco', '🔋 节能')}
-            </button>
+            {canvasState === 'active' && <p className="readout px-2 py-1 text-xs text-[var(--text-mid)]">WebGL · {fps} FPS</p>}
           </div>
-        </div>
+        </details>
 
-        {/* Tiny live frame stats tag */}
-        <div className="absolute top-4 right-4 bg-white/95 border border-slate-200 backdrop-blur-md rounded px-2.5 py-1 text-[12px] text-slate-600 font-mono shadow-sm flex items-center gap-1.5 z-10 select-none">
-          <Activity className="w-3 h-3 text-[#5f7f5a]" />
-          <span>{fps} FPS</span>
-          <span className="text-slate-400">|</span>
-          <span>{t('WebMesh', '网格渲染')}</span>
+        <div className="pointer-events-none absolute bottom-2 left-2 z-10 flex max-w-[85%] flex-col items-start gap-1 text-xs">
+          {(placementHint || drawingTrajectory) && (
+            <p role="status" className="rounded border border-[var(--line)] bg-white/95 px-2 py-1 font-semibold">
+              {placementHint || t('Click to add a waypoint. Esc ends drawing.', '点击添加轨迹点，按 Esc 结束绘制。')}
+            </p>
+          )}
+          {canvasState !== 'active' && (
+            <p role="status" className="rounded bg-white/95 px-2 py-1">
+              WebGL · {canvasState === 'unavailable' ? t('Unavailable', '不可用') : t('Starting', '正在启动')}
+            </p>
+          )}
+          {coordinates && <p className="rounded bg-white/90 px-2 py-0.5 text-[var(--text-mid)]">{coordinates}</p>}
         </div>
       </div>
     </div>

@@ -1,8 +1,8 @@
 # Sionna RT Studio
 
-使用 NVIDIA Sionna RT 做交互式无线传播仿真。四个工作区覆盖场景配置、AP 与 UE 规划、CSI 预览和数据导出。界面支持中文和英文，并提供 Windows x64 和 Apple Silicon macOS 桌面版。
+使用 NVIDIA Sionna RT 做交互式无线传播仿真。底栏提供场景、部署、仿真和导出四个工作区。界面支持中文和英文，并提供 Windows x64 和 Apple Silicon macOS 桌面版。
 
-An interactive wireless propagation studio built on NVIDIA Sionna RT. Four workspaces cover scene setup, device planning, CSI preview, and export. The bilingual desktop app supports Windows x64 and Apple Silicon Macs.
+An interactive wireless propagation studio built on NVIDIA Sionna RT. The bottom bar opens the Scene, Deployment, Simulation, and Export workspaces. The bilingual desktop app supports Windows x64 and Apple Silicon Macs.
 
 ## 安装与运行 · Setup
 
@@ -48,17 +48,17 @@ The app opens in its own window and stops its local service when it quits. Keep 
 
 ## 四个工作区 · Four workspaces
 
-1. **场景**选择内置场景或导入 OSM 建筑，设置载频、系统带宽、传播机制和 CSI 子载波网格。默认的 100 MHz 系统带宽与 1024 × 30 kHz 的 CSI 网格分别设置。
-2. **规划**使用三维工具栏新增和移动 AP、UE。选中 AP 可设置阵列、功率、波束方向和前传容量。选中 UE 后用「绘制轨迹」添加控制点，并设置速度和采样间隔。
-3. **预览**计算静态全链路或所选 UE 轨迹。计算前可查看采样时刻、收发端口和完整 CFR 的预计大小。大规模阵列或较长轨迹可选「仅 CIR」，保留阵列与时频网格。
-4. **导出**下载本次预览的 CSI ZIP。切换工作区后仍可查看本次运行。更改传播输入后，在预览页重新计算。
+1. **场景**从内置街区、空白场景、OSM 地图或网格开始。在对象列表或三维视图选中对象来编辑几何和材质，用「求解检查」查看实际参与求解的网格。
+2. **部署**使用三维工具栏放置和移动 AP、UE。选中 AP 可设置阵列、功率、波束方向和前传容量。选中 UE 后用「绘制轨迹」添加控制点。
+3. **仿真**配置共享无线参数，运行 CSI、覆盖或链路诊断并在同页查看结果。CSI 可计算静态全链路或单 UE 轨迹。计算前可查看采样时刻数、收发端口和 CFR 的预计大小。大规模阵列或较长轨迹可选「仅 CIR」。
+4. **导出**下载本次仿真的 CSI ZIP 和场景复现文件。更改传播输入后，从仿真页重新计算。用顶部「项目」菜单打开或保存可编辑的项目文件。
 
-1. **Scene** opens the built-in scene or imports OSM buildings. Set the carrier, system bandwidth, propagation mechanisms, and CSI subcarrier grid. The default system bandwidth is 100 MHz, and the CSI grid uses 1024 subcarriers spaced at 30 kHz.
-2. **Planning** places and moves APs and UEs. Select an AP to edit its array, power, orientation, and fronthaul capacity. Select a UE to draw its trajectory and set the speed and sampling interval.
-3. **Preview** solves all static links or one selected UE's trajectory. Check the number of time samples and antenna ports and the estimated full CFR size before running. Choose CIR only for large arrays or long trajectories to retain the array and sampling grid.
-4. **Export** saves the CSI ZIP from the Preview run. You can revisit a run after switching workspaces. Recompute in Preview after changing propagation inputs.
+1. **Scene** opens a built-in or blank scene or imports OSM or mesh data. Select geometry in the object list or 3D view to edit it. Solver Check shows the meshes used by the solver.
+2. **Deployment** places and moves APs and UEs. Select an AP to edit its array, power, orientation, and fronthaul capacity. Select a UE to draw its route.
+3. **Simulation** provides shared wireless settings and three tasks for CSI, coverage, and link diagnostics. CSI solves all static links or one selected UE's trajectory. Check the estimated CFR size before running and choose CIR only for large arrays or long routes.
+4. **Export** saves the CSI ZIP from the current simulation and the scene files for reproduction. Recompute in Simulation after changing propagation inputs. Open or save an editable project file from the Project menu.
 
-「场景」支持离线绘制矩形、多边形和墙，也可编辑内置街区和已下载的 OSM 对象。切换「求解网格」可查看 Sionna RT 实际使用的三角形及对象、材质来源和导入问题。PLY、OBJ 和带引用网格的 Mitsuba ZIP 可以先检查尺度、坐标轴和材质，再导入并随项目保存。顶部的求解状态与 3D 画布的 WebGL 状态分开。
+「场景」支持离线绘制矩形、多边形和墙，也可编辑内置街区和已下载的 OSM 对象。「求解检查」可查看 Sionna RT 实际使用的三角形和导入问题。PLY、OBJ 和带引用网格的 Mitsuba ZIP 可以先检查尺度、坐标轴和材质，再导入并随项目保存。顶部的求解状态与 3D 画布的 WebGL 状态分开。
 
 Use Scene to draw rectangles, polygons, and walls offline, or edit the built-in street scene and imported OSM objects. Solver mesh displays the triangles used by Sionna RT along with object participation, material provenance, and import issues. Review the scale, axes, and material of PLY, OBJ, and Mitsuba ZIP imports before embedding them in the project. The solver and the WebGL canvas report their status separately.
 
@@ -72,9 +72,9 @@ ZIP 包含 `csi.npz` 和 `manifest.json`。复数 `h_freq` 的轴顺序为 `[时
 
 The ZIP contains `csi.npz` and `manifest.json`. Complex `h_freq` uses the axis order `[time, UE, Rx port, AP, Tx port, subcarrier]`. Static runs have one time sample, and trajectory runs have one UE. The manifest records device IDs, actual sample times and positions, the baseband frequency axis, delay reference, and solver settings. AP fronthaul capacities are exported in Mb/s under `fronthaulMbpsByTxId`, with `null` for an unspecified capacity. The same CSI can be exported with revised fronthaul metadata.
 
-默认将每条链路的时延以该链路首径为参考。需要保留 AP 间传播时延差时，可在「场景」中选择绝对时延后计算。
+默认将每条链路的时延以该链路首径为参考。需要保留 AP 间传播时延差时，可在「仿真」的 CSI「频率网格与时延」中选择绝对时延后计算。系统带宽和 CSI 网格分别配置，默认值为 100 MHz 与 1024 × 30 kHz。
 
-By default, each link uses its own first arrival as the delay reference. To preserve relative propagation delays across APs, select absolute delays in Scene before running CSI.
+By default, each link uses its own first arrival as the delay reference. To preserve relative propagation delays across APs, select absolute delays in the CSI frequency grid settings before running. System bandwidth and the CSI grid are configured separately and default to 100 MHz and 1024 × 30 kHz.
 
 「CIR + CFR」保存路径数据与完整 `h_freq`。「仅 CIR」保存每条路径的复系数 `a`、时延 `tau_geometric`、有效路径掩码 `valid_paths` 和频率轴。清单中的 `output` 分别为 `cir_cfr` 或 `cir`，`shape` 在两种模式下都描述完整 CFR 的形状。仅 CIR 模式的大小取决于求解找到的路径数。两种模式分别以 256 MiB 和 512 MiB 为上限，按实际要保存的未压缩信道数组估算。
 

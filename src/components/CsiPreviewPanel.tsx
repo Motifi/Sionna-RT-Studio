@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { ArrowRight, Loader2, Pause, Play, Waves } from 'lucide-react';
 import type { CsiLinkPreview, CsiRun, CsiRunMode, CsiRunOutput, CsiSelection } from '../api';
 import { useI18n } from '../i18n';
@@ -7,11 +7,16 @@ import { CIR_SIZE_LIMIT, FULL_CSI_SIZE_LIMIT, formatCsiBytes, type CsiSizeEstima
 interface CsiPreviewPanelProps {
   run: CsiRun | null;
   stale: boolean;
+  expired?: boolean;
   running: CsiRunMode | null;
   error: string;
   staticDisabledReason?: string;
   trajectoryDisabledReason?: string;
   trajectoryReceiverName?: string;
+  trajectoryReceiver?: ReactNode;
+  gridControls?: ReactNode;
+  trajectoryControls?: ReactNode;
+  mixedArrays?: Record<CsiRunMode, boolean>;
   staticEstimate: CsiSizeEstimate | null;
   trajectoryEstimate: CsiSizeEstimate | null;
   output: CsiRunOutput;
@@ -23,6 +28,9 @@ interface CsiPreviewPanelProps {
   linkLoading: boolean;
   linkError?: string;
   onOpenExport?: () => void;
+  onOpenDiagnostics?: () => void;
+  onOpenTrajectory?: () => void;
+  active?: boolean;
 }
 
 function FrequencyResponse({ link }: { link: CsiLinkPreview }) {
@@ -74,16 +82,30 @@ function FrequencyResponse({ link }: { link: CsiLinkPreview }) {
 }
 
 export function CsiPreviewPanel({
-  run, stale, running, error, staticDisabledReason, trajectoryDisabledReason, trajectoryReceiverName,
+  run, stale, expired, running, error, staticDisabledReason, trajectoryDisabledReason, trajectoryReceiverName,
+  trajectoryReceiver, gridControls, trajectoryControls, mixedArrays,
   staticEstimate, trajectoryEstimate, output, onOutputChange,
-  onRun, selection, onSelect, link, linkLoading, linkError, onOpenExport,
+  onRun, selection, onSelect, link, linkLoading, linkError, onOpenExport, onOpenDiagnostics, onOpenTrajectory, active = true,
 }: CsiPreviewPanelProps) {
   const { t } = useI18n();
+  const [mode, setMode] = useState<CsiRunMode>('static');
   const [playingRunId, setPlayingRunId] = useState<string | null>(null);
   const sampleIndex = selection?.sampleIndex ?? 0;
   const sampleCount = run?.timeSeconds.length ?? 0;
-  const canPlay = !stale && !running && run?.mode === 'trajectory' && !!selection && sampleCount > 1;
+  const unavailable = stale || expired;
+  const resultDisabled = unavailable || !!running;
+  const canPlay = active && !resultDisabled && run?.mode === 'trajectory' && !!selection && sampleCount > 1;
   const playing = canPlay && playingRunId === run.runId && sampleIndex < sampleCount - 1;
+  const isTrajectory = mode === 'trajectory';
+  const estimate = isTrajectory ? trajectoryEstimate : staticEstimate;
+  const disabledReason = isTrajectory ? trajectoryDisabledReason : staticDisabledReason;
+  const estimateId = `csi-size-estimate-${mode}`;
+  const disabledReasonId = `csi-run-disabled-${mode}`;
+  const runDescription = [estimate && estimateId, disabledReason && disabledReasonId].filter(Boolean).join(' ');
+
+  useEffect(() => {
+    if (!canPlay) setPlayingRunId(null);
+  }, [canPlay]);
 
   useEffect(() => {
     if (!playing || !run || !selection) return;
@@ -112,14 +134,47 @@ export function CsiPreviewPanel({
   const hasMatrix = !!run && !!selection;
 
   return (
-    <section id="csi-preview-panel" className="panel flex flex-col gap-4 p-4">
+    <section id="csi-preview-panel" className="panel flex min-w-0 flex-col gap-3 p-4">
       <div className="flex items-center gap-2">
-        <Waves size={17} className="text-[var(--accent)]" aria-hidden="true" />
-        <h3 className="panel-title">{t('Channel preview', '信道预览')}</h3>
+        <Waves size={16} className="text-[var(--accent)]" aria-hidden="true" />
+        <h3 className="panel-title">{t('CSI simulation', 'CSI 仿真')}</h3>
       </div>
-      <div className="grid gap-1 rounded border border-[var(--line)] bg-[#f5f3ec] p-2.5">
+
+      <div role="group" aria-label={t('CSI run mode', 'CSI 仿真模式')}
+        className="grid grid-cols-2 gap-1 rounded-md border border-[var(--line)] bg-[var(--ink-750)] p-1">
+        {([
+          ['static', t('Static links', '静态链路')],
+          ['trajectory', t('UE trajectory', 'UE 轨迹')],
+        ] as const).map(([value, label]) => (
+          <button
+            key={value}
+            id={`btn-csi-mode-${value}`}
+            type="button"
+            aria-pressed={mode === value}
+            onClick={() => {
+              setMode(value);
+              setPlayingRunId(null);
+            }}
+            className={`rounded border px-2 py-1.5 text-xs font-semibold transition cursor-pointer ${
+              mode === value
+                ? 'border-[var(--line)] bg-white text-slate-900'
+                : 'border-transparent text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {isTrajectory && (trajectoryReceiver || (trajectoryReceiverName && (
+        <p className="text-xs text-slate-700">{t(`Moving UE · ${trajectoryReceiverName}`, `移动 UE · ${trajectoryReceiverName}`)}</p>
+      )))}
+      {gridControls}
+      {isTrajectory && trajectoryControls}
+
+      <div className="grid gap-1">
         <label htmlFor="select-csi-output" className="text-xs font-semibold text-slate-800">
-          {t('Data to save for the next run', '下次计算保存的数据')}
+          {t('Data to save', '保存的数据')}
         </label>
         <select
           id="select-csi-output"
@@ -127,79 +182,81 @@ export function CsiPreviewPanel({
           disabled={!!running}
           aria-describedby="csi-output-hint"
           onChange={event => onOutputChange(event.target.value === 'cir' ? 'cir' : 'cir_cfr')}
-          className="rounded border border-[var(--line)] bg-white px-2 py-1.5 text-sm"
+          className="w-full min-w-0 rounded border border-[var(--line)] bg-white px-2 py-1.5 text-sm"
         >
           <option value="cir_cfr">{t('CIR + full CFR', 'CIR + 完整 CFR')}</option>
           <option value="cir">{t('CIR only (reconstruct CFR as needed)', '仅 CIR（按需重建 CFR）')}</option>
         </select>
-        <p id="csi-output-hint" className="text-[11px] text-slate-600">
+        <p id="csi-output-hint" className="text-[11px] leading-normal text-slate-600">
           {t(
-            `Uncompressed limits per run · CIR + full CFR ${formatCsiBytes(FULL_CSI_SIZE_LIMIT)} · CIR only ${formatCsiBytes(CIR_SIZE_LIMIT)}. CIR size depends on the path count after tracing.`,
-            `每次计算的未压缩数组上限 · CIR + 完整 CFR ${formatCsiBytes(FULL_CSI_SIZE_LIMIT)} · 仅 CIR ${formatCsiBytes(CIR_SIZE_LIMIT)}。CIR 大小取决于追踪得到的路径数。`,
+            `Uncompressed limits · CIR + CFR ${formatCsiBytes(FULL_CSI_SIZE_LIMIT)} · CIR only ${formatCsiBytes(CIR_SIZE_LIMIT)}`,
+            `未压缩数据上限 · CIR + CFR ${formatCsiBytes(FULL_CSI_SIZE_LIMIT)} · 仅 CIR ${formatCsiBytes(CIR_SIZE_LIMIT)}`,
           )}
         </p>
       </div>
       <div className="grid gap-2">
-        {([
-          ['static', t('Solve all static links', '计算静态全链路'), staticDisabledReason, staticEstimate],
-          ['trajectory', t('Solve selected UE trajectory', '计算所选 UE 轨迹'), trajectoryDisabledReason, trajectoryEstimate],
-        ] as const).map(([mode, label, disabledReason, estimate]) => (
-          <div key={mode}>
-            {estimate && (
-              <div id={`csi-size-estimate-${mode}`} className="mb-1.5 space-y-0.5 text-[11px] leading-normal text-slate-600">
-                <p>
-                  <span className="readout font-semibold text-slate-800">
-                    CFR [{estimate.shape.join(' × ')}] · {formatCsiBytes(estimate.cfrBytes)}
-                  </span>{' '}
-                  {output === 'cir' ? t('if full CFR were stored', '如保存完整 CFR') : t('uncompressed', '未压缩')}
-                </p>
-                <p>{t('Time · UE · Rx port · AP · Tx port · subcarrier', '时刻 · UE · Rx 端口 · AP · Tx 端口 · 子载波')}</p>
-                <p>{t(
-                  `CIR adds ${formatCsiBytes(estimate.cirBytesPerPath)} per slot on the path axis.`,
-                  `CIR 路径维每增加 1，数据量增加 ${formatCsiBytes(estimate.cirBytesPerPath)}。`,
-                )}</p>
-              </div>
-            )}
-            <button
-              id={`btn-run-csi-${mode}`}
-              type="button"
-              onClick={() => { setPlayingRunId(null); onRun(mode); }}
-              disabled={!!running || !!disabledReason}
-              aria-describedby={estimate ? `csi-size-estimate-${mode}` : undefined}
-              className="flex w-full items-center justify-center gap-2 rounded border border-[var(--line)] bg-[#ebe7dc] px-3 py-2 text-sm font-semibold text-slate-900 transition hover:border-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-55"
-            >
-              {running === mode && <Loader2 size={15} className="animate-spin" aria-hidden="true" />}
-              {running === mode ? t('Tracing channels…', '正在追踪信道…') : label}
-            </button>
-            {(disabledReason || (mode === 'trajectory' && trajectoryReceiverName)) && (
-              <p className="mt-1 text-[11px] text-slate-600">
-                {disabledReason || t(`Moving UE · ${trajectoryReceiverName}`, `移动 UE · ${trajectoryReceiverName}`)}
-              </p>
-            )}
+        {estimate && (
+          <div id={estimateId} className="space-y-0.5 rounded border border-[var(--line)] bg-[var(--ink-750)] px-2.5 py-2 text-[11px] leading-normal text-slate-600">
+            <p>
+              <span className="readout font-semibold text-slate-800">
+                CFR [{estimate.shape.join(' × ')}] · {formatCsiBytes(estimate.cfrBytes)}
+              </span>{' '}
+              {output === 'cir' ? t('if stored', '如保存 CFR') : t('uncompressed', '未压缩')}
+            </p>
+            <p>{t('Time × UE × Rx port × AP × Tx port × subcarrier', '时刻 × UE × Rx 端口 × AP × Tx 端口 × 子载波')}</p>
+            <p>{t(
+              `CIR adds ${formatCsiBytes(estimate.cirBytesPerPath)} per slot on the path axis.`,
+              `CIR 路径维每增加 1，数据量增加 ${formatCsiBytes(estimate.cirBytesPerPath)}。`,
+            )}</p>
           </div>
-        ))}
+        )}
+        <button
+          id={`btn-run-csi-${mode}`}
+          type="button"
+          onClick={() => { setPlayingRunId(null); onRun(mode); }}
+          disabled={!!running || !!disabledReason}
+          aria-describedby={runDescription || undefined}
+          className="btn-signal flex w-full items-center justify-center gap-2 px-3 py-2 text-sm cursor-pointer disabled:cursor-not-allowed"
+        >
+          {running && <Loader2 size={15} className="animate-spin" aria-hidden="true" />}
+          {running
+            ? running === 'trajectory' ? t('Tracing UE trajectory…', '正在追踪 UE 轨迹…') : t('Tracing static links…', '正在追踪静态链路…')
+            : isTrajectory ? t('Run trajectory CSI', '计算轨迹 CSI') : t('Run static CSI', '计算静态 CSI')}
+        </button>
+        {disabledReason && (
+          <p id={disabledReasonId} className="text-xs leading-normal text-slate-600">{disabledReason}</p>
+        )}
+        {disabledReason && mixedArrays?.[mode] && onOpenDiagnostics && (
+          <button id="btn-open-csi-diagnostics" type="button" onClick={onOpenDiagnostics}
+            className="flex w-fit items-center gap-1 text-xs font-semibold text-[var(--accent-deep)] hover:underline cursor-pointer">
+            {t('Open link diagnostics', '打开链路诊断')} <ArrowRight size={14} aria-hidden="true" />
+          </button>
+        )}
+        {isTrajectory && onOpenTrajectory && (
+          <button id="btn-open-csi-trajectory" type="button" onClick={onOpenTrajectory}
+            className="flex w-fit items-center gap-1 text-xs font-semibold text-[var(--accent-deep)] hover:underline cursor-pointer">
+            {t('Draw a trajectory for this UE', '为这个 UE 绘制轨迹')} <ArrowRight size={14} aria-hidden="true" />
+          </button>
+        )}
       </div>
 
       {error && <p role="alert" className="rounded border border-red-200 bg-red-50 p-2 text-xs text-red-700">{error}</p>}
-      {stale && (
-        <p role="status" className="rounded border border-amber-200 bg-amber-50 p-2 text-xs text-amber-800">
-          {t('Inputs have changed. Run the preview again to update CSI.', '输入已变化。请重新计算预览以更新 CSI。')}
-        </p>
-      )}
-      {!run && !running && !error && (
-        <p className="text-xs leading-relaxed text-slate-600">
-          {t('Run a solve to inspect rays, received power, and frequency response.', '运行求解后可查看射线、接收功率和频率响应。')}
-        </p>
-      )}
 
       {hasMatrix && (
         <>
           <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-1 border-t border-[var(--line)] pt-3">
-            <span className="text-sm font-semibold text-slate-900">{run.mode === 'static' ? t('Static result', '静态结果') : t('Trajectory result', '轨迹结果')}</span>
-            <span className="text-[11px] text-slate-600">{run.txIds.length} AP · {run.rxIds.length} UE · {t(`${sampleCount} samples`, `${sampleCount} 个时刻`)}</span>
+            <h4 className="text-sm font-semibold text-slate-900">{run.mode === 'static' ? t('Static CSI result', '静态 CSI 结果') : t('Trajectory CSI result', '轨迹 CSI 结果')}</h4>
+            <span className="text-[11px] text-slate-600">{run.txIds.length} AP · {run.rxIds.length} UE</span>
           </div>
+          {unavailable && (
+            <p role="status" className="rounded border border-amber-200 bg-amber-50 p-2 text-xs text-amber-700">
+              {expired
+                ? t('This run expired in the solver cache. Run the simulation again to inspect or export its CSI.', '求解器缓存中的此结果已过期。请重新运行仿真以查看链路详情或导出 CSI。')
+                : t('Inputs changed since this run. Run the simulation again to update CSI.', '输入已变化。请重新运行仿真以更新 CSI。')}
+            </p>
+          )}
           <p id="csi-run-output" className="text-[11px] text-slate-600">
-            {run.output === 'cir' ? t('CIR only · CFR preview reconstructed from paths', '仅 CIR · 频域预览由路径重建') : t('CIR + full CFR', 'CIR + 完整 CFR')}
+            {run.output === 'cir' ? t('CIR only · CFR reconstructed from paths', '仅 CIR · CFR 由路径重建') : t('CIR + full CFR', 'CIR + 完整 CFR')}
             {' · '}{formatCsiBytes(run.uncompressedBytes)} {t('uncompressed', '未压缩')}
           </p>
           {run.mode === 'trajectory' && (
@@ -227,7 +284,7 @@ export function CsiPreviewPanel({
                 max={Math.max(0, sampleCount - 1)}
                 value={sampleIndex}
                 onChange={(event) => seek(Number(event.target.value))}
-                disabled={stale || !!running || sampleCount <= 1}
+                disabled={resultDisabled || sampleCount <= 1}
                 className="w-full accent-[var(--accent)]"
               />
             </div>
@@ -236,13 +293,13 @@ export function CsiPreviewPanel({
           <div className="grid grid-cols-2 gap-2">
             <label className="flex min-w-0 flex-col gap-1 text-xs font-semibold text-slate-700">
               AP
-              <select id="select-csi-tx" value={selection.txId} onChange={(event) => onSelect({ ...selection, txId: event.target.value })} disabled={stale || !!running} className="min-w-0 rounded border border-[var(--line)] bg-white px-2 py-1.5 text-sm">
+              <select id="select-csi-tx" value={selection.txId} onChange={(event) => onSelect({ ...selection, txId: event.target.value })} disabled={resultDisabled} className="min-w-0 rounded border border-[var(--line)] bg-white px-2 py-1.5 text-sm">
                 {run.txIds.map((id, index) => <option key={id} value={id}>{run.txNames[index] ?? id}</option>)}
               </select>
             </label>
             <label className="flex min-w-0 flex-col gap-1 text-xs font-semibold text-slate-700">
               UE
-              <select id="select-csi-rx" value={selection.rxId} onChange={(event) => onSelect({ ...selection, rxId: event.target.value })} disabled={stale || !!running} className="min-w-0 rounded border border-[var(--line)] bg-white px-2 py-1.5 text-sm">
+              <select id="select-csi-rx" value={selection.rxId} onChange={(event) => onSelect({ ...selection, rxId: event.target.value })} disabled={resultDisabled} className="min-w-0 rounded border border-[var(--line)] bg-white px-2 py-1.5 text-sm">
                 {run.rxIds.map((id, index) => <option key={id} value={id}>{run.rxNames[index] ?? id}</option>)}
               </select>
             </label>
@@ -269,7 +326,7 @@ export function CsiPreviewPanel({
                             aria-pressed={active}
                             aria-label={`${run.txNames[txIndex] ?? txId} → ${run.rxNames[rxIndex] ?? rxId}`}
                             onClick={() => onSelect({ txId, rxId, sampleIndex })}
-                            disabled={stale || !!running}
+                            disabled={resultDisabled}
                             className={`w-full whitespace-nowrap rounded px-1.5 py-1 readout ${active ? 'bg-[#ebe7dc] font-bold text-slate-900' : 'text-slate-700 hover:bg-[#f5f3ec]'}`}
                           >
                             {paths && power != null ? power.toFixed(1) : '—'}
@@ -283,9 +340,9 @@ export function CsiPreviewPanel({
             </table>
           </div>
 
-          {linkLoading && !stale && <p role="status" className="text-xs text-slate-600">{t('Loading the selected link…', '正在读取所选链路…')}</p>}
-          {linkError && !stale && <p role="alert" className="text-xs text-red-700">{linkError}</p>}
-          {link && !linkLoading && !stale && (
+          {linkLoading && !unavailable && <p role="status" className="text-xs text-slate-600">{t('Loading the selected link…', '正在读取所选链路…')}</p>}
+          {linkError && !unavailable && <p role="alert" className="text-xs text-red-700">{linkError}</p>}
+          {link && !linkLoading && !unavailable && (
             <>
               <div className="flex flex-wrap gap-x-2 gap-y-1 text-xs text-slate-700">
                 <span>{link.metrics.numPaths ? link.metrics.losStatus : t('No resolved path', '无可解析路径')}</span>
@@ -305,7 +362,7 @@ export function CsiPreviewPanel({
               <ul className="mt-1 max-h-36 space-y-1 overflow-y-auto text-xs">
                 {run.handover.events.map((event) => (
                   <li key={`${event.stepIndex}-${event.toTxId}`}>
-                    <button type="button" onClick={() => seek(event.stepIndex)} disabled={stale || !!running} className="w-full rounded border border-[var(--line)] bg-white px-2 py-1 text-left disabled:opacity-50">
+                    <button type="button" onClick={() => seek(event.stepIndex)} disabled={resultDisabled} className="w-full rounded border border-[var(--line)] bg-white px-2 py-1 text-left disabled:opacity-50">
                       <span className="mr-1 readout">{event.timeS.toFixed(3)} s</span>
                       {event.fromTxName} → {event.toTxName}{event.pingPong ? t(' · ping-pong', ' · 乒乓') : ''}
                     </button>
@@ -314,7 +371,7 @@ export function CsiPreviewPanel({
               </ul>
             </details>
           )}
-          {!stale && !running && onOpenExport && (
+          {!resultDisabled && onOpenExport && (
             <button type="button" onClick={onOpenExport} className="flex items-center justify-end gap-1 text-xs font-semibold text-[var(--accent-deep)] hover:underline">
               {t('Go to Export', '前往导出')} <ArrowRight size={14} aria-hidden="true" />
             </button>

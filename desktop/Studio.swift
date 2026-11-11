@@ -510,6 +510,8 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
             };
             const setNumber = async (selector, value) => {
               const input = await waitFor(() => document.querySelector(selector), selector);
+              const details = input.closest('details');
+              if (details) details.open = true;
               input.focus();
               Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, String(value));
               input.dispatchEvent(new Event('input', {bubbles: true}));
@@ -518,12 +520,14 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
               input.blur();
             };
             const select = await waitFor(() => document.querySelector('select[data-studio-language]'));
-            const nav = await waitFor(() => navFor('scene'), 'Scene navigation');
+            await waitFor(() => navFor('scene'), 'Scene navigation');
             const initial = select.value;
             const alternate = initial === 'zh' ? 'en' : 'zh';
-            const labels = {zh: '场景', en: 'Scene'};
+            const pages = ['scene', 'planning', 'preview', 'export'];
+            const labels = {zh: ['场景', '部署', '仿真', '导出'], en: ['Scene', 'Deployment', 'Simulation', 'Export']};
             const waitForLanguage = language => waitFor(() =>
-              document.documentElement.lang.startsWith(language) && nav.textContent.trim().endsWith(labels[language]));
+              document.documentElement.lang.startsWith(language) &&
+              pages.every((id, i) => navFor(id).textContent.trim() === labels[language][i]));
             const setLanguage = value => {
               select.value = value;
               select.dispatchEvent(new Event('change', {bubbles: true}));
@@ -552,8 +556,8 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
             legacy.state.mobility.trajectoryPoints = [0, 2].map(x => ({
               lat: anchor.latitude, lon: anchor.longitude, enu: {x, y: 0, z: 0},
             }));
-            await go('export');
-            const legacyInput = document.querySelector('#export-suite-panel input[type=file]');
+            document.querySelector('#project-menu-trigger').click();
+            const legacyInput = document.querySelector('#input-import-project');
             const transfer = new DataTransfer();
             transfer.items.add(new File([JSON.stringify(legacy)], 'legacy-project.json', {type: 'application/json'}));
             legacyInput.files = transfer.files;
@@ -634,10 +638,12 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
             await setNumber('#input-ap-fronthaul', 25);
             await waitFor(async () => (await savedDevices())?.fronthaulMbpsByTxId[apId] === 25, 'fronthaul 25 Mbps');
 
-            await go('scene');
+            await go('preview');
+            document.querySelector('#simulation-settings-trigger').click();
             const samples = document.querySelector('#select-path-samples');
             samples.value = '10000';
             samples.dispatchEvent(new Event('change', {bubbles: true}));
+            document.querySelector('#simulation-settings-trigger').click();
             await setNumber('#input-csi-subcarriers', 8);
             await waitFor(async () => {
               const state = (await project())?.state;
@@ -655,6 +661,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
               return response;
             };
             const run = async mode => {
+              document.querySelector('#btn-csi-mode-' + mode).click();
               const before = completedRuns.length;
               const button = await waitFor(() => {
                 const button = document.querySelector('#btn-run-csi-' + mode);
@@ -713,7 +720,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
             if (runRequests.length !== 1 || beforeFronthaul.hash !== afterFronthaul.hash) {
               throw new Error('Export or fronthaul edit changed computed CSI');
             }
-            await go('scene');
+            await go('preview');
             await setNumber('#input-csi-subcarriers', 9);
             await waitFor(async () => (await project())?.state.csi.numSubcarriers === 9, 'changed CSI input');
             await go('export');
@@ -721,7 +728,8 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
 
             await go('planning');
             const plannedRx = (await savedDevices()).activeRxId;
-            const draw = document.querySelector('#btn-draw-3d-mobility-path');
+            receivers().find(button => button.dataset.deviceId === plannedRx).click();
+            const draw = await waitFor(() => document.querySelector('#btn-draw-3d-mobility-path'), 'route drawing control');
             draw.click();
             await waitFor(() => draw.getAttribute('aria-pressed') === 'true', 'draw mode');
             clickScene(0.42, 0.68);
@@ -735,13 +743,14 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
             await setNumber('#input-rx-ant-v', 8);
             await waitFor(async () => (await savedDevices())?.receivers.find(rx => rx.id === plannedRx)?.antennaArraySize.join() === '8,8',
               '64-port receiver');
-            await go('scene');
+            await go('preview');
             await setNumber('#input-csi-subcarriers', 256);
             await waitFor(async () => (await project())?.state.csi.numSubcarriers === 256, '256 CSI subcarriers');
             await go('preview');
-            if (document.querySelector('#btn-draw-3d-mobility-path')) throw new Error('Draw controls remained visible in Preview');
+            if (document.querySelector('#btn-draw-3d-mobility-path')) throw new Error('Draw controls remained visible in Simulation');
+            document.querySelector('#btn-csi-mode-trajectory').click();
             const outputSelect = document.querySelector('#select-csi-output');
-            const trajectoryButton = document.querySelector('#btn-run-csi-trajectory');
+            const trajectoryButton = await waitFor(() => document.querySelector('#btn-run-csi-trajectory'), 'trajectory CSI control');
             if (!document.querySelector('#csi-size-estimate-trajectory') || !trajectoryButton.disabled ||
                 outputSelect?.value !== 'cir_cfr' || runRequests.length !== 1) {
               throw new Error('Oversize CFR was not caught before solving');
@@ -816,6 +825,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
                 smokeCsi = fileManager.temporaryDirectory.appendingPathComponent("studio-smoke-\(UUID().uuidString).zip")
                 let export = """
                     document.querySelector('#nav-btn-export').click();
+                    document.querySelector('#project-menu-trigger').closest('details').open = true;
                     for (let attempt = 0; attempt < 40; attempt++) {
                       const project = document.querySelector('#btn-export-project');
                       const csi = document.querySelector('#btn-export-csi-run');
