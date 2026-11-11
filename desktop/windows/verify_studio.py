@@ -280,6 +280,9 @@ def main():
                 origin, folder, trajectory, [0, 1, 2], [[[20, y, 1.5]] for y in positions],
             )
             print("PASS single-UE trajectory CIR and reconstructed response", flush=True)
+            workbench = Path(__file__).resolve().parents[2] / "scripts" / "verify_scene_workbench.py"
+            subprocess.run([sys.executable, "-B", str(workbench), origin, str(folder / "scene-workbench")], check=True)
+            report["results"]["sceneWorkbench"] = "scene-workbench/verification.json"
             report["cudaPassed"] = is_cuda
             require(is_cuda or args.allow_cpu,
                     f"CUDA acceptance requires an NVIDIA-backed solve. Studio used {health['variant']}.")

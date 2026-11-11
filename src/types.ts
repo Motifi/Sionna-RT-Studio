@@ -24,9 +24,22 @@ export interface BuildingFootprint {
   enuPoints: ENUVector[];
   height: number;
   levels?: number;
+  kind?: 'building' | 'wall' | 'mesh';
+  baseZ?: number;
+  source?: 'template' | 'osm' | 'manual' | 'import';
+  heightSource?: 'tag' | 'levels' | 'estimated' | 'manual';
+  materialSource?: 'tag' | 'estimated' | 'manual';
+  rawTags?: Record<string, string>;
+  importIssues?: string[];
+  mesh?: { vertices: number[]; triangles: number[] };
   category: 'building' | 'infrastructure' | 'terrain' | 'water';
   type: string;
   material: string; // e.g., 'itu_concrete', 'itu_glass', 'itu_brick'
+}
+
+export interface SolverRoof {
+  topZ: number;
+  rings: Pick<ENUVector, 'x' | 'y'>[][]; // Exterior followed by any holes.
 }
 
 export interface Transmitter {
@@ -34,7 +47,8 @@ export interface Transmitter {
   name: string;
   latitude: number;
   longitude: number;
-  height: number; // Antenna height above ground/roof in meters
+  height: number; // Meters, relative to ground/roof by default
+  heightReference?: 'roof' | 'enu';
   enu: ENUVector;
   powerDbm: number; // e.g., 30 dBm (1W)
   antennaArraySize: [number, number]; // [horizontal, vertical] e.g. [8, 8] for massive MIMO
@@ -43,6 +57,7 @@ export interface Transmitter {
 }
 
 export interface Receiver {
+  heightReference?: 'roof' | 'enu';
   id: string;
   name: string;
   latitude: number;

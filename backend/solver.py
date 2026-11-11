@@ -27,7 +27,9 @@ from .models import (
     SolverOptions,
     Transmitter,
 )
-from .scene_build import build_scene
+from .runtime_env import trace_paths_for_runtime
+from .scene_build import build_compiled_scene, build_scene, building_roofs, compile_scene, inspect_scene
+from .solver_runtime import solver_runtime
 
 # Sionna InteractionType codes (sionna.rt.constants.InteractionType).
 _INTERACTION_NAMES = {1: "specular", 2: "diffuse", 4: "refraction", 8: "diffraction"}
@@ -39,6 +41,9 @@ MAX_DEPTH = 3
 # bounded by the chunk — this cap guards total runtime and output size. Keep in
 # sync with CHANNEL_GRID_MAX_CELLS in src/components/ExportPanel.tsx.
 MAX_CHANNEL_GRID_CELLS = 16384
+# Coverage returns one JSON object per cell and allocates metrics per Tx × cell.
+MAX_RADIO_MAP_CELLS = 250_000
+MAX_RADIO_MAP_TX_CELLS = 1_000_000
 
 
 @dataclass
@@ -192,35 +197,33 @@ def _place_tx(scene, name: str, pos: list[float], beam: list[float] | None,
 
 def _trace_paths(scene, max_depth: int, opts: SolverOptions | None):
     """Run PathSolver on the scene with the request's interaction switches."""
-    from sionna.rt import PathSolver
-
     opts = opts or SolverOptions()
-    return PathSolver()(scene, max_depth=int(max(0, max_depth)),
-                        samples_per_src=int(opts.pathSamplesPerSource),
-                        seed=int(opts.pathSeed),
-                        los=opts.los,
-                        specular_reflection=opts.specularReflection,
-                        diffuse_reflection=opts.diffuseReflection,
-                        refraction=opts.refraction,
-                        diffraction=opts.diffraction,
-                        edge_diffraction=opts.edgeDiffraction,
-                        synthetic_array=True)
+    return trace_paths_for_runtime(
+        scene,
+        max_depth=int(max(0, max_depth)),
+        samples_per_src=int(opts.pathSamplesPerSource),
+        seed=int(opts.pathSeed),
+        los=opts.los,
+        specular_reflection=opts.specularReflection,
+        diffuse_reflection=opts.diffuseReflection,
+        refraction=opts.refraction,
+        diffraction=opts.diffraction,
+        edge_diffraction=opts.edgeDiffraction,
+        synthetic_array=True,
+    )
 
 
-def _device_z(enu: ENUVector, height: float, buildings: list[BuildingFootprint]) -> float:
-    """Antenna height; if the device sits over a building footprint, it's on the roof."""
-    from shapely.geometry import Point, Polygon
+def _device_z(enu: ENUVector, height: float, buildings: list[BuildingFootprint], reference: str = "roof") -> float:
+    """Resolve absolute ENU height or the legacy height above ground/roof."""
+    if reference == "enu":
+        return float(height)
+    from shapely.geometry import Point
 
     pt = Point(enu.x, enu.y)
     roof = 0.0
-    for b in buildings:
-        if b.category != "building" or len(b.enuPoints) < 3:
-            continue
-        try:
-            if Polygon([(p.x, p.y) for p in b.enuPoints]).contains(pt):
-                roof = max(roof, float(b.height))
-        except Exception:
-            continue
+    for polygon, top in building_roofs(buildings):
+        if top > roof and polygon.contains(pt):
+            roof = top
     return roof + float(height)
 
 
@@ -531,9 +534,9 @@ def _solve_batched(
 def solve_link(req: SolveRequest) -> tuple[list[PropagationPath], ChannelMetrics]:
     scene = build_scene(req.buildings, req.freqGhz, req.materials)
     tx_pos = [float(req.tx.enu.x), float(req.tx.enu.y),
-              _device_z(req.tx.enu, req.tx.height, req.buildings)]
+              _device_z(req.tx.enu, req.tx.height, req.buildings, req.tx.heightReference)]
     rx_pos = [float(req.rx.enu.x), float(req.rx.enu.y),
-              _device_z(req.rx.enu, req.rx.height, req.buildings)]
+              _device_z(req.rx.enu, req.rx.height, req.buildings, req.rx.heightReference)]
     n_tx_ant = _set_tx_array(scene, req.tx.antennaArraySize, req.options)
     _set_rx_array(scene, req.rx.antennaArraySize, req.options)
     beam = _beam_target(tx_pos, req.tx.beamsteeringAzimuth, req.tx.beamsteeringElevation)
@@ -615,12 +618,12 @@ def solve_cir(req) -> dict:
     scene = build_scene(req.buildings, req.freqGhz, getattr(req, "materials", None))
     tx_positions = np.asarray([
         [float(tx.enu.x), float(tx.enu.y),
-         _device_z(tx.enu, tx.height, req.buildings)]
+         _device_z(tx.enu, tx.height, req.buildings, tx.heightReference)]
         for tx in txs
     ], dtype=float)
     rx_positions = np.asarray([
         [float(rx.enu.x), float(rx.enu.y),
-         _device_z(rx.enu, rx.height, req.buildings)]
+         _device_z(rx.enu, rx.height, req.buildings, rx.heightReference)]
         for rx in rxs
     ], dtype=float)
     n_tx_ant = _set_tx_array(scene, tx_size, req.options)
@@ -661,6 +664,11 @@ def solve_cir(req) -> dict:
     a_array = np.asarray(a)
 
     return {
+        "manifest": {
+            "solverRuntime": solver_runtime(),
+            "scene": inspect_scene(req.buildings, req.freqGhz, req.materials, include_meshes=False),
+            "settings": req.model_dump(mode="json", exclude={"buildings"}),
+        },
         "a": a_array,                              # complex CIR coefficients
         "tau": np.asarray(tau, dtype=float),        # delays [s]
         "h": h_array,                              # complex CFR (None for raw CIR)
@@ -721,7 +729,7 @@ def solve_channel_grid(req) -> dict:
     rx_size = req.rx.antennaArraySize if req.rx is not None else (1, 1)
     n_rx_ant = _set_rx_array(scene, rx_size, req.options)
     tx_pos = [float(req.tx.enu.x), float(req.tx.enu.y),
-              _device_z(req.tx.enu, req.tx.height, req.buildings)]
+              _device_z(req.tx.enu, req.tx.height, req.buildings, req.tx.heightReference)]
     beam = _beam_target(tx_pos, req.tx.beamsteeringAzimuth, req.tx.beamsteeringElevation)
 
     num_sc = max(1, int(req.numSubcarriers))
@@ -918,7 +926,7 @@ def _mobility_step(
 def _resolve_tx_specs(txs: list[Transmitter], buildings: list[BuildingFootprint]) -> list[_TxSpec]:
     specs = []
     for tx in txs:
-        pos = [float(tx.enu.x), float(tx.enu.y), _device_z(tx.enu, tx.height, buildings)]
+        pos = [float(tx.enu.x), float(tx.enu.y), _device_z(tx.enu, tx.height, buildings, tx.heightReference)]
         beam = _beam_target(pos, tx.beamsteeringAzimuth, tx.beamsteeringElevation)
         specs.append(_TxSpec(pos=pos, beam=beam, power_dbm=float(tx.powerDbm),
                              id=tx.id, name=tx.name))
@@ -927,21 +935,25 @@ def _resolve_tx_specs(txs: list[Transmitter], buildings: list[BuildingFootprint]
 
 def _mobility_kinematics(
     waypoints: list[ENUVector], rx_height: float, buildings: list[BuildingFootprint], speed_ms: float,
+    reference: str = "roof",
 ) -> tuple[list[list[float]], list[list[float]]]:
     """Resolve antenna position and horizontal velocity for each trajectory sample."""
     positions: list[list[float]] = []
     velocities: list[list[float]] = []
     for i, wp in enumerate(waypoints):
-        positions.append([float(wp.x), float(wp.y), _device_z(wp, rx_height, buildings)])
+        z = _device_z(wp, rx_height, buildings, reference)
+        if reference == "enu":
+            z += wp.z  # waypoint offset relative to the selected UE's absolute altitude
+        positions.append([float(wp.x), float(wp.y), z])
         neighbor = waypoints[i + 1] if i + 1 < len(waypoints) else waypoints[i - 1] if i else None
         velocity = [0.0, 0.0, 0.0]
         if neighbor is not None:
             dx, dy = float(neighbor.x) - float(wp.x), float(neighbor.y) - float(wp.y)
-            norm = math.hypot(dx, dy)
-            if i + 1 == len(waypoints):
-                dx, dy = -dx, -dy  # keep heading direction on the last point
+            dz = float(neighbor.z - wp.z) if reference == "enu" else 0.0
+            norm = math.hypot(dx, dy, dz)
             if norm > 1e-6:
-                velocity = [dx / norm * speed_ms, dy / norm * speed_ms, 0.0]
+                direction = -1.0 if i + 1 == len(waypoints) else 1.0
+                velocity = [component / norm * speed_ms * direction for component in (dx, dy, dz)]
         velocities.append(velocity)
     return positions, velocities
 
@@ -979,7 +991,7 @@ def solve_mobility(req) -> tuple[list, dict, "HandoverAnalysis | None"]:
     tx_specs = _resolve_tx_specs(txs, req.buildings)
     speed_ms = float(req.speedKmh) / 3.6
     wps = req.waypoints
-    rx_positions, velocities = _mobility_kinematics(wps, req.rx.height, req.buildings, speed_ms)
+    rx_positions, velocities = _mobility_kinematics(wps, req.rx.height, req.buildings, speed_ms, req.rx.heightReference)
 
     # Fast path: one GPU dispatch for all (waypoint, Tx) pairs. Defensive fallback
     # to per-(waypoint, Tx) solves if the batched extraction misbehaves.
@@ -1098,37 +1110,22 @@ def _path_type(order: int, kinds: list[int]) -> str:
     return "NLOS"
 
 
-def _segment_has_building_los(
-    start: list[float],
-    end: list[float],
-    buildings: list[BuildingFootprint],
-) -> bool:
-    """Approximate LOS test for radio-map cells using the scene footprints."""
-    from shapely.geometry import LineString, Polygon
+def _segment_visibility(scene, starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
+    """Test unobstructed segments against the same mesh used for propagation."""
+    import drjit as dr
+    import mitsuba as mi
+    from sionna.rt.utils import spawn_ray_to
 
-    line = LineString([(float(start[0]), float(start[1])), (float(end[0]), float(end[1]))])
-    for b in buildings:
-        if b.category != "building" or len(b.enuPoints) < 3:
-            continue
-        try:
-            poly = Polygon([(p.x, p.y) for p in b.enuPoints])
-            if poly.is_empty or not line.intersects(poly):
-                continue
-        except Exception:
-            continue
-
-        # If the 2D segment crosses the footprint, sample the segment near the
-        # building center. If the ray is below the roof there, LOS is blocked.
-        bx, by = poly.centroid.x, poly.centroid.y
-        dx, dy = float(end[0]) - float(start[0]), float(end[1]) - float(start[1])
-        denom = dx * dx + dy * dy
-        if denom <= 1e-9:
-            continue
-        t = max(0.0, min(1.0, ((bx - float(start[0])) * dx + (by - float(start[1])) * dy) / denom))
-        z_at_building = float(start[2]) + t * (float(end[2]) - float(start[2]))
-        if 0.0 <= z_at_building <= float(b.height):
-            return False
-    return True
+    origins = mi.Point3f(starts.T)
+    targets = mi.Point3f(ends.T)
+    lengths = dr.norm(targets - origins)
+    rays = spawn_ray_to(origins, targets)
+    # spawn_ray_to excludes the target. Also move off the source surface.
+    offset = dr.minimum(1e-4, lengths * 0.25)
+    rays.o += rays.d * offset
+    rays.maxt -= offset
+    active = lengths > 0
+    return np.asarray(to_numpy(active & ~scene.mi_scene.ray_test(rays, active=active)), dtype=bool)
 
 
 def _empty_metrics() -> ChannelMetrics:
@@ -1188,11 +1185,53 @@ def _to_tx_cells(arr, num_tx: int, n_cells: int) -> np.ndarray:
     return a.reshape(num_tx, -1)[:, :n_cells]
 
 
+def _validate_radio_map_grid(size_x: float, size_y: float, cell: float,
+                             center: list[float], num_tx: int) -> None:
+    # Match Sionna's PlanarRadioMap, which divides in float32 and rounds each
+    # dimension up before allocating the grid.
+    with np.errstate(over="ignore"):
+        sizes = np.asarray([size_x, size_y, cell, *center], dtype=np.float32)
+    if not np.isfinite(sizes).all():
+        raise ValueError("Coverage extent, height and grid step must be finite in solver coordinates.")
+    nx, ny = map(math.ceil, sizes[:2] / sizes[2])
+    requested_cells = nx * ny
+    max_cells = min(MAX_RADIO_MAP_CELLS, MAX_RADIO_MAP_TX_CELLS // num_tx)
+    if requested_cells > max_cells:
+        raise ValueError(
+            f"Coverage grid needs {requested_cells:,} cells, exceeding the {max_cells:,}-cell limit "
+            f"for {num_tx} transmitter(s). Increase the grid step or move distant geometry and "
+            "transmitters closer together."
+        )
+
+
 def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
+    txs = req.transmitters()
+    grid_step = float(req.gridSize)
+    if not math.isfinite(grid_step):
+        raise ValueError("Coverage grid step must be finite.")
+    cell = max(grid_step, 1.0)
+    num_tx = len(txs)
+    array_sizes = [tuple(int(v) for v in t.antennaArraySize) for t in txs]
+    if any(size != array_sizes[0] for size in array_sizes):
+        raise ValueError("Radio maps with multiple transmitters require matching antennaArraySize")
+
+    compiled = compile_scene(req.buildings, req.freqGhz, req.materials)
+    # Bound the transmitters and physical triangles at solver precision. The
+    # compiler puts the generated ground plane first, outside this extent.
+    tx_xy = np.asarray([(t.enu.x, t.enu.y) for t in txs])
+    mesh_bounds = [mesh.bounds[:, :2] for _, _, mesh in compiled.meshes[1:]]
+    with np.errstate(over="ignore"):
+        xy = np.concatenate([tx_xy, *mesh_bounds], dtype=np.float32)
+    minx, miny = map(float, xy.min(axis=0))
+    maxx, maxy = map(float, xy.max(axis=0))
+    size_x = max(maxx - minx, 100.0) + 60.0
+    size_y = max(maxy - miny, 100.0) + 60.0
+    center = [minx / 2.0 + maxx / 2.0, miny / 2.0 + maxy / 2.0, float(req.gridHeight)]
+    _validate_radio_map_grid(size_x, size_y, cell, center, num_tx)
+
     from sionna.rt import RadioMapSolver
 
-    txs = req.transmitters()
-    scene = build_scene(req.buildings, req.freqGhz, req.materials)
+    scene = build_compiled_scene(compiled, req.freqGhz, req.materials)
 
     # Physical noise floor for SINR: bandwidth → thermal noise; fold the receiver
     # noise figure into an effective temperature (raises the floor by NF dB).
@@ -1201,24 +1240,6 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
         scene.temperature = 293.0 * (10.0 ** (float(req.noiseFigureDb) / 10.0))
     except Exception:
         pass
-
-    # Bounding box must enclose every transmitter and all geometry.
-    xs = [t.enu.x for t in txs]
-    ys = [t.enu.y for t in txs]
-    for b in req.buildings:
-        for p in b.enuPoints:
-            xs.append(p.x)
-            ys.append(p.y)
-    minx, maxx = min(xs), max(xs)
-    miny, maxy = min(ys), max(ys)
-    cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
-    size_x = max(maxx - minx, 100.0) + 60.0
-    size_y = max(maxy - miny, 100.0) + 60.0
-    cell = max(float(req.gridSize), 1.0)
-
-    array_sizes = [tuple(int(v) for v in t.antennaArraySize) for t in txs]
-    if any(size != array_sizes[0] for size in array_sizes):
-        raise ValueError("Radio maps with multiple transmitters require matching antennaArraySize")
 
     # Directive array so the beam genuinely steers; default uniform precoding
     # forms the main lobe along each Tx's boresight.
@@ -1229,7 +1250,7 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
     _clear_devices(scene)
     tx_positions: list[list[float]] = []
     for i, t in enumerate(txs):
-        tz = _device_z(t.enu, t.height, req.buildings)
+        tz = _device_z(t.enu, t.height, req.buildings, t.heightReference)
         pos = [float(t.enu.x), float(t.enu.y), tz]
         tx_positions.append(pos)
         beam = _beam_target(pos, t.beamsteeringAzimuth, t.beamsteeringElevation)
@@ -1237,7 +1258,7 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
 
     rm = RadioMapSolver()(
         scene,
-        center=[cx, cy, float(req.gridHeight)],
+        center=center,
         orientation=[0.0, 0.0, 0.0],
         size=[size_x, size_y],
         cell_size=[cell, cell],
@@ -1254,8 +1275,6 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
 
     centers = np.asarray(to_numpy(rm.cell_centers), dtype=float).reshape(-1, 3)
     n_cells = centers.shape[0]
-    num_tx = len(txs)
-
     rss = _to_tx_cells(rm.rss, num_tx, n_cells)     # (num_tx, n_cells) linear W
     sinr = _to_tx_cells(rm.sinr, num_tx, n_cells)   # (num_tx, n_cells) linear
 
@@ -1275,26 +1294,22 @@ def solve_radiomap(req: RadioMapRequest) -> RadioMapGrid:
     chosen = best_pwr if metric == "power" else sinr_db
     stats = _coverage_stats(chosen, metric, threshold)
 
+    # RadioMapSolver does not return a LOS flag. Test geometric visibility from
+    # each served cell's best Tx, independently of the propagation options.
+    reached = np.isfinite(best_pwr)
+    is_los = np.zeros(n_cells, dtype=bool)
+    if reached.any():
+        origins = np.asarray(tx_positions)[best_tx[reached]]
+        is_los[reached] = _segment_visibility(scene, origins, centers[reached])
+
     cells: list[RadioMapCell] = []
     for k in range(n_cells):
         pos = centers[k]
-        finite = np.isfinite(best_pwr[k])
-        power = float(best_pwr[k]) if finite else -250.0
+        power = float(best_pwr[k]) if reached[k] else -250.0
         sinr_val = float(sinr_db[k]) if np.isfinite(sinr_db[k]) else None
-        serving = int(best_tx[k]) if finite else None
-        # NOTE: Sionna's RadioMapSolver exposes path gain / RSS / SINR per cell,
-        # but not a per-cell LOS flag. `isLos` here is an app-side approximation
-        # from the 2D footprints (best-server Tx → cell), not an RT output, so it
-        # can disagree with the actual propagation (e.g. a footprint-"blocked"
-        # cell still served via reflection/diffraction). It drives only UI hints
-        # and the synthetic channel-grid LOS hint, never the RSS/SINR values.
-        is_los = False
-        if finite:
-            is_los = _segment_has_building_los(
-                tx_positions[int(best_tx[k])],
-                [float(pos[0]), float(pos[1]), float(pos[2])], req.buildings)
+        serving = int(best_tx[k]) if reached[k] else None
         cells.append(RadioMapCell(x=float(pos[0]), y=float(pos[1]), z=float(pos[2]),
-                                  powerDbm=power, isLos=is_los, sinr=sinr_val,
+                                  powerDbm=power, isLos=bool(is_los[k]), sinr=sinr_val,
                                   servingTx=serving))
 
     return RadioMapGrid(cells=cells, minX=float(minx), maxX=float(maxx),

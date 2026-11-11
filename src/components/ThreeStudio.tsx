@@ -7,9 +7,12 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useI18n } from '../i18n';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import type { SolverMesh } from '../api';
+import type { SceneEditor } from '../sceneEditor';
+import type { SolverRoof } from '../types';
 import { BuildingFootprint, GeoAnchor, Transmitter, Receiver, PropagationPath, ENUVector, PlacementMode } from '../types';
 import { cn } from '../lib/utils';
-import { enuToLatLon, isPointInPolygon } from '../utils';
+import { enuToLatLon, getDeviceElevation, isPointInPolygon } from '../utils';
 import { RadioMapGrid } from '../types';
 import { ColormapName, sampleColormap } from '../lib/colormaps';
 import { Compass, Activity, Camera } from 'lucide-react';
@@ -150,6 +153,9 @@ function makeStreetLabelMesh(
 type DevicePlacement = Exclude<PlacementMode, 'none'>;
 
 interface ThreeStudioProps {
+  sceneEditor?: SceneEditor;
+  physicalMeshes?: SolverMesh[];
+  solverRoofs?: SolverRoof[];
   buildings: BuildingFootprint[];
   anchor: GeoAnchor;
   tx: Transmitter;
@@ -188,6 +194,9 @@ function enuToThree(v: ENUVector): THREE.Vector3 {
 }
 
 export function ThreeStudio({
+  sceneEditor,
+  physicalMeshes,
+  solverRoofs,
   buildings,
   anchor,
   tx,
@@ -221,6 +230,7 @@ export function ThreeStudio({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const captureScreenshotRef = useRef<(() => void) | null>(null);
 
+  const [canvasState, setCanvasState] = useState<'initializing' | 'active' | 'unavailable'>('initializing');
   const [fps, setFps] = useState<number>(0);
   const [screenshotStatus, setScreenshotStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [performanceMode, setPerformanceMode] = useState<'high' | 'eco'>('high');
@@ -248,6 +258,7 @@ export function ThreeStudio({
 
   // Keep references to access them in render loops & events stably
   const stateRef = useRef({
+    sceneEditor, physicalMeshes, solverRoofs,
     buildings,
     anchor,
     tx,
@@ -278,6 +289,7 @@ export function ThreeStudio({
 
   useEffect(() => {
     stateRef.current = {
+      sceneEditor, physicalMeshes, solverRoofs,
       buildings,
       anchor,
       tx,
@@ -305,7 +317,7 @@ export function ThreeStudio({
       onPlaceDevice,
       visible,
     };
-  }, [buildings, anchor, tx, rx, txs, rxs, activeTxId, activeRxId, paths, matrixPaths, showRaysOnHeatmap, radioMap, rmColormap, rmAutoRange, rmVmin, rmVmax, placementMode, activeMode, cameraMode, showOutlines, drawingTrajectory, mobilityRxPosition, trajectoryPoints, setTrajectoryPoints, onPlaceDevice, visible]);
+  }, [sceneEditor, physicalMeshes, solverRoofs, buildings, anchor, tx, rx, txs, rxs, activeTxId, activeRxId, paths, matrixPaths, showRaysOnHeatmap, radioMap, rmColormap, rmAutoRange, rmVmin, rmVmax, placementMode, activeMode, cameraMode, showOutlines, drawingTrajectory, mobilityRxPosition, trajectoryPoints, setTrajectoryPoints, onPlaceDevice, visible]);
 
   useEffect(() => {
     if (!containerRef.current || !canvasRef.current) return;
@@ -325,13 +337,24 @@ export function ThreeStudio({
 
     // 3. WebGL Renderer. logarithmicDepthBuffer eliminates the flicker between
     // the many coplanar flat layers (ground, grid, roads, parks, water).
-    const renderer = new THREE.WebGLRenderer({
-      canvas: canvasRef.current,
-      antialias: performanceMode === 'high',
-      alpha: true,
-      logarithmicDepthBuffer: true,
-      powerPreference: "high-performance"
-    });
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = new THREE.WebGLRenderer({
+        canvas: canvasRef.current,
+        antialias: performanceMode === 'high',
+        alpha: true,
+        logarithmicDepthBuffer: true,
+        powerPreference: 'high-performance',
+      });
+      setCanvasState('active');
+    } catch {
+      setCanvasState('unavailable');
+      return;
+    }
+    const onContextLost = () => setCanvasState('unavailable');
+    const onContextRestored = () => setCanvasState('active');
+    renderer.domElement.addEventListener('webglcontextlost', onContextLost);
+    renderer.domElement.addEventListener('webglcontextrestored', onContextRestored);
     renderer.setSize(width, height);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, performanceMode === 'high' ? 2 : 1));
     renderer.shadowMap.enabled = true;
@@ -387,6 +410,8 @@ export function ThreeStudio({
 
     // Grouping nodes for logical clear layers
     const buildingGroup = new THREE.Group();
+    const draftGroup = new THREE.Group();
+    scene.add(draftGroup);
     const streetLabelGroup = new THREE.Group();
     const transmitterGroup = new THREE.Group();
     const receiverGroup = new THREE.Group();
@@ -404,12 +429,52 @@ export function ThreeStudio({
     scene.add(trajectoryGroup);
     scene.add(interactionGroup);
 
+    function addTriangleMesh(data: { vertices: number[]; triangles: number[] }, id: string, base = 0) {
+      const positions = new Float32Array(data.vertices.length);
+      for (let i = 0; i < positions.length; i += 3) {
+        positions[i] = data.vertices[i];
+        positions[i + 1] = data.vertices[i + 2] + base;
+        positions[i + 2] = -data.vertices[i + 1];
+      }
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geometry.setIndex(data.triangles);
+      geometry.computeVertexNormals();
+      const selected = id && stateRef.current.sceneEditor?.selected?.id === id;
+      const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
+        side: THREE.DoubleSide, flatShading: true,
+        color: selected ? 0xf59e0b : id ? buildingColor(id) : 0x94a3b8,
+      }));
+      mesh.name = id;
+      buildingGroup.add(mesh);
+      if (stateRef.current.physicalMeshes || stateRef.current.showOutlines) {
+        buildingGroup.add(new THREE.LineSegments(new THREE.WireframeGeometry(geometry),
+          new THREE.LineBasicMaterial({ color: 0x334155, transparent: true, opacity: 0.5 })));
+      }
+    }
+
+    function rebuildDraft() {
+      clearGroup(draftGroup);
+      const points = stateRef.current.sceneEditor?.draft ?? [];
+      if (!points.length) return;
+      const geometry = new THREE.BufferGeometry().setFromPoints(points.map(point => enuToThree({ ...point, z: 0.2 })));
+      draftGroup.add(new THREE.Points(geometry, new THREE.PointsMaterial({ color: 0xb45309, size: 8, sizeAttenuation: false })));
+      draftGroup.add(new THREE.Line(geometry.clone(), new THREE.LineBasicMaterial({ color: 0xb45309 })));
+    }
+
     // 6. BUILD GENERATOR: Building Geometry Extruders
     function rebuildBuildings3D() {
       clearGroup(buildingGroup);
       clearGroup(streetLabelGroup);
 
       const current = stateRef.current;
+      ground.visible = current.physicalMeshes === undefined;
+      if (current.physicalMeshes) {
+        for (const mesh of current.physicalMeshes) {
+          if (!mesh.id || !current.sceneEditor?.hiddenLayers.includes('building')) addTriangleMesh(mesh, mesh.id);
+        }
+        return;
+      }
       type NamedStreetSegment = {
         key: string;
         name: string;
@@ -423,6 +488,11 @@ export function ThreeStudio({
       const namedStreetSegments: NamedStreetSegment[] = [];
 
       current.buildings.forEach(b => {
+        if (current.sceneEditor?.hiddenLayers.includes(b.category)) return;
+        if (b.kind === 'mesh' && b.mesh) {
+          addTriangleMesh(b.mesh, b.id, b.baseZ);
+          return;
+        }
         const pts = b.enuPoints;
         if (pts.length < 2) return;
 
@@ -611,6 +681,16 @@ export function ThreeStudio({
           return;
         }
 
+        if (b.kind === 'wall') {
+          const [a, end] = pts;
+          const h = b.height;
+          addTriangleMesh({
+            vertices: [a.x, a.y, 0, end.x, end.y, 0, end.x, end.y, h, a.x, a.y, h],
+            triangles: [0, 1, 2, 0, 2, 3],
+          }, b.id, b.baseZ);
+          return;
+        }
+
         // --- 4. BUILDINGS (DEFAULT RENDERING) ---
         if (pts.length < 3) return;
 
@@ -632,11 +712,12 @@ export function ThreeStudio({
         const geom = new THREE.ExtrudeGeometry(shape, extrudeSettings);
         // Rotate so depth matches +Y height upright
         geom.rotateX(-Math.PI / 2);
+        geom.translate(0, b.baseZ ?? 0, 0);
 
         // Matte, muted, solid buildings — matches Sionna RT's preview look.
         // Each building gets a distinct earthy tone (deterministic by id).
         const meshMat = new THREE.MeshStandardMaterial({
-          color: buildingColor(b.id),
+          color: current.sceneEditor?.selected?.id === b.id ? 0xf59e0b : buildingColor(b.id),
           roughness: 0.97,
           metalness: 0.0,
           flatShading: true,
@@ -730,26 +811,16 @@ export function ThreeStudio({
       clearGroup(receiverGroup);
 
       const current = stateRef.current;
-
-      // Roof height under a device: if it sits over a building footprint, its
-      // antenna height is measured from that roof.
-      const rooftopZ = (enu: { x: number; y: number }) => {
-        const fp = current.buildings.find(
-          (b) => b.category === 'building' && b.enuPoints.length >= 3 && isPointInPolygon(enu, b.enuPoints),
-        );
-        return fp ? fp.height : 0;
-      };
+      const elevation = (device: Transmitter | Receiver) => getDeviceElevation(device, current.buildings, current.solverRoofs);
 
       // Draw Transmitter Tower (TX)
-      const txEnuPos = { ...current.tx.enu };
-      const txBaseZ = rooftopZ(txEnuPos);
-      const txThreePos = enuToThree({ ...txEnuPos, z: txBaseZ + current.tx.height });
+      const txThreePos = enuToThree({ ...current.tx.enu, z: elevation(current.tx) });
 
       // Draw tower pedestal structure
-      const towerBaseGeom = new THREE.CylinderGeometry(0.5, 3, txBaseZ + current.tx.height, 4);
+      const towerBaseGeom = new THREE.CylinderGeometry(0.5, 3, Math.abs(txThreePos.y), 4);
       const towerBaseMat = new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.8, roughness: 0.2 });
       const towerMesh = new THREE.Mesh(towerBaseGeom, towerBaseMat);
-      towerMesh.position.set(txThreePos.x, (txBaseZ + current.tx.height) / 2, txThreePos.z);
+      towerMesh.position.set(txThreePos.x, txThreePos.y / 2, txThreePos.z);
       towerMesh.castShadow = true;
       transmitterGroup.add(towerMesh);
 
@@ -793,14 +864,9 @@ export function ThreeStudio({
 
       // Draw Receiver Terminal (RX). During mobility playback, use the selected
       // solved sample directly so animation does not mutate the editable Rx state.
-      const rxEnuPos = current.activeMode === 'playback' && current.mobilityRxPosition
-        ? { ...current.mobilityRxPosition, z: 0 }
-        : { ...current.rx.enu };
-      const rxBaseZ = rooftopZ(rxEnuPos);
-      const rxHeight = current.activeMode === 'playback' && current.mobilityRxPosition
-        ? current.mobilityRxPosition.z
-        : rxBaseZ + current.rx.height;
-      const rxThreePos = enuToThree({ ...rxEnuPos, z: rxHeight });
+      const rxEnuPos = (current.activeMode === 'playback' && current.mobilityRxPosition) ||
+        { ...current.rx.enu, z: elevation(current.rx) };
+      const rxThreePos = enuToThree(rxEnuPos);
 
       // Clean glowing reception dome
       const deviceGeom = new THREE.SphereGeometry(1.2, 16, 16);
@@ -809,10 +875,10 @@ export function ThreeStudio({
       deviceMesh.position.copy(rxThreePos);
       receiverGroup.add(deviceMesh);
 
-      const devicePoleGeom = new THREE.CylinderGeometry(0.2, 0.2, rxHeight, 8);
+      const devicePoleGeom = new THREE.CylinderGeometry(0.2, 0.2, Math.abs(rxThreePos.y), 8);
       const devicePoleMat = new THREE.MeshStandardMaterial({ color: 0x475569 });
       const devicePoleMesh = new THREE.Mesh(devicePoleGeom, devicePoleMat);
-      devicePoleMesh.position.set(rxThreePos.x, rxHeight / 2, rxThreePos.z);
+      devicePoleMesh.position.set(rxThreePos.x, rxThreePos.y / 2, rxThreePos.z);
       receiverGroup.add(devicePoleMesh);
 
       // Name label (e.g. "Rx 1") floating above the active receiver.
@@ -823,31 +889,30 @@ export function ThreeStudio({
       // ── Markers for the OTHER (non-active) transmitters & receivers ───────
       // The active Tx/Rx already render above with full tower/device geometry;
       // here we add simpler poles+domes so every device in the list is visible.
-      const drawMarker = (enu: ENUVector, height: number, color: number, name: string, labelColor: string) => {
-        const baseZ = rooftopZ(enu);
-        const top = enuToThree({ ...enu, z: baseZ + height });
+      const drawMarker = (device: Transmitter | Receiver, color: number, labelColor: string) => {
+        const top = enuToThree({ ...device.enu, z: elevation(device) });
         const pole = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.3, 0.3, baseZ + height, 8),
+          new THREE.CylinderGeometry(0.3, 0.3, Math.abs(top.y), 8),
           new THREE.MeshStandardMaterial({ color: 0x475569, metalness: 0.6, roughness: 0.4 }),
         );
-        pole.position.set(top.x, (baseZ + height) / 2, top.z);
+        pole.position.set(top.x, top.y / 2, top.z);
         const dome = new THREE.Mesh(
           new THREE.SphereGeometry(1.3, 16, 16),
           new THREE.MeshBasicMaterial({ color }),
         );
         dome.position.copy(top);
-        const label = makeLabelSprite(name, labelColor);
+        const label = makeLabelSprite(device.name, labelColor);
         label.position.set(top.x, top.y + 6, top.z);
         return [pole, dome, label];
       };
 
       (current.txs ?? []).forEach((t) => {
         if (t.id === current.activeTxId) return; // active already drawn
-        drawMarker(t.enu, t.height, 0xf87171, t.name, '#d9aaa2').forEach((m) => transmitterGroup.add(m)); // soft red
+        transmitterGroup.add(...drawMarker(t, 0xf87171, '#d9aaa2')); // soft red
       });
       (current.rxs ?? []).forEach((r) => {
         if (r.id === current.activeRxId) return;
-        drawMarker(r.enu, r.height, 0x60a5fa, r.name, '#a9c2c9').forEach((m) => receiverGroup.add(m)); // soft blue
+        receiverGroup.add(...drawMarker(r, 0x60a5fa, '#a9c2c9')); // soft blue
       });
     }
 
@@ -992,7 +1057,7 @@ export function ThreeStudio({
       const current = stateRef.current;
       if (current.trajectoryPoints.length === 0) return;
 
-      const pts = current.trajectoryPoints.map((p) => enuToThree({ ...p.enu, z: 0.35 }));
+      const pts = current.trajectoryPoints.map((p) => enuToThree({ ...p.enu, z: current.rx.heightReference === 'enu' ? current.rx.height + p.enu.z : 0.35 }));
       if (pts.length >= 2) {
         const geom = new THREE.BufferGeometry().setFromPoints(pts);
         const mat = new THREE.LineBasicMaterial({ color: 0x10b981, transparent: true, opacity: 0.95 });
@@ -1013,8 +1078,6 @@ export function ThreeStudio({
 
     // Initial build — the dynamic layers (nodes/rays/heatmap/trajectory) draw on
     // the first animation frame via the change watcher below.
-    rebuildBuildings3D();
-
     // 10. ANCHORED RAYCAST EVENT LISTENER (Snaps Tx / Rx precisely onto ground/roof points)
     const raycaster = new THREE.Raycaster();
     const mouse = new THREE.Vector2();
@@ -1029,7 +1092,7 @@ export function ThreeStudio({
       press = null;
       if (e.button !== 0 || dragged) return;
       const current = stateRef.current;
-      if (current.placementMode === 'none' && !current.drawingTrajectory) return;
+      if (!current.sceneEditor && current.placementMode === 'none' && !current.drawingTrajectory) return;
 
       // Calculate mouse canvas click coords
       const rect = renderer.domElement.getBoundingClientRect();
@@ -1037,6 +1100,16 @@ export function ThreeStudio({
       mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
 
       raycaster.setFromCamera(mouse, camera);
+
+      if (current.sceneEditor) {
+        const point = raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0)), new THREE.Vector3());
+        if (!point) return;
+        const hit = current.sceneEditor.tool === 'select'
+          ? raycaster.intersectObjects(buildingGroup.children, true).find(result => result.object.name)?.object.name
+          : undefined;
+        current.sceneEditor.click({ x: point.x, y: -point.z, z: 0 }, hit);
+        return;
+      }
 
       // Target buildings first for roof placement, fallback to ground slab
       const intersects = raycaster.intersectObjects([ground, ...buildingGroup.children], true);
@@ -1095,8 +1168,11 @@ export function ThreeStudio({
       const first = prev === null;
       const p = prev ?? ({} as Snapshot);
 
-      if (!first && c.showOutlines !== p.showOutlines) rebuildBuildings3D();
-      if (first || c.tx !== p.tx || c.rx !== p.rx || c.txs !== p.txs || c.rxs !== p.rxs ||
+      if (c.buildings !== p.buildings || c.showOutlines !== p.showOutlines ||
+          c.physicalMeshes !== p.physicalMeshes || c.sceneEditor?.selected?.id !== p.sceneEditor?.selected?.id ||
+          c.sceneEditor?.hiddenLayers !== p.sceneEditor?.hiddenLayers) rebuildBuildings3D();
+      if (c.sceneEditor?.draft !== p.sceneEditor?.draft) rebuildDraft();
+      if (first || c.buildings !== p.buildings || c.solverRoofs !== p.solverRoofs || c.tx !== p.tx || c.rx !== p.rx || c.txs !== p.txs || c.rxs !== p.rxs ||
           c.activeTxId !== p.activeTxId || c.activeRxId !== p.activeRxId ||
           c.activeMode !== p.activeMode || c.mobilityRxPosition !== p.mobilityRxPosition ||
           c.showOutlines !== p.showOutlines) {
@@ -1111,15 +1187,28 @@ export function ThreeStudio({
           c.rmVmin !== p.rmVmin || c.rmVmax !== p.rmVmax) {
         drawRadioMap3D();
       }
-      if (first || c.trajectoryPoints !== p.trajectoryPoints) drawTrajectory3D();
+      if (first || c.rx !== p.rx || c.trajectoryPoints !== p.trajectoryPoints) drawTrajectory3D();
 
       prev = { ...c };
     };
 
     let followingTx = false;
+    let overhead = false;
     const updateCamera = () => {
       const current = stateRef.current;
-      const shouldFollowTx = current.cameraMode === 'lockTx';
+      const top = !!current.sceneEditor?.top;
+      if (top !== overhead) {
+        if (top) {
+          controls.saveState();
+          const distance = camera.position.distanceTo(controls.target);
+          camera.position.copy(controls.target).add(new THREE.Vector3(0, distance, distance * 0.001));
+        } else {
+          controls.reset();
+        }
+        controls.enableRotate = !top;
+        overhead = top;
+      }
+      const shouldFollowTx = !current.sceneEditor && current.cameraMode === 'lockTx';
       if (shouldFollowTx && !followingTx) {
         controls.saveState();
       } else if (!shouldFollowTx && followingTx) {
@@ -1205,12 +1294,14 @@ export function ThreeStudio({
       captureScreenshotRef.current = null;
       cancelAnimationFrame(animationFrameId);
       resizeObserver.disconnect();
+      renderer.domElement.removeEventListener('webglcontextlost', onContextLost);
+      renderer.domElement.removeEventListener('webglcontextrestored', onContextRestored);
       renderer.domElement.removeEventListener('pointerdown', handlePointerDown);
       renderer.domElement.removeEventListener('pointermove', handlePointerMove);
       renderer.domElement.removeEventListener('click', handleContainerClick);
       controls.dispose();
       // Release every GPU resource this effect created.
-      [buildingGroup, streetLabelGroup, transmitterGroup, receiverGroup, pathsGroup,
+      [buildingGroup, draftGroup, streetLabelGroup, transmitterGroup, receiverGroup, pathsGroup,
        heatmapGroup, trajectoryGroup, interactionGroup].forEach(clearGroup);
       ground.geometry.dispose();
       groundMat.dispose();
@@ -1218,7 +1309,7 @@ export function ThreeStudio({
       (gridHelper.material as THREE.Material).dispose();
       renderer.dispose();
     };
-  }, [buildings, performanceMode]);
+  }, [performanceMode]);
 
   const placementButtons: { mode: DevicePlacement; label: string; title: string }[] = [
     { mode: 'add-tx', label: t('+ Add AP', '+ 新增 AP'), title: t('Add a transmitter at each scene click', '每点击一个位置，就新增一个发射端（AP / Tx）') },
@@ -1241,7 +1332,7 @@ export function ThreeStudio({
         <canvas
           ref={canvasRef}
           id="canvas-3d"
-          className={cn('w-full h-full block', (placementHint || drawingTrajectory) && 'cursor-crosshair')}
+          className={cn('w-full h-full block', (placementHint || drawingTrajectory || (sceneEditor && sceneEditor.tool !== 'select')) && 'cursor-crosshair')}
           aria-label={t('3D propagation scene', '三维传播场景')}
         />
 
@@ -1251,6 +1342,9 @@ export function ThreeStudio({
             <span className="w-2 h-2 rounded-full bg-[#5f7f5a] animate-pulse" />
             <h4 className="eyebrow">{t('3D PROPAGATION FIELD', '三维传播场景')}</h4>
           </div>
+          <p className="text-xs text-slate-500" role="status">
+            WebGL · {canvasState === 'active' ? t('Rendering', '渲染中') : canvasState === 'unavailable' ? t('Unavailable', '不可用') : t('Starting', '正在启动')}
+          </p>
           <p className="text-[13px] text-slate-500 font-mono">
             {hoveredCoordinate
               ? t(

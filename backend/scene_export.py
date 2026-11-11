@@ -31,7 +31,9 @@ from .models import (
     SolverOptions,
     Transmitter,
 )
+from .solver_runtime import solver_runtime
 from .scene_build import (
+    inspect_scene,
     GROUND_BSDF_ID,
     GROUND_MATERIAL,
     build_scene_dir,
@@ -56,9 +58,10 @@ def _safe_name(value: str, index: int, prefix: str) -> str:
     return f"{prefix}_{index:02d}_{cleaned}" if cleaned else f"{prefix}_{index:02d}"
 
 
-def _position(enu, height: float, buildings: list[BuildingFootprint]) -> list[float]:
+def _position(device, buildings: list[BuildingFootprint]) -> list[float]:
     """Device position in scene coordinates, roof-aware like the solver."""
-    return [float(enu.x), float(enu.y), _device_z(enu, height, buildings)]
+    return [float(device.enu.x), float(device.enu.y),
+            _device_z(device.enu, device.height, buildings, device.heightReference)]
 
 
 def _material_lines(materials: list[MaterialConfig]) -> tuple[list[str], list[str]]:
@@ -71,7 +74,7 @@ def _material_lines(materials: list[MaterialConfig]) -> tuple[list[str], list[st
         "# Radio-material overrides. Applied after scene.frequency so the ITU",
         "# presets are computed first and explicit values win (scene_build.py).",
     ]
-    for cfg in materials:
+    for cfg in {config.id: config for config in materials}.values():
         target_ids = [cfg.id]
         if cfg.id == GROUND_MATERIAL:
             target_ids.append(GROUND_BSDF_ID)
@@ -115,7 +118,7 @@ def _device_specs(
     """Serializable device definitions used by the generated runner."""
     tx_specs: list[dict] = []
     for index, tx in enumerate(txs):
-        position = _position(tx.enu, tx.height, buildings)
+        position = _position(tx, buildings)
         beam = _beam_target(position, tx.beamsteeringAzimuth, tx.beamsteeringElevation)
         tx_specs.append(
             {
@@ -129,7 +132,7 @@ def _device_specs(
         )
     rx_specs: list[dict] = []
     for index, rx in enumerate(rxs):
-        position = _position(rx.enu, rx.height, buildings)
+        position = _position(rx, buildings)
         rx_specs.append(
             {
                 "id": rx.id,
@@ -197,7 +200,7 @@ def _load_scene_script(req: SceneExportRequest) -> str:
 
     material_imports, material_lines = _material_lines(req.materials)
     rt_imports = [
-        "PathSolver", "PlanarArray", "Receiver", "Transmitter",
+        "PlanarArray", "Receiver", "Transmitter",
         "load_scene", "subcarrier_frequencies",
     ] + material_imports
 
@@ -216,6 +219,13 @@ def _load_scene_script(req: SceneExportRequest) -> str:
         '"""',
         "import numpy as np",
         "from pathlib import Path",
+        "import os",
+        "from srts_runtime import configure_drjit_llvm_path, trace_paths_for_runtime",
+        "",
+        "configure_drjit_llvm_path()",
+        "import mitsuba as mi",
+        'if os.environ.get("SRTS_MITSUBA_VARIANT"):',
+        '    mi.set_variant(os.environ["SRTS_MITSUBA_VARIANT"])',
         "",
         "from sionna.rt import (",
     ]
@@ -288,7 +298,7 @@ def _load_scene_script(req: SceneExportRequest) -> str:
         "    )",
         "    _add_devices(group['txIndices'], group['rxIndices'])",
         "",
-        "    paths = PathSolver()(",
+        "    paths = trace_paths_for_runtime(",
         "        scene,",
         f"        max_depth={int(max(0, req.maxDepth))},",
         f"        samples_per_src={int(opts.pathSamplesPerSource)},",
@@ -383,7 +393,7 @@ def _manifest(req: SceneExportRequest, mesh_members: list[str]) -> dict:
             {
                 "id": tx.id,
                 "name": tx.name,
-                "position": _position(tx.enu, tx.height, req.buildings),
+                "position": _position(tx, req.buildings),
                 "antennaArraySize": list(tx.antennaArraySize),
                 "powerDbm": tx.powerDbm,
                 "beamsteeringAzimuthDeg": tx.beamsteeringAzimuth,
@@ -395,7 +405,7 @@ def _manifest(req: SceneExportRequest, mesh_members: list[str]) -> dict:
             {
                 "id": rx.id,
                 "name": rx.name,
-                "position": _position(rx.enu, rx.height, req.buildings),
+                "position": _position(rx, req.buildings),
                 "antennaArraySize": list(rx.antennaArraySize),
             }
             for rx in req.receivers()
@@ -411,6 +421,7 @@ replays the Python-side configuration Sionna does not store in the XML.
     scene.xml       Mitsuba scene, ITU radio-material BSDFs, relative mesh paths
     meshes/*.ply    ground plane + one extruded prism per building
     load_scene.py   frequency, material overrides, arrays, devices, PathSolver
+    srts_runtime.py LLVM discovery and initialization for the replay script
     manifest.json   the settings this export was generated from
     channels/*.npz exact array-compatible tensors created by load_scene.py
 
@@ -474,7 +485,11 @@ def scene_export_zip(req: SceneExportRequest) -> bytes:
         for member in mesh_members:
             archive.writestr(member, (scene_dir / member).read_bytes())
         archive.writestr("load_scene.py", _load_scene_script(req))
-        archive.writestr("manifest.json",
-                         json.dumps(_manifest(req, mesh_members), indent=2))
+        archive.writestr("srts_runtime.py", Path(__file__).with_name("runtime_env.py").read_bytes())
+        manifest = _manifest(req, mesh_members)
+        manifest["solverRuntime"] = solver_runtime()
+        manifest["anchor"] = req.anchor.model_dump() if req.anchor else None
+        manifest["scene"] = inspect_scene(req.buildings, req.freqGhz, req.materials, include_meshes=False)
+        archive.writestr("manifest.json", json.dumps(manifest, indent=2))
         archive.writestr("README.md", _README)
     return output.getvalue()

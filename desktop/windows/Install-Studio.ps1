@@ -146,7 +146,10 @@ try {
         Pop-Location
     }
     $project = Join-Path $PSScriptRoot 'app\SionnaRTStudio.csproj'
-    Invoke-CheckedCommand $dotnet.Source @('publish', $project, '-c', 'Release', '-r', 'win-x64', '--self-contained', 'true', '-o', $payload)
+    $versionFile = Join-Path $source 'backend\version.py'
+    $releaseVersion = & $python '-I' '-c' 'import runpy, sys; print(runpy.run_path(sys.argv[1])[sys.argv[2]])' $versionFile APP_VERSION
+    if ($LASTEXITCODE -ne 0 -or $releaseVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'Could not read the Studio version.' }
+    Invoke-CheckedCommand $dotnet.Source @('publish', $project, '-c', 'Release', '-r', 'win-x64', '--self-contained', 'true', "-p:Version=$releaseVersion", '-o', $payload)
     if (-not (Test-Path -LiteralPath (Join-Path $payload $exeName) -PathType Leaf) -or
         -not (Test-Path -LiteralPath (Join-Path $site 'index.html') -PathType Leaf)) {
         throw 'Build output is missing the Studio executable or interface.'

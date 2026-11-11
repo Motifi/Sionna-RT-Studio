@@ -58,9 +58,13 @@ The app opens in its own window and stops its local service when it quits. Keep 
 3. **Preview** solves all static links or one selected UE's trajectory. Check the number of time samples and antenna ports and the estimated full CFR size before running. Choose CIR only for large arrays or long trajectories to retain the array and sampling grid.
 4. **Export** saves the CSI ZIP from the Preview run. You can revisit a run after switching workspaces. Recompute in Preview after changing propagation inputs.
 
-在线底图和建筑导入需要网络，内置场景可直接计算。更新后，Web 版请强制刷新，桌面版请退出旧应用后打开新构建。
+「场景」支持离线绘制矩形、多边形和墙，也可编辑内置街区和已下载的 OSM 对象。切换「求解网格」可查看 Sionna RT 实际使用的三角形及对象、材质来源和导入问题。PLY、OBJ 和带引用网格的 Mitsuba ZIP 可以先检查尺度、坐标轴和材质，再导入并随项目保存。顶部的求解状态与 3D 画布的 WebGL 状态分开。
 
-Map tiles and building imports need a network connection. The built-in scene is ready to solve. After updating, hard-refresh the web page or quit the old desktop app and open the new build.
+Use Scene to draw rectangles, polygons, and walls offline, or edit the built-in street scene and imported OSM objects. Solver mesh displays the triangles used by Sionna RT along with object participation, material provenance, and import issues. Review the scale, axes, and material of PLY, OBJ, and Mitsuba ZIP imports before embedding them in the project. The solver and the WebGL canvas report their status separately.
+
+在线底图和首次 OSM 导入需要网络，保存后的场景可离线重开。更新后，Web 版请强制刷新，桌面版请退出旧应用后打开新构建。桌面稳定版检查与审查包流程见[发行说明](desktop/RELEASE.md)。
+
+Map tiles and the initial OSM import need a network connection. Saved scenes reopen offline. After updating, hard-refresh the web page or quit the old desktop app and open the new build. See the [desktop release notes](desktop/RELEASE.md) for update checks and candidate builds.
 
 ## CSI 文件 · CSI files
 

@@ -6,7 +6,7 @@
  * All RF solving happens on the Sionna RT backend (see api.ts).
  */
 
-import { GeoAnchor, ENUVector, BuildingFootprint, Transmitter, PropagationPath, RadioMapGrid, ChannelGridConfig } from './types';
+import { GeoAnchor, ENUVector, BuildingFootprint, SolverRoof, Transmitter, PropagationPath, RadioMapGrid, ChannelGridConfig } from './types';
 
 // Coordinate Math Constants
 const M_LAT = 110574;
@@ -27,19 +27,98 @@ export function enuToLatLon(enu: ENUVector, anchor: GeoAnchor): { lat: number; l
   return { lat, lon };
 }
 
-// 2D point-in-polygon test (ray casting) against a building footprint.
-// Used by the 3D scene to snap devices onto rooftops.
-export function isPointInPolygon(pt: { x: number; y: number }, poly: ENUVector[]): boolean {
+type HorizontalPoint = Pick<ENUVector, 'x' | 'y'>;
+
+const coordinateBits = new DataView(new ArrayBuffer(8));
+const implicitMantissaBit = 1n << 52n;
+
+function exactCoordinate(value: number): bigint {
+  // Express the IEEE-754 double in units of 2^-1074, including subnormals.
+  coordinateBits.setFloat64(0, value);
+  const bits = coordinateBits.getBigUint64(0);
+  const exponent = (bits >> 52n) & 0x7ffn;
+  const fraction = bits & (implicitMantissaBit - 1n);
+  const magnitude = exponent === 0n ? fraction : (implicitMantissaBit | fraction) << (exponent - 1n);
+  return bits >> 63n ? -magnitude : magnitude;
+}
+
+function orientationSign(a: HorizontalPoint, b: HorizontalPoint, p: HorizontalPoint): number {
+  const left = (b.x - a.x) * (p.y - a.y);
+  const right = (b.y - a.y) * (p.x - a.x);
+  const determinant = left - right;
+  const errorBound = Math.max(4 * Number.EPSILON * (Math.abs(left) + Math.abs(right)), 4 * Number.MIN_VALUE);
+  if (Number.isFinite(determinant) && Math.abs(determinant) > errorBound) return Math.sign(determinant);
+
+  // Repaired edges can sit within the floating-point error of the query point.
+  // Use the exact sign to distinguish true boundaries from nearby points.
+  const ax = exactCoordinate(a.x), ay = exactCoordinate(a.y);
+  const exact = (exactCoordinate(b.x) - ax) * (exactCoordinate(p.y) - ay) -
+    (exactCoordinate(b.y) - ay) * (exactCoordinate(p.x) - ax);
+  if (exact === 0n) return 0;
+  return exact > 0n ? 1 : -1;
+}
+
+// Match the solver's strict containment rule: roof mounting excludes the boundary.
+export function isPointInPolygon(
+  pt: HorizontalPoint,
+  poly: HorizontalPoint[],
+  includeBoundary = false,
+): boolean {
   let inside = false;
-  const n = poly.length;
-  for (let i = 0, j = n - 1; i < n; j = i++) {
-    const xi = poly[i].x, yi = poly[i].y;
-    const xj = poly[j].x, yj = poly[j].y;
-    const intersect = ((yi > pt.y) !== (yj > pt.y)) &&
-      (pt.x < (xj - xi) * (pt.y - yi) / (yj - yi + 1e-9) + xi);
-    if (intersect) inside = !inside;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[i], b = poly[j];
+    if (pt.y < Math.min(a.y, b.y) || pt.y > Math.max(a.y, b.y)) continue;
+    if (a.y === b.y) {
+      if (pt.x >= Math.min(a.x, b.x) && pt.x <= Math.max(a.x, b.x)) return includeBoundary;
+      continue;
+    }
+    const side = orientationSign(a, b, pt);
+    if (side === 0) return includeBoundary;
+    if ((a.y > pt.y) !== (b.y > pt.y) && (side > 0) === (b.y > a.y)) inside = !inside;
   }
   return inside;
+}
+
+function footprintArea(vertices: ENUVector[]): number {
+  const origin = vertices[0];
+  let twiceArea = 0;
+  for (let i = 1; i < vertices.length - 1; i++) {
+    const a = vertices[i], b = vertices[i + 1];
+    twiceArea += (a.x - origin.x) * (b.y - origin.y) - (a.y - origin.y) * (b.x - origin.x);
+  }
+  return Math.abs(twiceArea) / 2;
+}
+
+export function getDeviceElevation(
+  device: Pick<Transmitter, 'enu' | 'height' | 'heightReference'>,
+  buildings: BuildingFootprint[],
+  solverRoofs?: SolverRoof[],
+): number {
+  if (device.heightReference === 'enu') return device.height;
+  let roof = 0;
+  if (solverRoofs) {
+    for (const { topZ, rings } of solverRoofs) {
+      if (topZ > roof && isPointInPolygon(device.enu, rings[0]) &&
+        !rings.some((ring, index) => index > 0 && isPointInPolygon(device.enu, ring, true))) {
+        roof = topZ;
+      }
+    }
+    return roof + device.height;
+  }
+  // Keep local placement usable while the solver is unavailable or updating.
+  for (const building of buildings) {
+    if (building.category !== 'building' || (building.kind ?? 'building') !== 'building' ||
+      building.height <= 0 || building.enuPoints.length < 3) continue;
+    const top = (building.baseZ ?? 0) + Math.max(building.height, 1);
+    if (top > roof && isPointInPolygon(device.enu, building.enuPoints) && footprintArea(building.enuPoints) >= 0.5) {
+      roof = top;
+    }
+  }
+  return roof + device.height;
+}
+
+export function createIdSuffix(): string {
+  return crypto.getRandomValues(new Uint32Array(4)).join('-');
 }
 
 // Free space path loss: FSPL = 20 * log10(d) + 20 * log10(f_GHz) + 32.44
@@ -198,6 +277,8 @@ interface OsmClassification {
   material: string;
   levels?: number;
   name?: string;
+  heightSource?: BuildingFootprint['heightSource'];
+  materialSource?: BuildingFootprint['materialSource'];
 }
 
 // Classify a tagged OSM element into a scene feature (or null if not rendered).
@@ -205,18 +286,19 @@ function classifyOsmTags(tags: Record<string, string>, elemId: string | number):
   if (tags.building) {
     // Guard parseFloat/parseInt: tags like height="12'6\"" produce NaN, which
     // would serialize to null and fail backend validation.
-    let height: number | undefined;
-    const tagged = parseFloat(tags.height ?? '');
-    if (Number.isFinite(tagged) && tagged > 0) height = tagged;
-    const levelsRaw = parseInt(tags['building:levels'] ?? '', 10);
+    const tagged = Number(tags.height?.trim().replace(/\s*m$/i, ''));
+    const tagHeight = Number.isFinite(tagged) && tagged > 0 ? tagged : undefined;
+    const levelsRaw = Number(tags['building:levels']);
     const levels = Number.isFinite(levelsRaw) && levelsRaw > 0 ? levelsRaw : undefined;
-    if (height === undefined && levels !== undefined) height = levels * 3.5;
     const attrs = getBuildingAttributes(tags.building, String(elemId));
+    const taggedMaterial = normalizeOsmMaterial(tags['building:material'] || tags.material);
     return {
       category: 'building',
       type: tags.building,
-      height: height ?? attrs.height,
-      material: normalizeOsmMaterial(tags.material || tags['building:material']) || attrs.material,
+      height: tagHeight ?? (levels === undefined ? attrs.height : levels * 3.5),
+      heightSource: tagHeight !== undefined ? 'tag' : levels === undefined ? 'estimated' : 'levels',
+      material: taggedMaterial ?? attrs.material,
+      materialSource: taggedMaterial ? 'tag' : 'estimated',
       levels,
     };
   }
@@ -371,14 +453,21 @@ export function parseOsmElements(
 
   const buildings: BuildingFootprint[] = [];
 
-  const pushFeature = (id: string, nodeIds: number[], cls: OsmClassification) => {
+  const pushFeature = (id: string, nodeIds: number[], cls: OsmClassification, rawTags: Record<string, string>, importIssues: string[] = []) => {
     const polyPoints: { lat: number; lon: number }[] = [];
     for (const nodeId of nodeIds) {
       const n = nodes[nodeId];
       if (n) polyPoints.push(n);
     }
     // Streets need >= 2 points; closed footprints normally have >= 3.
-    if (polyPoints.length < 2) return;
+    if (polyPoints.length < 2 && cls.category !== 'building') return;
+    if (polyPoints.length !== nodeIds.length) importIssues.push('Some referenced OSM nodes are missing.');
+    if (cls.category === 'building' && cls.heightSource !== 'tag' && rawTags.height) {
+      importIssues.push('Unrecognized OSM height; using levels or an estimated height.');
+    }
+    if (cls.category === 'building' && cls.materialSource === 'estimated' && (rawTags['building:material'] || rawTags.material)) {
+      importIssues.push('Unmapped OSM material; using an estimate.');
+    }
 
     // Buildings keep their true footprint — clamping border-straddling
     // buildings to the bbox used to squash them into degenerate prisms.
@@ -393,6 +482,11 @@ export function parseOsmElements(
     buildings.push({
       id,
       name: cls.name,
+      source: 'osm',
+      heightSource: cls.heightSource,
+      materialSource: cls.materialSource,
+      rawTags,
+      importIssues,
       points,
       enuPoints: points.map((p) => latLonToENU(p.lat, p.lon, anchor)),
       height: cls.height,
@@ -408,7 +502,7 @@ export function parseOsmElements(
     if (elem.type !== 'way' || !elem.tags) continue;
     const cls = classifyOsmTags(elem.tags, elem.id);
     if (!cls) continue;
-    pushFeature(`osm_${elem.id}`, elem.nodes ?? [], cls);
+    pushFeature(`osm_${elem.id}`, elem.nodes ?? [], cls, elem.tags);
   }
 
   // Multipolygon building relations: assemble each outer ring into a footprint
@@ -421,8 +515,12 @@ export function parseOsmElements(
       .filter((m: any) => m.type === 'way' && (m.role === 'outer' || !m.role))
       .map((m: any) => wayNodeIds[m.ref])
       .filter((w: number[] | undefined): w is number[] => Array.isArray(w) && w.length >= 2);
-    stitchRings(outerWays).forEach((ring, ri) => {
-      pushFeature(`osm_rel_${elem.id}_${ri}`, ring, cls);
+    const rings = stitchRings(outerWays);
+    const hasHoles = elem.members.some((member: { role: string }) => member.role === 'inner');
+    (rings.length ? rings : [[]]).forEach((ring, ri) => {
+      const issues = hasHoles ? ['Interior rings were omitted.'] : [];
+      if (!ring.length) issues.push('No closed exterior ring could be assembled.');
+      pushFeature(`osm_rel_${elem.id}_${ri}`, ring, cls, elem.tags, issues);
     });
   }
 
@@ -490,7 +588,7 @@ export function exportCoverageChannelGrid(
       return {
         receiver_index: idx,
         coordinate_enu_m: [cell.x, cell.y, cell.z],
-        los_status: cell.isLos ? 1 : 0, // geometric LOS approximation, not an RT output
+        los_status: cell.isLos ? 1 : 0, // geometric visibility from the serving transmitter
         received_power_dbm: cell.powerDbm,
         h_matrix: subcarriers_data,
       };
@@ -504,35 +602,70 @@ export function exportCoverageChannelGrid(
 // GIS / 3D / propagation exporters used by the EXPORT navigation panel.
 // ---------------------------------------------------------------------------
 
-// Compile building footprints (+ anchor metadata) into a standard GeoJSON FeatureCollection.
-export function exportGeoJSON(buildings: BuildingFootprint[], anchor: GeoAnchor): string {
-  const features = buildings.map((b) => {
-    let coordinates: [number, number][][] = [];
-    if (b.points && b.points.length > 0) {
-      coordinates = [b.points.map((p) => [p.lon, p.lat])];
-      // Close the polygon safely
-      if (
-        coordinates[0].length > 0 &&
-        (coordinates[0][0][0] !== coordinates[0][coordinates[0].length - 1][0] ||
-          coordinates[0][0][1] !== coordinates[0][coordinates[0].length - 1][1])
-      ) {
-        coordinates[0].push([coordinates[0][0][0], coordinates[0][0][1]]);
+type Position2D = [number, number];
+
+function samePosition(a: Position2D, b: Position2D): boolean {
+  return a[0] === b[0] && a[1] === b[1];
+}
+
+function signedTurn(a: Position2D, b: Position2D, c: Position2D): number {
+  return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+}
+
+function meshConvexHull({ vertices, triangles }: NonNullable<BuildingFootprint['mesh']>): Position2D[] {
+  const sorted = Array.from(new Set(triangles), (index): Position2D => [vertices[3 * index], vertices[3 * index + 1]])
+    .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const points = sorted.filter((point, i) => i === 0 || !samePosition(point, sorted[i - 1]));
+  if (points.length <= 2) return points;
+
+  // Andrew's monotone chain also reduces a collinear projection to its endpoints.
+  const halfHull = (ordered: Position2D[]) => {
+    const hull: Position2D[] = [];
+    for (const point of ordered) {
+      while (hull.length >= 2 && signedTurn(hull[hull.length - 2], hull[hull.length - 1], point) <= 0) {
+        hull.pop();
       }
-    } else {
-      coordinates = [
-        b.enuPoints.map((ep) => {
-          const latLon = enuToLatLon(ep, anchor);
-          return [latLon.lon, latLon.lat];
-        }),
-      ];
-      if (
-        coordinates[0].length > 0 &&
-        (coordinates[0][0][0] !== coordinates[0][coordinates[0].length - 1][0] ||
-          coordinates[0][0][1] !== coordinates[0][coordinates[0].length - 1][1])
-      ) {
-        coordinates[0].push([coordinates[0][0][0], coordinates[0][0][1]]);
-      }
+      hull.push(point);
     }
+    return hull.slice(0, -1);
+  };
+  const lower = halfHull(points);
+  const upper = halfHull(points.reverse());
+  return [...lower, ...upper];
+}
+
+function geoJsonGeometry(coordinates: Position2D[], linear: boolean) {
+  const positions = coordinates.filter((position, i) => i === 0 || !samePosition(position, coordinates[i - 1]));
+  if (positions.length === 0) return null;
+  const first = positions[0];
+  if (positions.length === 1) return { type: 'Point', coordinates: first };
+  if (!linear && samePosition(first, positions[positions.length - 1])) positions.pop();
+
+  if (!linear && positions.length >= 3) {
+    const area = positions.reduce((sum, point, i) => sum + signedTurn(first, point, positions[i + 1] ?? first), 0);
+    if (area !== 0) {
+      positions.push(first);
+      if (area < 0) positions.reverse();
+      return { type: 'Polygon', coordinates: [positions] };
+    }
+  }
+  return { type: 'LineString', coordinates: positions };
+}
+
+// Compile scene footprints (+ anchor metadata) into a GeoJSON FeatureCollection.
+export function exportGeoJSON(buildings: BuildingFootprint[], anchor: GeoAnchor): string {
+  const geographicPosition = (point: ENUVector): Position2D => {
+    const { lon, lat } = enuToLatLon(point, anchor);
+    return [lon, lat];
+  };
+  const features = buildings.map((b) => {
+    const mesh = b.kind === 'mesh' ? b.mesh : undefined;
+    const positions = mesh
+      ? meshConvexHull(mesh).map(([x, y]) => geographicPosition({ x, y, z: 0 }))
+      : b.points?.length
+        ? b.points.map((p): Position2D => [p.lon, p.lat])
+        : b.enuPoints.map(geographicPosition);
+    const linear = !mesh && (b.kind === 'wall' || b.category === 'infrastructure');
 
     return {
       type: 'Feature',
@@ -545,10 +678,7 @@ export function exportGeoJSON(buildings: BuildingFootprint[], anchor: GeoAnchor)
         material: b.material,
         levels: b.levels,
       },
-      geometry: {
-        type: b.category === 'infrastructure' ? 'LineString' : 'Polygon',
-        coordinates: b.category === 'infrastructure' ? coordinates[0] : coordinates,
-      },
+      geometry: geoJsonGeometry(positions, linear),
     };
   });
 
@@ -566,7 +696,7 @@ export function exportGeoJSON(buildings: BuildingFootprint[], anchor: GeoAnchor)
   return JSON.stringify(geoJson, null, 2);
 }
 
-// Generate standard Wavefront OBJ file representing the procedural digital twin
+// Generate Wavefront OBJ geometry in ENU meters.
 export function exportOBJ3D(buildings: BuildingFootprint[]): string {
   let objText = `# SionnaRTStudio 3D Digital Twin Model OBJ Export\n`;
   objText += `# Generated at: ${new Date().toISOString()}\n`;
@@ -575,21 +705,40 @@ export function exportOBJ3D(buildings: BuildingFootprint[]): string {
   let vertexOffset = 1;
 
   for (const b of buildings) {
-    if (b.enuPoints.length < 2) continue;
+    if (b.kind !== 'mesh' && b.enuPoints.length < 2) continue;
 
     objText += `g ${b.id}_${b.category}_${b.type || 'generic'}\n`;
+    const baseZ = b.baseZ ?? 0;
+    const topZ = baseZ + b.height;
 
-    if (b.category === 'building' && b.enuPoints.length >= 3) {
-      const n = b.enuPoints.length;
-      const h = b.height;
-
-      // Add bottom vertices (z = 0)
-      for (const p of b.enuPoints) {
-        objText += `v ${p.x.toFixed(3)} ${p.y.toFixed(3)} 0.000\n`;
+    if (b.kind === 'mesh' && b.mesh) {
+      const { vertices, triangles } = b.mesh;
+      for (let i = 0; i < vertices.length; i += 3) {
+        objText += `v ${vertices[i]} ${vertices[i + 1]} ${vertices[i + 2] + baseZ}\n`;
       }
-      // Add top vertices (z = H)
+      for (let i = 0; i < triangles.length; i += 3) {
+        objText += `f ${vertexOffset + triangles[i]} ${vertexOffset + triangles[i + 1]} ${vertexOffset + triangles[i + 2]}\n`;
+      }
+      vertexOffset += vertices.length / 3;
+    } else if (b.category === 'building' && b.kind === 'wall') {
+      if (b.enuPoints.length !== 2 || b.height <= 0) continue;
+      const [start, end] = b.enuPoints;
+      if (Math.hypot(start.x - end.x, start.y - end.y) < 0.01) continue;
+      objText += `v ${start.x} ${start.y} ${baseZ}\n`;
+      objText += `v ${end.x} ${end.y} ${baseZ}\n`;
+      objText += `v ${end.x} ${end.y} ${topZ}\n`;
+      objText += `v ${start.x} ${start.y} ${topZ}\n`;
+      objText += `f ${vertexOffset} ${vertexOffset + 1} ${vertexOffset + 2}\n`;
+      objText += `f ${vertexOffset} ${vertexOffset + 2} ${vertexOffset + 3}\n`;
+      vertexOffset += 4;
+    } else if (b.category === 'building' && b.enuPoints.length >= 3) {
+      const n = b.enuPoints.length;
+
       for (const p of b.enuPoints) {
-        objText += `v ${p.x.toFixed(3)} ${p.y.toFixed(3)} ${h.toFixed(3)}\n`;
+        objText += `v ${p.x.toFixed(3)} ${p.y.toFixed(3)} ${baseZ}\n`;
+      }
+      for (const p of b.enuPoints) {
+        objText += `v ${p.x.toFixed(3)} ${p.y.toFixed(3)} ${topZ}\n`;
       }
 
       // 1. Bottom face

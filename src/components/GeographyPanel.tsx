@@ -146,7 +146,7 @@ export function GeographyPanel({ buildings, anchor, materialIds, materialConfigs
           </p>
           <div className="flex flex-col gap-3">
             {materialIds.map((id) => {
-              const cfg = materialConfigs.find((m) => m.id === id)
+              const cfg: MaterialConfig = materialConfigs.find((m) => m.id === id)
                 ?? { id, scatteringCoefficient: 0, xpdCoefficient: 0, scatteringPattern: 'none' as ScatteringPattern };
               return (
                 <div key={id} className="bg-[#f5f3ec] border border-[#e3e0d6] rounded p-3 flex flex-col gap-2.5">
@@ -174,6 +174,22 @@ export function GeographyPanel({ buildings, anchor, materialIds, materialConfigs
                       />
                     </label>
                   </div>
+                  <label className="flex flex-col gap-1 text-xs">
+                    {t('Radio slab thickness (m)', '无线薄层厚度（米）')}
+                    <input type="number" min="0" step="any" key={cfg.thickness ?? 'default'}
+                      defaultValue={cfg.thickness ?? ''} placeholder={t('ITU preset', 'ITU 预设')}
+                      className="rounded border border-[#e3e0d6] px-2 py-1"
+                      onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}
+                      onBlur={event => {
+                        const field = event.currentTarget;
+                        if (field.validity.badInput || (field.value && !(field.valueAsNumber >= 0))) {
+                          field.value = String(cfg.thickness ?? '');
+                          return;
+                        }
+                        const thickness = field.value ? field.valueAsNumber : undefined;
+                        if (thickness !== cfg.thickness) onMaterialChange({ ...cfg, thickness });
+                      }} />
+                  </label>
                   <label className="flex flex-col gap-1">
                     <span className="text-[11px] text-slate-600 font-bold">{t('Scattering Pattern', '散射方向图')}</span>
                     <select

@@ -82,6 +82,23 @@ def run(listener, port, token):
             valid = secrets.compare_digest(studio_token.encode(), token.encode())
             return Response(status_code=204 if valid else 404)
 
+        from backend.release_updates import ReleaseChecker, desktop_update_cache
+
+        app.state.desktop = True
+        updates = ReleaseChecker(desktop_update_cache())
+
+        @app.get("/api/updates", include_in_schema=False)
+        def update_status():
+            return updates.status()
+
+        @app.post("/api/updates/check", include_in_schema=False)
+        def check_updates():
+            updates.check(manual=True)
+            return updates.status()
+
+        if port == 43110:  # stable desktop origin; isolated acceptance runs use ephemeral ports
+            updates.check()
+
         app.mount("/", StaticFiles(directory=Path(__file__).with_name("site"), html=True))
         app.add_middleware(LocalOrigin, host=f"127.0.0.1:{port}")
         server = uvicorn.Server(uvicorn.Config(app, log_level="info", access_log=False, timeout_graceful_shutdown=2))

@@ -24,6 +24,8 @@ internal sealed class StudioWindow : Form
     private StudioBackend? backend;
     private Uri? origin;
     private bool closing;
+    private bool projectClosePending;
+    private bool projectCloseApproved;
     private bool saveDialogOpen;
 
     private sealed record PendingDownload(string Stage, string Destination, bool Overwrite);
@@ -312,6 +314,84 @@ internal sealed class StudioWindow : Form
         else
             ShowError($"Studio could not start or stopped.\nSionna RT Studio 启动失败或已停止。\n\nLog / 日志\n{logPath}", error);
         Close();
+    }
+
+    protected override async void OnFormClosing(FormClosingEventArgs args)
+    {
+        base.OnFormClosing(args);
+        if (args.Cancel || projectCloseApproved || ResultCode != 0
+            || args.CloseReason != CloseReason.UserClosing)
+            return;
+        var core = webView.CoreWebView2;
+        if (core is null)
+            return;
+
+        args.Cancel = true;
+        if (projectClosePending)
+            return;
+
+        projectClosePending = true;
+        // Finish the canceled close before issuing a new one on the UI thread.
+        await Task.Yield();
+        try
+        {
+            if (closing)
+                return;
+
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            deadline.CancelAfter(TimeSpan.FromSeconds(2));
+            var token = deadline.Token;
+            var saved = false;
+            var chinese = true;
+            try
+            {
+                await core.ExecuteScriptAsync("window.dispatchEvent(new Event('sionna-studio-flush-project'))")
+                    .WaitAsync(token);
+                const string readSaveState = """
+                    [document.documentElement?.dataset.projectSaveState ?? '', document.documentElement?.lang ?? '']
+                    """;
+                while (true)
+                {
+                    var response = await core.ExecuteScriptAsync(readSaveState).WaitAsync(token);
+                    var stateAndLanguage = JsonSerializer.Deserialize<string[]>(response);
+                    if (stateAndLanguage is null || stateAndLanguage.Length != 2)
+                        break;
+                    var state = stateAndLanguage[0];
+                    chinese = stateAndLanguage[1] != "en";
+                    if (state != "saving")
+                    {
+                        saved = state is "saved" or "";
+                        break;
+                    }
+                    await Task.Delay(50, token);
+                }
+            }
+            catch (Exception error) when (error is OperationCanceledException or InvalidOperationException
+                or System.Runtime.InteropServices.COMException or JsonException)
+            {
+                // A timeout or an unavailable WebView leaves the save unconfirmed.
+            }
+
+            if (closing)
+                return;
+            if (!saved)
+            {
+                var message = chinese
+                    ? "无法确认项目更改已保存。仍要关闭 Sionna RT Studio 吗？"
+                    : "Studio could not confirm that the project changes were saved. Close Sionna RT Studio anyway?";
+                if (MessageBox.Show(this, message, Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2) != DialogResult.Yes || closing)
+                    return;
+            }
+
+            projectCloseApproved = true;
+            Close();
+        }
+        finally
+        {
+            projectClosePending = false;
+            projectCloseApproved = false;
+        }
     }
 
     protected override void OnFormClosed(FormClosedEventArgs args)

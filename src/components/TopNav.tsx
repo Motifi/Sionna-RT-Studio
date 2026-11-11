@@ -3,17 +3,22 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React from 'react';
+import type { BackendHealth } from '../api';
+import type { ProjectAutosaveStatus } from '../project';
+import { AboutStudio } from './AboutStudio';
 import { useI18n } from '../i18n';
 
 const LOGO_URL = new URL('../../assets/logo-app-bone.png', import.meta.url).href;
 
 interface TopNavProps {
-  backendOnline: boolean;
-  version?: string;
+  health: BackendHealth | null;
+  autosaveStatus: ProjectAutosaveStatus;
+  onRetryAutosave: () => void;
+  onReplaceUnreadableAutosave?: () => void;
+  recoveryError?: string;
 }
 
-export function TopNav({ backendOnline, version = '1.0.0' }: TopNavProps) {
+export function TopNav({ health, autosaveStatus, onRetryAutosave, onReplaceUnreadableAutosave, recoveryError }: TopNavProps) {
   const { t, locale, setLocale } = useI18n();
 
   return (
@@ -26,15 +31,34 @@ export function TopNav({ backendOnline, version = '1.0.0' }: TopNavProps) {
             className="h-11 w-auto select-none"
             draggable={false}
           />
-          <span className="hidden readout text-[12px] text-[var(--text-lo)] sm:inline">v{version}</span>
+          <span className="hidden readout text-[12px] text-[var(--text-lo)] sm:inline">{health?.appVersion ? `v${health.appVersion}` : ''}</span>
         </div>
 
         <div className="flex shrink-0 items-center gap-2 py-2 select-none">
-          <span className="w-1.5 h-1.5 rounded-full" aria-hidden="true" style={{ background: backendOnline ? 'var(--ok)' : 'var(--bad)' }} />
-          <span className="readout text-[13px] text-[var(--text-mid)]" role="status">
-            <span className="hidden text-[var(--text-lo)] sm:inline">Sionna RT </span>
-            {backendOnline ? t('ready', '已就绪') : t('offline', '离线')}
-          </span>
+          <details className="relative">
+            <summary className="cursor-pointer readout text-xs" aria-label={t('Solver details', '求解后端详情')}>
+              <span role="status">{health?.backend ?? t('Solver offline', '求解器离线')}</span>
+            </summary>
+            <div className="absolute right-0 top-8 w-72 max-w-[80vw] rounded border border-[var(--line)] bg-[var(--page)] p-3 shadow-lg text-xs space-y-2">
+              <p>{t('Selected solver', '已选求解后端')} · {health?.variant ?? '—'}</p>
+              <p>{t('Device', '设备型号')} · {health?.deviceModel ?? t('Unavailable', '无法确认')}</p>
+              <p>Sionna RT {health?.sionnaRtVersion ?? '—'} · Mitsuba {health?.mitsubaVersion ?? '—'}</p>
+              <p>Dr.Jit {health?.drjitVersion ?? '—'} · Python {health?.pythonVersion ?? '—'}</p>
+              {!!health?.fallbackReasons?.length && <div>
+                <p>{t('Backend selection diagnostics', '后端选择诊断')}</p>
+                {health.fallbackReasons.map(reason => <p key={reason} className="break-words text-[var(--text-lo)]">{reason}</p>)}
+              </div>}
+              {health?.activeSolve && <p>{t('Running', '求解中')} · {health.activeSolve.operation}</p>}
+              <p>{t('Last solve', '最近一次求解')} · {health?.lastSolve
+                ? (health.lastSolve.status === 'succeeded' ? t('Succeeded', '已通过') : t('Failed', '失败'))
+                : t('Awaiting a real solve', '等待真实求解验证')}</p>
+              {health?.lastSolve && <p className="break-words">
+                {health.lastSolve.operation} · {new Date(health.lastSolve.finishedAt ?? health.lastSolve.startedAt).toLocaleString()}
+                {health.lastSolve.error && <span className="block text-[var(--bad)]">{health.lastSolve.error}</span>}
+              </p>}
+            </div>
+          </details>
+          <AboutStudio health={health} />
           <select
             data-studio-language=""
             aria-label={t('Interface language', '界面语言')}
@@ -48,6 +72,28 @@ export function TopNav({ backendOnline, version = '1.0.0' }: TopNavProps) {
           </select>
         </div>
       </div>
+      {autosaveStatus === 'disabled' ? (
+        <div className="flex flex-wrap items-center gap-x-2 border-t border-[var(--line)] px-3 py-1 text-xs text-[var(--bad)] sm:px-6">
+          <span role="status">{t('Autosave unavailable. Export the project to keep your changes.', '自动保存不可用。请导出项目以保留修改。')}</span>
+          {onReplaceUnreadableAutosave && (
+            <button type="button" className="font-semibold underline underline-offset-2" onClick={onReplaceUnreadableAutosave}>
+              {t('Replace unreadable autosave', '替换无法读取的自动存档')}
+            </button>
+          )}
+          {recoveryError && <span role="alert" className="basis-full">{recoveryError}</span>}
+        </div>
+      ) : autosaveStatus === 'error' ? (
+        <div className="flex items-center gap-2 border-t border-[var(--line)] px-3 py-1.5 text-xs text-[var(--bad)] sm:px-6">
+          <span role="alert">{t('Project autosave failed.', '项目自动保存失败。')}</span>
+          <button type="button" className="font-semibold underline underline-offset-2" onClick={onRetryAutosave}>
+            {t('Retry save', '重试保存')}
+          </button>
+        </div>
+      ) : (
+        <p role="status" className="border-t border-[var(--line)] px-3 py-1 text-xs text-[var(--text-lo)] sm:px-6">
+          {autosaveStatus === 'saving' ? t('Saving project…', '正在保存项目…') : t('Project saved locally', '项目已保存到本机')}
+        </p>
+      )}
     </header>
   );
 }

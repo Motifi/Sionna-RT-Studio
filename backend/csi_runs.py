@@ -16,10 +16,11 @@ import numpy as np
 from pydantic import BaseModel, Field, FiniteFloat, model_validator
 
 from .models import (
-    BuildingFootprint, ChannelMetrics, ENUVector, HandoverConfig, MaterialConfig,
+    BuildingFootprint, ChannelMetrics, ENUVector, GeoAnchor, HandoverConfig, MaterialConfig,
     PropagationPath, Receiver, SolverOptions, Transmitter,
 )
-from .scene_build import build_scene
+from .scene_build import build_scene, inspect_scene
+from .solver_runtime import solver_runtime
 from .solver import (
     MAX_PATHS, _channel_metrics, _device_z, _handover_analysis, _mobility_kinematics,
     _mobility_step, _resolve_tx_specs, _set_rx_array, _set_tx_array,
@@ -42,6 +43,7 @@ class CsiRunRequest(BaseModel):
     txs: list[Transmitter] = Field(min_length=1, max_length=64)
     rxs: list[Receiver] = Field(min_length=1, max_length=64)
     buildings: list[BuildingFootprint]
+    anchor: GeoAnchor | None = None
     freqGhz: FiniteFloat = Field(gt=0)
     systemBandwidthMhz: FiniteFloat = Field(default=100, gt=0)
     noiseFigureDb: FiniteFloat = Field(default=7, ge=0)
@@ -265,9 +267,9 @@ def solve_csi_run(req: CsiRunRequest) -> CsiRun:
     tx_specs = _resolve_tx_specs(req.txs, req.buildings)
     speed_ms = req.speedKmh / 3.6
     if moving:
-        rx_positions, velocities = _mobility_kinematics(req.waypoints, req.rxs[0].height, req.buildings, speed_ms)
+        rx_positions, velocities = _mobility_kinematics(req.waypoints, req.rxs[0].height, req.buildings, speed_ms, req.rxs[0].heightReference)
     else:
-        rx_positions = [[rx.enu.x, rx.enu.y, _device_z(rx.enu, rx.height, req.buildings)] for rx in req.rxs]
+        rx_positions = [[rx.enu.x, rx.enu.y, _device_z(rx.enu, rx.height, req.buildings, rx.heightReference)] for rx in req.rxs]
         velocities = [[0.0, 0.0, 0.0] for _ in rx_positions]
     positions = _geometric_axes(np.asarray(rx_positions, dtype=float), moving)
     frequencies = np.asarray(to_numpy(subcarrier_frequencies(req.numSubcarriers, req.subcarrierSpacing)))
@@ -290,7 +292,9 @@ def solve_csi_run(req: CsiRunRequest) -> CsiRun:
         )
         traced_links = _summarize_batched(paths, tx_specs, rx_positions, n_tx_ant)
         links = [[_Link(rays[:MAX_PATHS], _channel_metrics(rays)) for rays, _ in row] for row in traced_links]
+        scene_record = inspect_scene(req.buildings, req.freqGhz, req.materials, include_meshes=False)
         summary = {
+            "sceneId": scene_record["sceneId"], "solverRuntime": solver_runtime(),
             "runId": run_id, "mode": req.mode, "output": req.output, "txIds": tx_ids, "rxIds": rx_ids,
             "txNames": [tx.name for tx in req.txs], "rxNames": [rx.name for rx in req.rxs],
             "timeSeconds": times, "rxPositions": positions.tolist(), "txPositions": tx_positions,
@@ -331,6 +335,8 @@ def solve_csi_run(req: CsiRunRequest) -> CsiRun:
             },
             "delayUnit": "s", "positionFrame": "ENU_m",
             "channelReference": "unprecoded_per_port_baseband",
+            "scene": scene_record,
+            "objects": [obj.model_dump(mode="json") for obj in req.buildings if obj.category == "building"],
             "buildingCount": len(req.buildings),
             "settings": req.model_dump(mode="json", exclude={"buildings"}),
         })

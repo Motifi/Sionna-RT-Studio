@@ -24,7 +24,9 @@ internal sealed class StudioBackend : IDisposable
             ? Path.Combine(Path.GetTempPath(), $"sionna-studio-{Guid.NewGuid():N}.port")
             : Path.Combine(acceptanceDirectory, "backend-port");
         var runtime = Path.Combine(AppContext.BaseDirectory, "runtime");
-        var python = Path.Combine(runtime, ".venv", "Scripts", "python.exe");
+        var python = Path.Combine(runtime, "python", "python.exe");
+        if (!File.Exists(python))
+            python = Path.Combine(runtime, ".venv", "Scripts", "python.exe");
         if (!File.Exists(python))
             throw new FileNotFoundException("Install-Studio.ps1 is required to set up the Studio Python environment.", python);
 
@@ -45,6 +47,7 @@ internal sealed class StudioBackend : IDisposable
         start.Environment.Remove("PYTHONHOME");
         start.Environment.Remove("PYTHONPATH");
         start.Environment["PYTHONUTF8"] = "1";
+        start.Environment["PYTHONNOUSERSITE"] = "1";
         start.Environment["PYTHONIOENCODING"] = "utf-8";
         start.Environment["PYTHONUNBUFFERED"] = "1";
         start.Environment["PYTHONDONTWRITEBYTECODE"] = "1";
