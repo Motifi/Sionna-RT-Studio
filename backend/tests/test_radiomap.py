@@ -1,5 +1,6 @@
-"""Coverage-map allocation and visibility regressions."""
+"""Coverage-map allocation, visibility, and export regressions."""
 
+import io
 import os
 import sys
 from types import SimpleNamespace
@@ -101,6 +102,26 @@ class TestCoverageGridBudget(unittest.TestCase):
                          (4096, 128, 20_000_000, 2_560_000_000))
         self.assertIn("1,000,000 or fewer", plan.issues[0])
 
+    def test_automatic_terrain_extent_rejects_a_grid_without_measured_cells(self):
+        from backend.solver import preflight_radiomap
+
+        terrain = [
+            BuildingFootprint(
+                id=f"terrain-{x}", kind="mesh", category="terrain", rfRole="ground", height=0, enuPoints=[],
+                mesh={"vertices": [x, 0, 0, x + 1, 0, 0, x + 1, 1, 0, x, 1, 0],
+                      "triangles": [0, 1, 2, 0, 2, 3]},
+            ) for x in (0, 10)
+        ]
+        req = RadioMapRequest(txs=[_tx("first")], buildings=terrain, gridSize=8, maxDepth=0)
+        plan = preflight_radiomap(req)
+        self.assertEqual((plan.cells, plan.measuredCells), (2, 0))
+        self.assertTrue(plan.issues)
+        with (
+            patch("backend.solver.build_compiled_scene", side_effect=AssertionError("Scene load started")),
+            self.assertRaisesRegex(ValueError, "No grid centers"),
+        ):
+            solve_radiomap(req)
+
     def test_rejects_oversized_physical_grid_before_loading_ray_tracing_scene(self):
         cases = ((100_000, 1, None), (100_000, 1, []),
                  (3_900, 5, [{"x": 0, "y": 0, "z": 0}]))
@@ -185,6 +206,38 @@ class TestTerrainCoverage(unittest.TestCase):
 
 @unittest.skipUnless(os.getenv("SRTS_TEST_RT"), "requires an initialized Mitsuba runtime")
 class TestCoverageVisibility(unittest.TestCase):
+    def test_cfr_export_traces_sampled_floor_cells_beyond_the_terrain(self):
+        from backend import main
+        from backend.models import ChannelGridRequest
+
+        floor = BuildingFootprint(
+            id="floor", floor="2F", kind="mesh", category="building", rfRole="surface",
+            height=0, baseZ=10, enuPoints=[],
+            mesh={"vertices": [0, 0, 3, 8, 0, 3, 0, 8, 3], "triangles": [0, 1, 2]},
+        )
+        terrain = BuildingFootprint(
+            id="terrain", kind="mesh", category="terrain", rfRole="ground", height=0, enuPoints=[],
+            mesh={"vertices": [0, 0, 0, 3, 0, 0, 3, 8, 0, 0, 8, 0],
+                  "triangles": [0, 1, 2, 0, 2, 3]},
+        )
+        shared = dict(tx=_tx("first", 2, 2, 15.5), buildings=[floor, terrain], maxDepth=0,
+                      options=SolverOptions(txPattern="iso"))
+        result = main.api_radiomap(RadioMapRequest(
+            **shared, floorId=floor.id, gridSize=4, gridHeight=1.5, samplesPerTx=1000,
+        ))
+        sampled = [c for c in result.cells if c.sampled]
+        self.assertEqual([c.servingTx for c in sampled], [0, 0, 0])
+
+        response = main.api_channel_grid(ChannelGridRequest(
+            **shared, numSubcarriers=4, cellsAreSampled=True,
+            cells=[ENUVector(x=c.x, y=c.y, z=c.z) for c in sampled],
+        ))
+        with np.load(io.BytesIO(response.body)) as exported:
+            np.testing.assert_array_equal(exported["coordinates"], [[2, 2, 14.5], [6, 2, 14.5], [2, 6, 14.5]])
+            self.assertTrue(np.isfinite(exported["received_power_dbm"][1]))
+            self.assertTrue(exported["los"][1])
+            self.assertTrue(np.abs(exported["h"][1]).any())
+
     def test_floor_grid_uses_native_tracing_at_the_planned_receiver_elevation(self):
         from backend import main
 

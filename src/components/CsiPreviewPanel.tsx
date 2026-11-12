@@ -185,8 +185,8 @@ export function CsiPreviewPanel({
         </p>
         {sampling && <p id="csi-actual-trajectory-sampling" className="readout text-xs text-slate-700">
           {t(
-            `${sampling.sampleCount} samples · ${sampling.durationSeconds.toFixed(2)} s · actual interval ${sampling.intervalMs.toFixed(1)} ms`,
-            `${sampling.sampleCount} 个样点 · ${sampling.durationSeconds.toFixed(2)} 秒 · 实际间隔 ${sampling.intervalMs.toFixed(1)} 毫秒`,
+            `${sampling.sampleCount} samples · ${sampling.durationSeconds.toFixed(2)} s · mean interval ${sampling.intervalMs.toFixed(1)} ms`,
+            `${sampling.sampleCount} 个样点 · ${sampling.durationSeconds.toFixed(2)} 秒 · 平均间隔 ${sampling.intervalMs.toFixed(1)} 毫秒`,
           )}
           {sampling.capped && <span className="mt-1 block text-amber-800">
             {t('The 100-sample cap increased the interval. Shorten the route to keep the requested spacing.',

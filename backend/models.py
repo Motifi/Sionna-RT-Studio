@@ -753,6 +753,8 @@ class ChannelGridRequest(BaseModel):
     # Receiver positions = radio-map cell centers (ENU), sent verbatim so the
     # dataset coordinates match the displayed coverage grid exactly.
     cells: List[ENUVector]
+    # True when the caller has already applied the coverage sampling mask.
+    cellsAreSampled: bool = False
     freqGhz: float = 28.0
     maxDepth: int = 3
     options: SolverOptions = Field(default_factory=SolverOptions)

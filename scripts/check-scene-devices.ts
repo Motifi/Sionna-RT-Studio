@@ -76,6 +76,24 @@ test('placement choices include floor slabs and omit vertical or visual geometry
   assert.equal(isFloorSurface({ ...floor, type: 'generated_facade', buildingSpec }), false);
 });
 
+test('a shallow ramp is not a coverage floor', () => {
+  const floor: BuildingFootprint = {
+    ...building, kind: 'mesh', floor: 'Level', rfRole: 'surface',
+    mesh: { vertices: [0, 0, 0, 4, 0, 0.01, 0, 4, 0], triangles: [0, 1, 2] },
+  };
+  assert.equal(isFloorSurface(floor), false);
+});
+
+test('coverage floor tolerance uses elevations rounded at solver precision', () => {
+  const floor = (baseZ: number, rise: number): BuildingFootprint => ({
+    ...building, kind: 'mesh', floor: 'Level', rfRole: 'surface', baseZ,
+    mesh: { vertices: [0, 0, 0, 4, 0, rise, 0, 4, 0], triangles: [0, 1, 2] },
+  });
+  assert.equal(isFloorSurface(floor(7, 0.00005)), true);
+  assert.equal(isFloorSurface(floor(1024, 0.00008)), false);
+  assert.equal(isFloorSurface(floor(4096, 0.0002)), true);
+});
+
 test('route previews resolve old offsets, terrain and absolute ENU coordinates', () => {
   const enu = { x: 2, y: 2, z: 2 };
   assert.deepEqual(getWaypointPosition(enu, { height: 5, heightReference: 'enu' }, [building, slope]), { ...enu, z: 7 });

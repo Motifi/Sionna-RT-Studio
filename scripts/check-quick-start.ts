@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { starterExperiment } from '../src/lib/experimentPresets';
 import { sampleTrajectory, trajectorySampling } from '../src/lib/trajectory';
+import type { BuildingFootprint } from '../src/types';
+import { getWaypointPosition } from '../src/utils';
 
 test('starter static preset has one isotropic link and a known absolute direct-path delay', () => {
   const setup = starterExperiment('static');
@@ -31,4 +33,35 @@ test('shows actual trajectory interval when the requested spacing exceeds the 10
   assert.equal(summary?.capped, true);
   assert.ok(summary && Math.abs(summary.intervalMs - 100_000 / 99) < 1e-9);
   assert.equal(trajectorySampling([], 250), null);
+});
+
+test('terrain trajectory timing and sampling use resolved 3D waypoints', () => {
+  const ground: BuildingFootprint = {
+    id: 'slope', kind: 'mesh', type: 'terrain', category: 'terrain', rfRole: 'ground',
+    height: 0, material: 'itu_concrete', points: [], enuPoints: [],
+    mesh: { vertices: [0, 0, 0, 10, 0, 10, 10, 2, 10, 0, 2, 0], triangles: [0, 1, 2, 0, 2, 3] },
+  };
+  const points = [0, 10].map(x => ({ lat: 0, lon: 0, enu: { x, y: 1, z: 0 } }));
+  const route = sampleTrajectory(points, 1000, 3.6, false,
+    enu => getWaypointPosition(enu, { height: 1.5, heightReference: 'ground' }, [ground]));
+  assert.equal(route.waypoints.length, 16);
+  assert.deepEqual(route.waypoints[0], points[0].enu);
+  assert.deepEqual(route.waypoints.at(-1), points[1].enu);
+  assert.ok(Math.abs(route.timeSeconds.at(-1)! - 14.1421356237) < 1e-9);
+});
+
+test('terrain trajectory resolves intermediate elevations as well as control points', () => {
+  const ground: BuildingFootprint = {
+    id: 'ridge', kind: 'mesh', type: 'terrain', category: 'terrain', rfRole: 'ground',
+    height: 0, material: 'itu_concrete', points: [], enuPoints: [],
+    mesh: { vertices: [0, 0, 0, 5, 0, 5, 10, 0, 0, 0, 2, 0, 5, 2, 5, 10, 2, 0],
+      triangles: [0, 1, 4, 0, 4, 3, 1, 2, 5, 1, 5, 4] },
+  };
+  const points = [0, 10].map(x => ({ lat: 0, lon: 0, enu: { x, y: 1, z: 0 } }));
+  const route = sampleTrajectory(points, 2500, 3.6, false,
+    enu => getWaypointPosition(enu, { height: 1.5, heightReference: 'ground' }, [ground]));
+  const crest = route.waypoints.findIndex(point => point.x === 5);
+  assert.notEqual(crest, -1);
+  assert.ok(Math.abs(route.timeSeconds[crest] - 7.07106781187) < 1e-9);
+  assert.ok(Math.abs(route.timeSeconds.at(-1)! - 14.1421356237) < 1e-9);
 });

@@ -35,6 +35,7 @@ import {
   latLonToENU,
   enuToLatLon,
   fetchOSMBuildings,
+  getWaypointPosition,
 } from './utils';
 import { ApiRequestError, solveLink, readCoveragePreflight, readBackendHealth, inspectScene, inspectCsiLink, importScenePackage, readSolverRoofs, generateBuilding } from './api';
 import type { BackendHealth, SceneInspection, CsiRun, CsiRunMode, CsiRunOutput, CsiSelection, CsiLinkPreview, CsiRunRequest, CoverageJobRequest, HandoverConfig } from './api';
@@ -1269,10 +1270,14 @@ function StudioApp({ initialProject, initialProjectId, startTemporary, unreadabl
   const trajectoryReceiver = rxs.find(device => device.id === csiReceiverId) ?? rx;
   const simulationRoute = Object.hasOwn(trajectoriesByRxId, trajectoryReceiver.id) ? trajectoriesByRxId[trajectoryReceiver.id] : EMPTY_TRACK;
   const routeFrame = Object.hasOwn(waypointFrameByRxId, trajectoryReceiver.id) ? waypointFrameByRxId[trajectoryReceiver.id] : undefined;
-  const route = React.useMemo(
-    () => sampleTrajectory(simulationRoute, mobilityIntervalMs, mobilitySpeedKmh, routeFrame === 'ENU_m' || trajectoryReceiver.heightReference === 'enu'),
-    [simulationRoute, mobilityIntervalMs, mobilitySpeedKmh, routeFrame, trajectoryReceiver.heightReference],
-  );
+  const route = React.useMemo(() => {
+    const absolute = routeFrame === 'ENU_m' || trajectoryReceiver.heightReference === 'enu';
+    return sampleTrajectory(simulationRoute, mobilityIntervalMs, mobilitySpeedKmh, absolute,
+      absolute ? undefined : point => getWaypointPosition(point, trajectoryReceiver, buildings, solverRoofs));
+  }, [simulationRoute, mobilityIntervalMs, mobilitySpeedKmh, routeFrame, trajectoryReceiver, buildings, solverRoofs]);
+  const trajectoryTimes = !historicalRun && !csiStale && !csiExpired
+    && csiRun?.mode === 'trajectory' && csiRun.rxIds[0] === trajectoryReceiver.id
+    ? csiRun.timeSeconds : route.timeSeconds;
   const txPorts = antennaPortCount(tx.antennaArraySize, solverOptions.txPolarization);
   const rxPorts = antennaPortCount(rx.antennaArraySize, solverOptions.rxPolarization);
   const staticEstimate = txArraysMatch && rxArraysMatch
@@ -1307,7 +1312,8 @@ function StudioApp({ initialProject, initialProjectId, startTemporary, unreadabl
       ...csiCommon, projectId: runProjectId, fronthaulMbpsByTxId: currentFronthaul,
       mode, output: csiOutput, rxs: mode === 'static' ? rxs : [receiver],
       ...(mode === 'trajectory' ? {
-        ...route, waypointFrame: routeFrame, speedKmh: mobilitySpeedKmh, combineMode: mobilityCombineMode, handover: handoverConfig,
+        waypoints: route.waypoints, waypointFrame: routeFrame, deriveTimeFromSpeed: true,
+        speedKmh: mobilitySpeedKmh, combineMode: mobilityCombineMode, handover: handoverConfig,
       } : {}),
     };
     void csiTask.run(input, run => {
@@ -1713,7 +1719,7 @@ function StudioApp({ initialProject, initialProjectId, startTemporary, unreadabl
               run={csiRun} stale={csiStale} expired={csiExpired} running={csiRunning} active={showingCsi} historical={!!historicalRun}
               error={csiIssue ? t(...csiIssue) : ''}
               presetMode={presetMode} jobStatus={renderTaskStatus(csiTask)}
-              sampling={trajectorySampling(route.timeSeconds, mobilityIntervalMs)}
+              sampling={trajectorySampling(trajectoryTimes, mobilityIntervalMs)}
               staticDisabledReason={staticDisabledReason} trajectoryDisabledReason={trajectoryDisabledReason}
               mixedArrays={{ static: !txArraysMatch || !rxArraysMatch, trajectory: !txArraysMatch }}
               staticEstimate={staticEstimate} trajectoryEstimate={trajectoryEstimate}

@@ -69,8 +69,11 @@ Sionna scene build, no network:
 See [procedural buildings](../docs/scene-package.md#参数化建筑--procedural-buildings) for an example of calling the generator from a script or an agent.
 
 `/api/csi-runs` accepts `mode="static"` for every selected AP and UE, or
-`mode="trajectory"` for one UE and up to 100 `waypoints` with matching
-`timeSeconds`. Trajectory times start at zero and increase strictly. Both modes
+`mode="trajectory"` for one UE and up to 100 `waypoints`. Supply matching
+`timeSeconds` that start at zero and increase strictly, or set
+`deriveTimeFromSpeed: true` and supply a positive `speedKmh` to time the
+trajectory using the resolved 3D distances. CSI velocities use the same
+resolved coordinates and elapsed times. Both modes
 use one `PathSolver` dispatch for rays, link metrics, and unprecoded complex
 channel data. The trajectory axis describes independent geometric snapshots.
 Each side needs uniform antenna array sizes for the dense tensor. For static
@@ -90,6 +93,11 @@ weighted by `exp(-2j * pi * tau_geometric * f)`, where `f` is a baseband offset
 in Hz from the stored `frequencies` axis. The Preview curve shows
 `10 log10(mean(|H|²))` across antenna ports at up to 256 sampled subcarriers.
 `null` marks zero magnitude on that curve.
+
+Set `cellsAreSampled: true` on `/api/channel-grid` when `cells` contains
+only the sampled centers returned by a coverage run. This retraces those
+exact positions, including floor samples outside the terrain mesh. By
+default, an unfiltered grid uses the terrain mask.
 
 CSI and coverage jobs run in submission order and share the solver lock with
 synchronous requests. Poll the returned `jobId` for its status, including

@@ -27,7 +27,7 @@ from .models import (
 from .scene_build import FoliageCrown, build_scene, build_scene_dir, foliage_crowns, inspect_scene
 from .solver_runtime import package_version, solver_runtime
 from .solver import (
-    MAX_PATHS, _TxSpec, _channel_metrics, _device_positions, _handover_analysis, _mobility_kinematics,
+    MAX_PATHS, _TxSpec, _channel_metrics, _device_positions, _handover_analysis, _mobility_positions,
     _mobility_step, _resolve_tx_specs, _set_rx_array, _set_tx_array,
     _summarize_batched, _trace_batched, _uniform_array_size, to_numpy,
 )
@@ -79,6 +79,7 @@ class CsiRunRequest(CsiExportRequest):
     waypoints: list[ENUVector] = Field(default_factory=list, max_length=100)
     waypointFrame: Literal["ENU_m"] | None = None
     timeSeconds: list[FiniteFloat] = Field(default_factory=list, max_length=100)
+    deriveTimeFromSpeed: bool = False
     speedKmh: FiniteFloat = Field(default=30, ge=0)
     combineMode: Literal["best_server", "sum"] = "best_server"
     handover: HandoverConfig = Field(default_factory=HandoverConfig)
@@ -93,10 +94,13 @@ class CsiRunRequest(CsiExportRequest):
         if self.mode == "trajectory":
             if len(self.rxs) != 1 or len(self.waypoints) < 2:
                 raise ValueError("Trajectory CSI requires one Rx and at least two samples")
-            if (len(self.timeSeconds) != len(self.waypoints) or self.timeSeconds[0] != 0
+            if self.deriveTimeFromSpeed:
+                if self.timeSeconds or self.speedKmh / 3.6 <= 0:
+                    raise ValueError("Speed-derived timing requires positive speed and no explicit sample times")
+            elif (len(self.timeSeconds) != len(self.waypoints) or self.timeSeconds[0] != 0
                     or any(b <= a for a, b in zip(self.timeSeconds, self.timeSeconds[1:]))):
                 raise ValueError("Trajectory sample times must start at 0 and increase strictly")
-        elif self.waypoints or self.timeSeconds:
+        elif self.waypoints or self.timeSeconds or self.deriveTimeFromSpeed:
             raise ValueError("Static CSI does not take trajectory samples")
         samples = len(self.waypoints) if self.mode == "trajectory" else len(self.rxs)
         if samples * len(self.txs) > _MAX_LINK_SNAPSHOTS:
@@ -390,17 +394,33 @@ def solve_csi_run(req: CsiRunRequest, *, staging_parent: Path | None = None,
     started = time.perf_counter()
     moving = req.mode == "trajectory"
     times = list(req.timeSeconds) if moving else [0.0]
-    scene = build_scene(req.buildings, req.freqGhz, req.materials)
-    tx_specs = _resolve_tx_specs(req.txs, req.buildings)
     speed_ms = req.speedKmh / 3.6
     if moving:
-        rx_positions, velocities = _mobility_kinematics(
-            req.waypoints, req.rxs[0].height, req.buildings, speed_ms,
-            req.rxs[0].heightReference, waypoint_frame=req.waypointFrame,
+        rx_positions, _ = _mobility_positions(
+            req.waypoints, req.rxs[0].height, req.buildings, req.rxs[0].heightReference, req.waypointFrame,
         )
+        if req.deriveTimeFromSpeed:
+            times = [0.0]
+            for a, b in zip(rx_positions, rx_positions[1:]):
+                time_s = times[-1] + math.dist(a, b) / speed_ms
+                if not math.isfinite(time_s) or time_s <= times[-1]:
+                    raise ValueError("Trajectory needs distinct consecutive samples and finite travel times. "
+                                     "Adjust the route, speed, or sampling interval.")
+                times.append(time_s)
+        # Use the outgoing segment at each sample and the incoming segment at
+        # the final sample, with the same times used for playback and export.
+        with np.errstate(over="ignore", invalid="ignore"):
+            segment_velocities = np.diff(rx_positions, axis=0) / np.diff(times)[:, None]
+            if not np.isfinite(segment_velocities.astype(np.float32)).all():
+                raise ValueError("Trajectory sample velocity is outside the solver's supported range. "
+                                 "Adjust the route or increase the sample interval.")
+        velocities = segment_velocities.tolist()
+        velocities.append(velocities[-1].copy())
     else:
         rx_positions = _device_positions(req.rxs, req.buildings)
         velocities = [[0.0, 0.0, 0.0] for _ in rx_positions]
+    scene = build_scene(req.buildings, req.freqGhz, req.materials)
+    tx_specs = _resolve_tx_specs(req.txs, req.buildings)
     resolved = _ResolvedInputs(tx_specs, rx_positions, velocities, foliage_crowns(req.buildings), times)
 
     directory = TemporaryDirectory(prefix=".stage-" if staging_parent else "srts_csi_", dir=staging_parent)

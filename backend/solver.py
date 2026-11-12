@@ -786,9 +786,10 @@ def solve_channel_grid(req) -> dict:
     chunk = max(1, int(req.chunkSize))
     crowns = compiled.foliage_crowns
 
-    # Keep the displayed cell coordinates and ordering, including terrain holes.
+    # Sampled coverage centers can lie on floors beyond the terrain mesh.
+    # Retain the terrain mask for callers that pass an unfiltered grid.
     coords = np.array([[float(c.x), float(c.y), float(c.z)] for c in cells], dtype=float)
-    if compiled.ground_meshes:
+    if compiled.ground_meshes and not req.cellsAreSampled:
         ground = terrain_elevations(req.buildings, coords[:, :2], compiled=compiled)
         measured = np.flatnonzero(np.isfinite(ground))
     else:
@@ -986,15 +987,14 @@ def _resolve_tx_specs(txs: list[Transmitter], buildings: list[BuildingFootprint]
     return specs
 
 
-def _mobility_kinematics(
-    waypoints: list[ENUVector], rx_height: float, buildings: list[BuildingFootprint], speed_ms: float,
-    reference: str = "roof",
-    waypoint_frame: WaypointFrame | None = None,
-) -> tuple[list[list[float]], list[list[float]]]:
-    """Resolve antenna position and velocity for each trajectory sample."""
-    if not waypoints:
-        return [], []
+def _mobility_positions(
+    waypoints: list[ENUVector], rx_height: float, buildings: list[BuildingFootprint],
+    reference: str, waypoint_frame: WaypointFrame | None,
+) -> tuple[list[list[float]], np.ndarray]:
+    """Resolve the antenna positions and report the terrain heights under them."""
     terrain = np.full(len(waypoints), np.nan)
+    if not waypoints:
+        return [], terrain
     if waypoint_frame == "ENU_m":
         positions = [[wp.x, wp.y, wp.z] for wp in waypoints]
     elif reference == "enu":
@@ -1006,6 +1006,16 @@ def _mobility_kinematics(
             [wp.x, wp.y, _device_z(wp, rx_height, buildings, reference, terrain_z=float(ground_z))]
             for wp, ground_z in zip(waypoints, terrain)
         ]
+    return positions, terrain
+
+
+def _mobility_kinematics(
+    waypoints: list[ENUVector], rx_height: float, buildings: list[BuildingFootprint], speed_ms: float,
+    reference: str = "roof",
+    waypoint_frame: WaypointFrame | None = None,
+) -> tuple[list[list[float]], list[list[float]]]:
+    """Resolve antenna position and velocity for each untimed mobility sample."""
+    positions, terrain = _mobility_positions(waypoints, rx_height, buildings, reference, waypoint_frame)
     velocities: list[list[float]] = []
     for i, pos in enumerate(positions):
         neighbor = i + 1 if i + 1 < len(positions) else i - 1
@@ -1431,7 +1441,7 @@ def _plan_radiomap(req: RadioMapRequest) -> _CoveragePlan:
             height[measured] += ground[measured]
         else:
             measured = np.arange(len(coordinates))
-        if (support is not None or req.region is not None) and not measured.size:
+        if not measured.size:
             issues.append("No grid centers lie on the selected floor or terrain. "
                           "Adjust the coverage area or use a finer grid.")
         centers = np.column_stack((coordinates, height))

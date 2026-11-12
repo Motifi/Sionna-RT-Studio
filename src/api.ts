@@ -142,6 +142,7 @@ export interface CsiRunRequest extends CIRExportOptions {
   materials: MaterialConfig[];
   waypoints?: ENUVector[];
   timeSeconds?: number[];
+  deriveTimeFromSpeed?: boolean;
   speedKmh?: number;
   combineMode?: MobilityCombineMode;
   handover?: HandoverConfig;
@@ -785,10 +786,10 @@ export interface ChannelGridExportOptions {
 }
 
 /**
- * Ray-traced channel-grid export. Every radio-map cell is retraced on the
- * backend and the full per-Rx/per-Tx-port CFR (`paths.cfr()`) is returned as a
- * NumPy `.npz`. `cells` are the radio-map cell centers (ENU); all of those
- * virtual receivers share the active receiver's scene.rx_array.
+ * Ray-traced channel-grid export. The caller supplies the sampled radio-map
+ * cell centers (ENU). The backend retraces those positions and returns the
+ * full per-Rx/per-Tx-port CFR (`paths.cfr()`) as a NumPy `.npz`. The virtual
+ * receivers share the active receiver's scene.rx_array.
  */
 export function exportChannelGrid(
   tx: Transmitter,
@@ -806,6 +807,7 @@ export function exportChannelGrid(
     rx,
     buildings,
     cells,
+    cellsAreSampled: true,
     freqGhz,
     maxDepth,
     options,

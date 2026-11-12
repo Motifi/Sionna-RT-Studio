@@ -40,6 +40,42 @@ class TestReplayIntegrity(unittest.TestCase):
 
 @unittest.skipUnless(os.getenv("SRTS_TEST_RT"), "requires an initialized Mitsuba runtime")
 class TestOfflineCsiReplay(unittest.TestCase):
+    def test_csi_export_velocity_matches_sample_times_and_terrain_positions(self):
+        from backend import main  # Initializes the selected real solver.
+
+        req = CsiRunRequest(
+            mode="trajectory", output="cir", txs=[_device("ap", -5)],
+            rxs=[{**_device("ue", 0, 1), "heightReference": "ground", "height": 1.5}],
+            buildings=[{
+                "id": "slope", "kind": "mesh", "category": "terrain", "rfRole": "ground",
+                "height": 0, "enuPoints": [], "mesh": {
+                    "vertices": [0, 0, 0, 10, 0, 10, 10, 2, 10, 0, 2, 0],
+                    "triangles": [0, 1, 2, 0, 2, 3],
+                },
+            }],
+            freqGhz=3.5, maxDepth=0, numSubcarriers=8, speedKmh=3.6,
+            waypoints=[_point(0, 1), _point(10, 1)], timeSeconds=[0, 20],
+        )
+        for timing, duration, component in (
+            ({"timeSeconds": [0, 20]}, 20, 0.5),
+            ({"deriveTimeFromSpeed": True, "timeSeconds": []}, 14.1421356237, 0.707106781187),
+        ):
+            with self.subTest(timing=timing):
+                request = CsiRunRequest.model_validate({**req.model_dump(), **timing})
+                summary = main.api_csi_run(request)
+                run = main._csi_runs.pop(summary["runId"])
+                self.addCleanup(run.directory.cleanup)
+                self.assertEqual(summary["rxPositions"], [[[0, 1, 1.5]], [[10, 1, 11.5]]])
+                np.testing.assert_allclose(summary["timeSeconds"], [0, duration], rtol=1e-9)
+                with np.load(Path(run.directory.name) / "csi.npz") as archive:
+                    np.testing.assert_array_equal(archive["time_seconds"], summary["timeSeconds"])
+                    np.testing.assert_allclose(archive["rx_velocities"][:, 0], [[component, 0, component]] * 2, rtol=1e-9)
+
+        impossible = req.model_copy(update={"timeSeconds": [0, 1e-300]})
+        with patch("backend.csi_runs.build_scene", side_effect=AssertionError("Scene loaded")):
+            with self.assertRaisesRegex(ValueError, "velocity is outside"):
+                solve_csi_run(impossible)
+
     def test_static_and_multi_ap_trajectory_replay(self):
         from backend import main  # Initializes the selected real solver.
 
@@ -62,7 +98,7 @@ class TestOfflineCsiReplay(unittest.TestCase):
             **base, "mode": "trajectory", "output": "cir", "normalizeDelays": True,
             "txs": [*base["txs"], _device("ap2", 12, 3)], "speedKmh": 3.6, "waypointFrame": "ENU_m",
             "waypoints": [_point(5, 0, 5.5 + 0.5 * i) for i in range(7)],
-            "timeSeconds": [0.5 * i for i in range(7)], "buildings": [tree],
+            "deriveTimeFromSpeed": True, "buildings": [tree],
         }
         material = {"id": "itu_concrete", "relativePermittivity": 5.0, "conductivity": 0.1}
         reflected = {
@@ -112,6 +148,7 @@ class TestOfflineCsiReplay(unittest.TestCase):
                 np.testing.assert_array_equal(a[field], b[field])
             self.assertEqual(bool(a["valid_paths"].any()), expect_paths)
             if request.mode == "trajectory":
+                self.assertEqual(b["time_seconds"].tolist(), [0.5 * i for i in range(7)])
                 self.assertEqual(b["rx_positions"][:, 0, 2].tolist(), [5.5 + 0.5 * i for i in range(7)])
                 np.testing.assert_allclose(b["rx_velocities"][:, 0], [[0, 0, 1]] * 7)
             if request.output == "cir_cfr":

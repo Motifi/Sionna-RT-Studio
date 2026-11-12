@@ -31,8 +31,11 @@ jobs:
           python -m pip install -r backend/requirements.txt
           sudo apt-get update
           sudo apt-get install -y libllvm18
-          llvm="$(ldconfig -p | awk '/libLLVM-18\.so/ && !found {print $NF; found=1}')"
-          test -n "$llvm"
+          llvm="$(dpkg-query -L libllvm18 | awk '/\/libLLVM(-18\.so|\.so\.18)(\.[0-9]+)*$/ && !found { print; found = 1 }')"
+          if [[ ! -r "$llvm" ]]; then
+            echo 'Could not find the shared LLVM library installed by libllvm18.' >&2
+            exit 1
+          fi
           echo "DRJIT_LIBLLVM_PATH=$llvm" >> "$GITHUB_ENV"
       - name: Check the frontend
         run: |

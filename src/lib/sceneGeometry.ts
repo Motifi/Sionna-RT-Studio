@@ -2,6 +2,7 @@ import { Matrix3, Mesh, Vector3, type Intersection, type Object3D } from 'three'
 import type { BuildingFootprint, ENUVector, RadioRole } from '../types';
 
 const MIN_SUPPORT_NORMAL_UP = 0.7;
+const MAX_FLOOR_HEIGHT_SPAN_M = 1e-4;
 
 export function radioRole(object: BuildingFootprint): RadioRole {
   return object.rfRole ?? (object.category === 'building' ? 'surface' : 'visual');
@@ -25,13 +26,20 @@ export function findHorizontalSurface(hits: Intersection[], accepts: (object: Ob
 export function isFloorSurface(object: BuildingFootprint) {
   if (!object.floor || object.kind !== 'mesh' || !object.mesh || radioRole(object) !== 'surface') return false;
   if (object.buildingSpec && object.type !== 'generated_slab') return false;
-  const { vertices, triangles } = object.mesh;
+  const { baseZ = 0, mesh: { vertices, triangles } } = object;
   const edgeA = new Vector3();
   const edgeB = new Vector3();
   for (let i = 0; i < triangles.length; i += 3) {
     const a = triangles[i] * 3, b = triangles[i + 1] * 3, c = triangles[i + 2] * 3;
-    edgeA.set(vertices[b] - vertices[a], vertices[b + 1] - vertices[a + 1], vertices[b + 2] - vertices[a + 2]);
-    edgeB.set(vertices[c] - vertices[a], vertices[c + 1] - vertices[a + 1], vertices[c + 2] - vertices[a + 2]);
+    // Coverage uses world-space vertices rounded to the solver's float32 precision.
+    const az = Math.fround(vertices[a + 2] + baseZ);
+    const bz = Math.fround(vertices[b + 2] + baseZ);
+    const cz = Math.fround(vertices[c + 2] + baseZ);
+    if (Math.max(az, bz, cz) - Math.min(az, bz, cz) > MAX_FLOOR_HEIGHT_SPAN_M) continue;
+    const ax = Math.fround(vertices[a]);
+    const ay = Math.fround(vertices[a + 1]);
+    edgeA.set(Math.fround(vertices[b]) - ax, Math.fround(vertices[b + 1]) - ay, bz - az);
+    edgeB.set(Math.fround(vertices[c]) - ax, Math.fround(vertices[c + 1]) - ay, cz - az);
     if (edgeA.cross(edgeB).normalize().z >= MIN_SUPPORT_NORMAL_UP) return true;
   }
   return false;
