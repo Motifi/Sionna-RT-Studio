@@ -51,3 +51,13 @@ The script checks workspace navigation, project autosave, and the WebGL2 canvas 
 如果启动或求解失败，把验收输出目录中的 `report.json`、`studio.log` 和 `nvidia-smi` 输出交给 Codex。正常启动的求解日志保存在 `%LOCALAPPDATA%\SionnaRTStudio\logs\studio.log`。CPU 回退需要 x64 LLVM 运行库。可将 `DRJIT_LIBLLVM_PATH` 指向 `LLVM-C.dll` 的完整路径。
 
 For startup or solve failures, give Codex `report.json`, `studio.log`, and the output of `nvidia-smi`. The normal app writes its solver log to `%LOCALAPPDATA%\SionnaRTStudio\logs\studio.log`. CPU fallback requires the x64 LLVM runtime. Set `DRJIT_LIBLLVM_PATH` to the full path of `LLVM-C.dll` if needed.
+
+## 便携候选包 · Portable candidates
+
+候选 ZIP 解压后直接运行 `SionnaRTStudio.exe`。它自带 Python 和 .NET，不需要克隆仓库或安装开发工具。仍需 WebView2，以及支持 CUDA/OptiX 的 NVIDIA 驱动或用于 CPU 求解的 x64 LLVM。完整解压后可以移动整个文件夹。用同一候选提交的验收脚本传入 `-InstallDirectory` 指向解压目录，报告会记录包内 `build-info.json` 和实际使用的求解后端。
+
+Extract the candidate ZIP and open `SionnaRTStudio.exe`. The package includes
+Python and .NET. It requires WebView2 and either an NVIDIA CUDA/OptiX driver
+or x64 LLVM. Move the whole extracted folder together. Run the verifier from
+the matching checkout with `-InstallDirectory` pointing to the extracted
+directory. The report captures `build-info.json` and the actual solver backend.

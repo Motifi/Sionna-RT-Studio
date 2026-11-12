@@ -6,7 +6,8 @@
  * All RF solving happens on the Sionna RT backend (see api.ts).
  */
 
-import { GeoAnchor, ENUVector, BuildingFootprint, SolverRoof, Transmitter, PropagationPath, RadioMapGrid, ChannelGridConfig } from './types';
+import { GeoAnchor, ENUVector, BuildingFootprint, SolverRoof, Transmitter, PropagationPath, RadioMapGrid, ChannelGridConfig, WaypointFrame } from './types';
+import { hasTerrainMesh, radioRole, terrainHeight } from './lib/sceneGeometry';
 
 // Coordinate Math Constants
 const M_LAT = 110574;
@@ -93,9 +94,14 @@ export function getDeviceElevation(
   device: Pick<Transmitter, 'enu' | 'height' | 'heightReference'>,
   buildings: BuildingFootprint[],
   solverRoofs?: SolverRoof[],
-): number {
+): number | undefined {
   if (device.heightReference === 'enu') return device.height;
-  let roof = 0;
+  const ground = terrainHeight(device.enu, buildings);
+  if (device.heightReference === 'ground') {
+    if (ground === undefined && hasTerrainMesh(buildings)) return undefined;
+    return (ground ?? 0) + device.height;
+  }
+  let roof = ground ?? 0;
   if (solverRoofs) {
     for (const { topZ, rings } of solverRoofs) {
       if (topZ > roof && isPointInPolygon(device.enu, rings[0]) &&
@@ -107,7 +113,7 @@ export function getDeviceElevation(
   }
   // Keep local placement usable while the solver is unavailable or updating.
   for (const building of buildings) {
-    if (building.category !== 'building' || (building.kind ?? 'building') !== 'building' ||
+    if (building.category !== 'building' || radioRole(building) !== 'surface' || (building.kind ?? 'building') !== 'building' ||
       building.height <= 0 || building.enuPoints.length < 3) continue;
     const top = (building.baseZ ?? 0) + Math.max(building.height, 1);
     if (top > roof && isPointInPolygon(device.enu, building.enuPoints) && footprintArea(building.enuPoints) >= 0.5) {
@@ -115,6 +121,19 @@ export function getDeviceElevation(
     }
   }
   return roof + device.height;
+}
+
+export function getWaypointPosition(
+  enu: ENUVector,
+  receiver: Pick<Transmitter, 'height' | 'heightReference'>,
+  buildings: BuildingFootprint[],
+  solverRoofs?: SolverRoof[],
+  frame?: WaypointFrame,
+): ENUVector | undefined {
+  if (frame === 'ENU_m') return enu;
+  const height = getDeviceElevation({ ...receiver, enu }, buildings, solverRoofs);
+  if (height === undefined) return undefined;
+  return { ...enu, z: receiver.heightReference === 'enu' ? height + enu.z : height };
 }
 
 export function createIdSuffix(): string {
@@ -227,17 +246,22 @@ export class RequestTimeoutError extends Error {
 export async function withRequestTimeout<T>(
   timeoutMs: number,
   run: (signal: AbortSignal) => Promise<T>,
+  parentSignal?: AbortSignal,
 ): Promise<T> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const abort = () => controller.abort();
+  if (parentSignal?.aborted) abort();
+  else parentSignal?.addEventListener('abort', abort, { once: true });
+  const timer = setTimeout(abort, timeoutMs);
   try {
     return await run(controller.signal);
   } catch (error) {
     // Distinguish "we gave up" from "the caller/page aborted us".
-    if (controller.signal.aborted) throw new RequestTimeoutError(timeoutMs);
+    if (controller.signal.aborted && !parentSignal?.aborted) throw new RequestTimeoutError(timeoutMs);
     throw error;
   } finally {
     clearTimeout(timer);
+    parentSignal?.removeEventListener('abort', abort);
   }
 }
 
@@ -555,6 +579,9 @@ export function exportCoverageChannelGrid(
       schema: 'sionna_rt_studio_channel_grid_v1',
       dataset_kind: 'coverage_power_proxy',
       source_metric: grid.metric ?? 'power',
+      source_solver_method: grid.solverMethod,
+      source_floor_id: grid.floorId,
+      source_scene_id: grid.sceneId,
       h_model: 'magnitude = best-server coverage power; phase = deterministic f(cell x,y). Not Sionna paths.cfr().',
       antenna_configuration: {
         tx_array: tx.antennaArraySize,
@@ -572,7 +599,7 @@ export function exportCoverageChannelGrid(
     dataset: grid.cells.map((cell, idx) => {
       // Voltage magnitude from the cell's coverage power (RSS), shared across
       // subcarriers; the phase below is deterministic per coordinate (reproducible).
-      const amplitude = Math.pow(10, cell.powerDbm / 20);
+      const amplitude = cell.sampled === false ? 0 : Math.pow(10, cell.powerDbm / 20);
       const subcarriers_data = Array.from({ length: config.numSubcarriers }).map((_, scIdx) => {
         const freqOffset = (scIdx - config.numSubcarriers / 2) * (config.bandwidthMhz / config.numSubcarriers);
         // Deterministic (not random) phase from the cell coordinate.
@@ -587,6 +614,7 @@ export function exportCoverageChannelGrid(
 
       return {
         receiver_index: idx,
+        sampled: cell.sampled !== false,
         coordinate_enu_m: [cell.x, cell.y, cell.z],
         los_status: cell.isLos ? 1 : 0, // geometric visibility from the serving transmitter
         received_power_dbm: cell.powerDbm,

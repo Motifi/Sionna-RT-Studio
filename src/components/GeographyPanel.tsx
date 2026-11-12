@@ -5,6 +5,7 @@
 
 import { useState } from 'react';
 import { useI18n } from '../i18n';
+import { radioMaterialLabel } from '../lib/radioLabels';
 import { defaultMaterialConfig, type MaterialConfig, type ScatteringPattern } from '../types';
 
 interface GeographyPanelProps {
@@ -19,13 +20,15 @@ export function GeographyPanel({ materialIds, materialConfigs, onMaterialChange 
   const { t } = useI18n();
   const [selectedId, setSelectedId] = useState('');
   const id = materialIds.includes(selectedId) ? selectedId : materialIds[0];
-  if (!id) return <p className="text-xs text-[var(--text-mid)]">{t('No radio materials in this scene.', '当前场景没有无线材质。')}</p>;
+  if (!id) return <p className="text-xs text-[var(--text-mid)]">{t('No radio materials in this scene.', '当前场景没有射频材质。')}</p>;
   const cfg = materialConfigs.find(material => material.id === id) ?? defaultMaterialConfig(id);
 
   return <div className="space-y-2.5 text-xs">
     <label className="flex flex-col gap-1 font-medium">{t('Scene material', '场景材质')}
       <select className={field} value={id} onChange={event => setSelectedId(event.target.value)}>
-        {materialIds.map(materialId => <option key={materialId}>{materialId}</option>)}
+        {materialIds.map(materialId => <option key={materialId} value={materialId} title={materialId}>
+          {radioMaterialLabel(materialId, t)}
+        </option>)}
       </select>
     </label>
     <div key={id} className="space-y-2.5">

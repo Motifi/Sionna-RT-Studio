@@ -1,0 +1,280 @@
+{
+  "format": "SionnaRTStudio Project",
+  "schemaVersion": 5,
+  "projectId": "cc4111d6-a422-4ccc-b1aa-cfe7e9512c5b",
+  "savedAtUtc": "2026-11-12T00:00:00Z",
+  "state": {
+    "scene": {
+      "coordinateFrame": "ENU_m",
+      "name": "Synthetic indoor reference room",
+      "anchor": {
+        "latitude": 0,
+        "longitude": 0
+      },
+      "buildings": [
+        {
+          "id": "wall-south",
+          "name": "South wall",
+          "type": "wall",
+          "kind": "wall",
+          "category": "building",
+          "material": "itu_brick",
+          "points": [
+            {
+              "lat": -8.098477486232588e-05,
+              "lon": -0.00010779830936318149
+            },
+            {
+              "lat": -8.098477486232588e-05,
+              "lon": 0.00010779830936318149
+            }
+          ],
+          "enuPoints": [
+            {
+              "x": -12,
+              "y": -9,
+              "z": 0
+            },
+            {
+              "x": 12,
+              "y": -9,
+              "z": 0
+            }
+          ],
+          "baseZ": 0,
+          "height": 3.5,
+          "source": "template"
+        },
+        {
+          "id": "wall-east",
+          "name": "East wall",
+          "type": "wall",
+          "kind": "wall",
+          "category": "building",
+          "material": "itu_brick",
+          "points": [
+            {
+              "lat": -8.098477486232588e-05,
+              "lon": 0.00010779830936318149
+            },
+            {
+              "lat": 8.098477486232588e-05,
+              "lon": 0.00010779830936318149
+            }
+          ],
+          "enuPoints": [
+            {
+              "x": 12,
+              "y": -9,
+              "z": 0
+            },
+            {
+              "x": 12,
+              "y": 9,
+              "z": 0
+            }
+          ],
+          "baseZ": 0,
+          "height": 3.5,
+          "source": "template"
+        },
+        {
+          "id": "wall-north",
+          "name": "North wall",
+          "type": "wall",
+          "kind": "wall",
+          "category": "building",
+          "material": "itu_brick",
+          "points": [
+            {
+              "lat": 8.098477486232588e-05,
+              "lon": 0.00010779830936318149
+            },
+            {
+              "lat": 8.098477486232588e-05,
+              "lon": -0.00010779830936318149
+            }
+          ],
+          "enuPoints": [
+            {
+              "x": 12,
+              "y": 9,
+              "z": 0
+            },
+            {
+              "x": -12,
+              "y": 9,
+              "z": 0
+            }
+          ],
+          "baseZ": 0,
+          "height": 3.5,
+          "source": "template"
+        },
+        {
+          "id": "wall-west",
+          "name": "West wall",
+          "type": "wall",
+          "kind": "wall",
+          "category": "building",
+          "material": "itu_brick",
+          "points": [
+            {
+              "lat": 8.098477486232588e-05,
+              "lon": -0.00010779830936318149
+            },
+            {
+              "lat": -8.098477486232588e-05,
+              "lon": -0.00010779830936318149
+            }
+          ],
+          "enuPoints": [
+            {
+              "x": -12,
+              "y": 9,
+              "z": 0
+            },
+            {
+              "x": -12,
+              "y": -9,
+              "z": 0
+            }
+          ],
+          "baseZ": 0,
+          "height": 3.5,
+          "source": "template"
+        }
+      ]
+    },
+    "devices": {
+      "transmitters": [
+        {
+          "id": "ap-west",
+          "name": "AP WEST",
+          "latitude": -2.699492495410863e-05,
+          "longitude": -5.3899154681590744e-05,
+          "enu": {
+            "x": -6,
+            "y": -3,
+            "z": 1.5
+          },
+          "height": 1.5,
+          "heightReference": "enu",
+          "antennaArraySize": [
+            1,
+            1
+          ],
+          "powerDbm": 20,
+          "beamsteeringAzimuth": 90,
+          "beamsteeringElevation": 0
+        },
+        {
+          "id": "ap-east",
+          "name": "AP EAST",
+          "latitude": 3.599323327214484e-05,
+          "longitude": 4.4915962234658956e-05,
+          "enu": {
+            "x": 5,
+            "y": 4,
+            "z": 1.5
+          },
+          "height": 1.5,
+          "heightReference": "enu",
+          "antennaArraySize": [
+            1,
+            1
+          ],
+          "powerDbm": 17,
+          "beamsteeringAzimuth": -90,
+          "beamsteeringElevation": 0
+        }
+      ],
+      "receivers": [
+        {
+          "id": "ue-reference",
+          "name": "Reference UE",
+          "latitude": -2.699492495410863e-05,
+          "longitude": 8.98319244693179e-06,
+          "enu": {
+            "x": 1,
+            "y": -3,
+            "z": 1.5
+          },
+          "height": 1.5,
+          "heightReference": "enu",
+          "antennaArraySize": [
+            1,
+            1
+          ]
+        }
+      ],
+      "activeTxId": "ap-west",
+      "activeRxId": "ue-reference",
+      "fronthaulMbpsByTxId": {
+        "ap-west": 1000,
+        "ap-east": 1000
+      }
+    },
+    "solver": {
+      "carrierFrequencyGhz": 3.5,
+      "maxDepth": 0,
+      "options": {
+        "los": true,
+        "specularReflection": false,
+        "diffuseReflection": false,
+        "refraction": false,
+        "diffraction": false,
+        "edgeDiffraction": false,
+        "txPattern": "iso",
+        "rxPattern": "iso",
+        "txPolarization": "V",
+        "rxPolarization": "V",
+        "pathSamplesPerSource": 10000,
+        "pathSeed": 42
+      },
+      "materialConfigs": {
+        "itu_brick": {
+          "id": "itu_brick",
+          "scatteringCoefficient": 0,
+          "xpdCoefficient": 0,
+          "scatteringPattern": "none",
+          "thickness": 0.2
+        }
+      }
+    },
+    "csi": {
+      "numSubcarriers": 16,
+      "subcarrierSpacingKhz": 30,
+      "normalizeDelays": true
+    },
+    "coverage": {
+      "metric": "power",
+      "bandwidthMhz": 100,
+      "noiseFigureDb": 7,
+      "heightM": 1.5,
+      "gridStepM": 2,
+      "samplesPerTx": 10000,
+      "seed": 42
+    },
+    "mobility": {
+      "trajectoriesByRxId": {},
+      "combineMode": "best_server",
+      "handover": {
+        "hysteresisDb": 3,
+        "timeToTriggerMs": 160
+      },
+      "speedKmh": 3.6,
+      "intervalMs": 500
+    },
+    "display": {
+      "workspace": "scene",
+      "activeMode": "link",
+      "showOutlines": true,
+      "showRaysOnHeatmap": false,
+      "radioMapColormap": "viridis",
+      "radioMapAutoRange": true,
+      "radioMapVmin": -120,
+      "radioMapVmax": -40
+    }
+  }
+}

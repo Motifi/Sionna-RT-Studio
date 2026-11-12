@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "freqGhz": [
+    3.5,
+    5.8
+  ],
+  "output": "cir",
+  "arrays": [
+    {
+      "id": "single-port",
+      "tx": [
+        1,
+        1
+      ],
+      "rx": [
+        1,
+        1
+      ]
+    },
+    {
+      "id": "two-element-ap",
+      "tx": [
+        2,
+        1
+      ],
+      "rx": [
+        1,
+        1
+      ]
+    }
+  ],
+  "deployments": [
+    {
+      "id": "both-saved-aps"
+    },
+    {
+      "id": "west-ap-moved",
+      "aps": {
+        "ap-west": {
+          "enu": {
+            "x": -4,
+            "y": -3,
+            "z": 1.5
+          }
+        }
+      }
+    }
+  ]
+}

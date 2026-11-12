@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import type { BuildingFootprint, ENUVector, GeoAnchor } from './types';
 import { createIdSuffix, enuToLatLon } from './utils';
+import { radioRole } from './lib/sceneGeometry';
 
-export type SceneTool = 'select' | 'rectangle' | 'polygon' | 'wall' | 'move';
+export type SceneTool = 'select' | 'generate' | 'rectangle' | 'polygon' | 'wall' | 'move';
 export type SceneLayer = BuildingFootprint['category'];
 
 export function withFootprint(object: BuildingFootprint, vertices: ENUVector[], anchor: GeoAnchor) {
@@ -13,6 +14,7 @@ export function useSceneEditor(
   buildings: BuildingFootprint[], anchor: GeoAnchor,
   setBuildings: (objects: BuildingFootprint[]) => void, setAnchor: (anchor: GeoAnchor) => void,
   initialHiddenLayers: SceneLayer[] = [],
+  onDrawBuilding?: (first: ENUVector, opposite: ENUVector) => void,
 ) {
   const [history, setHistory] = useState<{
     buildings: BuildingFootprint[]; anchor: GeoAnchor; restoreMaterials?: () => void;
@@ -67,7 +69,10 @@ export function useSceneEditor(
     const mesh = object.mesh && { ...object.mesh, vertices: object.mesh.vertices.map(
       (value, index) => value + (index % 3 === 0 ? dx : index % 3 === 1 ? dy : 0),
     ) };
-    return withFootprint({ ...object, mesh }, vertices, anchor);
+    const foliage = object.foliage && {
+      ...object.foliage, center: { ...object.foliage.center, x: object.foliage.center.x + dx, y: object.foliage.center.y + dy },
+    };
+    return withFootprint({ ...object, mesh, foliage }, vertices, anchor);
   };
   const click = (point: ENUVector, hitId?: string) => {
     if (tool === 'select') {
@@ -80,6 +85,9 @@ export function useSceneEditor(
       setDraft([...draft, point]);
     } else if (tool === 'wall') {
       create('wall', [draft[0], point]);
+    } else if (tool === 'generate') {
+      onDrawBuilding?.(draft[0], point);
+      chooseTool('select');
     } else if (tool === 'rectangle') {
       const first = draft[0];
       create('building', [first, { ...first, x: point.x }, point, { ...first, y: point.y }]);
@@ -91,7 +99,7 @@ export function useSceneEditor(
     hiddenLayers, setHiddenLayers, draft, click, update,
     finish: () => { if (tool === 'polygon' && draft.length >= 3) create('building', draft); },
     duplicate: () => {
-      if (selected) insert({ ...shift(selected, 3, 3), id: createIdSuffix() });
+      if (selected) insert({ ...shift(selected, 3, 3), id: createIdSuffix(), buildingSpec: undefined });
     },
     remove: () => {
       if (selected) commit(buildings.filter(object => object.id !== selected.id));
@@ -106,8 +114,8 @@ export type SceneEditor = ReturnType<typeof useSceneEditor>;
 // Coordinates/EM inputs only. Labels, map decorations and view controls are
 // excluded from the frontend invalidation key.
 export function physicalSceneInputs(objects: BuildingFootprint[]) {
-  return objects.filter(object => object.category === 'building').map(
-    ({ kind, baseZ, height, material, enuPoints, mesh }) => [kind ?? 'building', baseZ ?? 0,
-      height, material, enuPoints.map(({ x, y }) => [x, y]), mesh],
+  return objects.filter(object => radioRole(object) !== 'visual').map(
+    object => [object.id, radioRole(object), object.kind ?? 'building', object.baseZ ?? 0, object.height,
+      object.material, object.enuPoints.map(({ x, y }) => [x, y]), object.mesh, object.foliage],
   );
 }

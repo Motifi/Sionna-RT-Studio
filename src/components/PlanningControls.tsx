@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Cable, Route } from 'lucide-react';
 import type { HandoverConfig } from '../api';
 import { useI18n } from '../i18n';
-import type { GeoAnchor, MobilityCombineMode, Receiver, TrajectoryPoint, Transmitter } from '../types';
+import type { GeoAnchor, MobilityCombineMode, Receiver, TrajectoryPoint, Transmitter, WaypointFrame } from '../types';
 import { enuToLatLon } from '../utils';
 import { NumberField } from './NumberField';
 
@@ -57,10 +57,11 @@ interface RouteControlsProps {
   rx: Receiver;
   anchor: GeoAnchor;
   trajectoryPoints: readonly TrajectoryPoint[];
-  onTrajectoryChange: (points: TrajectoryPoint[]) => void;
+  waypointFrame?: WaypointFrame;
+  onTrajectoryChange: (points: TrajectoryPoint[], frame?: WaypointFrame) => void;
 }
 
-export function RouteControls({ tx, rx, anchor, trajectoryPoints, onTrajectoryChange }: RouteControlsProps) {
+export function RouteControls({ tx, rx, anchor, trajectoryPoints, waypointFrame, onTrajectoryChange }: RouteControlsProps) {
   const { t } = useI18n();
 
   const generateLoop = () => {
@@ -88,16 +89,21 @@ export function RouteControls({ tx, rx, anchor, trajectoryPoints, onTrajectoryCh
           {t('Use Draw route in the 3D view to add waypoints.', '使用三维视图中的「绘制轨迹」添加控制点。')}
         </p>
       )}
-      {rx.heightReference === 'enu' && trajectoryPoints.length > 0 &&
+      {(waypointFrame === 'ENU_m' || rx.heightReference === 'enu') && trajectoryPoints.length > 0 &&
         <details className="text-xs">
-          <summary className="cursor-pointer">{t('Waypoint offsets from UE elevation (m)', '控制点相对 UE 的标高偏移（米）')}</summary>
+          <summary className="cursor-pointer">{waypointFrame === 'ENU_m'
+            ? t('Absolute ENU waypoints (m)', '绝对 ENU 控制点（米）')
+            : t('Waypoint offsets from UE elevation (m)', '控制点相对 UE 的标高偏移（米）')}</summary>
           <div className="mt-2 grid grid-cols-2 gap-2">
             {trajectoryPoints.map((point, index) => <label key={index}>
-              {index + 1}
+              {waypointFrame === 'ENU_m'
+                ? t(`E ${point.enu.x.toFixed(3)} · N ${point.enu.y.toFixed(3)} · Up`,
+                  `东 ${point.enu.x.toFixed(3)} · 北 ${point.enu.y.toFixed(3)} · 高程`)
+                : index + 1}
               <NumberField value={point.enu.z} className={inputClass} step="any"
                 onChange={z => onTrajectoryChange(trajectoryPoints.map((entry, i) =>
                   i === index ? { ...entry, enu: { ...entry.enu, z } } : entry,
-                ))} />
+                ), waypointFrame)} />
             </label>)}
           </div>
         </details>}

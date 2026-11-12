@@ -9,8 +9,11 @@ export interface CoverageDisplayRange {
 }
 
 export function coverageCellValue(cell: RadioMapCell, metric: CoverageMetric): number | null {
+  if (cell.sampled === false || cell.servingTx === null) return null;
   const value = metric === 'sinr' ? cell.sinr : cell.powerDbm;
-  return value != null && Number.isFinite(value) && value > -200 ? value : null;
+  if (value == null || !Number.isFinite(value)) return null;
+  // Historical grids may omit servingTx and encode unresolved power as -250.
+  return metric === 'power' && cell.servingTx === undefined && value === -250 ? null : value;
 }
 
 export function coverageDisplayRange(
@@ -20,7 +23,7 @@ export function coverageDisplayRange(
   vmax: number,
 ): CoverageDisplayRange | null {
   const metric = radioMap.metric ?? 'power';
-  const autoStretch = autoRange || metric === 'sinr';
+  const autoStretch = autoRange;
   let min = Infinity;
   let max = -Infinity;
   for (const cell of radioMap.cells) {

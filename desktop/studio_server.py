@@ -31,7 +31,9 @@ class LocalOrigin:
 
 def wait_for_parent_exit(stopped):
     if sys.platform != "win32":
-        sys.stdin.buffer.read(1)
+        # Startup can fail while the parent is still holding the pipe open.
+        # Avoid holding a Python buffered I/O lock during interpreter shutdown.
+        os.read(sys.stdin.fileno(), 1)
         return
 
     # A blocked stdin read can deadlock NumPy and SciPy DLL initialization

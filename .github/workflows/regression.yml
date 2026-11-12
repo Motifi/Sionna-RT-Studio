@@ -1,0 +1,53 @@
+name: Studio regression
+
+on: [push, pull_request, workflow_dispatch]
+
+permissions:
+  contents: read
+
+jobs:
+  llvm-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      SRTS_MITSUBA_VARIANT: llvm_ad_mono_polarized
+      SRTS_TEST_RT: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: Install test dependencies
+        run: |
+          npm ci --no-audit --no-fund
+          python -m pip install -r backend/requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y libllvm18
+          llvm="$(ldconfig -p | awk '/libLLVM-18\.so/ && !found {print $NF; found=1}')"
+          test -n "$llvm"
+          echo "DRJIT_LIBLLVM_PATH=$llvm" >> "$GITHUB_ENV"
+      - name: Check the frontend
+        run: |
+          npm run lint -- --noUnusedLocals
+          node --import tsx --test scripts/check-project-storage.ts scripts/check-scene-devices.ts scripts/check-csi-history.ts scripts/check-quick-start.ts scripts/check-coverage-comparison.ts
+      - name: Run backend tests with real LLVM solves
+        run: python -m unittest discover backend/tests
+      - name: Verify physical fixtures, archive replay, and restart
+        if: success() || failure()
+        run: python -B scripts/verify_scene_workbench.py http://127.0.0.1:8011 "$RUNNER_TEMP/studio-regression" --launch
+      - name: Save solver evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: studio-llvm-regression
+          path: ${{ runner.temp }}/studio-regression
+          if-no-files-found: warn
+          retention-days: 7

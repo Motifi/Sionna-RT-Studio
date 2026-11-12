@@ -199,6 +199,8 @@ print('Native Python libraries loaded.', flush=True)
 '@
     $installedRuntime = Join-Path $InstallDirectory 'runtime'
     Invoke-CheckedCommand $solverPython @('-I', '-X', 'faulthandler', '-u', '-c', $nativeProbe, $installedRuntime)
+    $buildInfoScript = Join-Path $source 'scripts\candidate_info.py'
+    Invoke-CheckedCommand $solverPython @('-B', '-I', $buildInfoScript, (Join-Path $InstallDirectory 'build-info.json'), 'windows-x64-installed')
     Set-Content -LiteralPath (Join-Path $InstallDirectory $markerName) -Value 'Sionna RT Studio for Windows x64' -Encoding ASCII
     Rename-Item -LiteralPath "$exe.staged" -NewName $exeName
     $installed = $true

@@ -74,8 +74,17 @@ internal sealed class StudioWindow : Form
     private async Task OpenWorkspaceAsync()
     {
         var token = lifetime.Token;
-        var environment = await CoreWebView2Environment.CreateAsync(userDataFolder: profilePath)
-            .WaitAsync(TimeSpan.FromSeconds(30), token);
+        CoreWebView2Environment environment;
+        try
+        {
+            environment = await CoreWebView2Environment.CreateAsync(userDataFolder: profilePath)
+                .WaitAsync(TimeSpan.FromSeconds(30), token);
+        }
+        catch (WebView2RuntimeNotFoundException error)
+        {
+            throw new InvalidOperationException("Install Microsoft Edge WebView2 Runtime (x64), then reopen Studio. "
+                + "PowerShell: winget install --exact --id Microsoft.EdgeWebView2Runtime --architecture x64", error);
+        }
         await webView.EnsureCoreWebView2Async(environment).WaitAsync(TimeSpan.FromSeconds(30), token);
         var core = webView.CoreWebView2;
         core.Settings.AreHostObjectsAllowed = false;

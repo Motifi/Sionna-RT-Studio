@@ -6,6 +6,8 @@
 export interface GeoAnchor {
   latitude: number;
   longitude: number;
+  elevation?: number;
+  verticalDatum?: string;
 }
 
 export interface ENUVector {
@@ -15,6 +17,35 @@ export interface ENUVector {
 }
 
 export type PlacementMode = 'none' | 'add-tx' | 'add-rx' | 'move-tx' | 'move-rx';
+
+export type RadioRole = 'surface' | 'ground' | 'foliage' | 'visual';
+export type HeightReference = 'roof' | 'enu' | 'ground';
+export type WaypointFrame = 'ENU_m';
+
+export interface FoliageVolume {
+  center: ENUVector;
+  radii: ENUVector;
+  attenuationDbPerM: number;
+}
+
+export interface SceneVisual {
+  glb: string;
+  bindings: { id: string; origin: ENUVector }[];
+}
+
+export interface BuildingSpec {
+  id: string;
+  name: string;
+  east: number;
+  north: number;
+  length: number;
+  width: number;
+  height: number;
+  baseZ: number;
+  floors?: number;
+  rotationDeg?: number;
+  layout: 'office' | 'apartments';
+}
 
 export interface BuildingFootprint {
   id: string;
@@ -35,6 +66,11 @@ export interface BuildingFootprint {
   category: 'building' | 'infrastructure' | 'terrain' | 'water';
   type: string;
   material: string; // e.g., 'itu_concrete', 'itu_glass', 'itu_brick'
+  rfRole?: RadioRole;
+  floor?: string;
+  geometrySource?: string;
+  foliage?: FoliageVolume;
+  buildingSpec?: BuildingSpec;
 }
 
 export interface SolverRoof {
@@ -48,7 +84,7 @@ export interface Transmitter {
   latitude: number;
   longitude: number;
   height: number; // Meters, relative to ground/roof by default
-  heightReference?: 'roof' | 'enu';
+  heightReference?: HeightReference;
   enu: ENUVector;
   powerDbm: number; // e.g., 30 dBm (1W)
   antennaArraySize: [number, number]; // [horizontal, vertical] e.g. [8, 8] for massive MIMO
@@ -57,7 +93,7 @@ export interface Transmitter {
 }
 
 export interface Receiver {
-  heightReference?: 'roof' | 'enu';
+  heightReference?: HeightReference;
   id: string;
   name: string;
   latitude: number;
@@ -101,6 +137,7 @@ export interface ChannelMetrics {
   rmsDelaySpreadValid?: boolean;
   strongestPathPowerDbm: number;
   strongestPathType: string;
+  firstArrivalDelayNs?: number | null;
 }
 
 export type CoverageMetric = 'power' | 'sinr';
@@ -110,6 +147,33 @@ export type CoverageMetric = 'power' | 'sinr';
 // power over all Tx. A cross-Tx delay spread is undefined in the latter mode.
 export type MobilityCombineMode = 'best_server' | 'sum';
 
+export interface CoverageRegion {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
+export interface CoveragePreflight {
+  solverMethod: NonNullable<RadioMapGrid['solverMethod']>;
+  gridSize: number;
+  nx: number;
+  ny: number;
+  cells: number;
+  measuredCells: number | null;
+  transmitterCount: number;
+  apCells: number;
+  maxCells: number;
+  maxApCells: number;
+  traceBatches: number | null;
+  samplesPerBatch: number | null;
+  totalSamples: number | null;
+  maxSamplesPerBatch: number | null;
+  maxTotalSamples: number | null;
+  estimatedRasterBytes: number;
+  issues: string[];
+}
+
 export interface RadioMapCell {
   x: number;
   y: number;
@@ -118,6 +182,7 @@ export interface RadioMapCell {
   isLos: boolean;
   sinr?: number | null; // best-server SINR [dB]
   servingTx?: number | null;
+  sampled?: boolean;
 }
 
 export interface CoverageStats {
@@ -145,6 +210,11 @@ export interface RadioMapGrid {
   stats?: CoverageStats | null;
   samplesPerTx?: number;
   seed?: number;
+  solverMethod?: 'radio_map' | 'traced_receivers' | 'direct_receivers';
+  traceBatches?: number | null;
+  floorId?: string | null;
+  floorElevationM?: number | null;
+  sceneId?: string;
 }
 
 // OFDM grid for coverage-proxy and ray-traced channel-grid exports.

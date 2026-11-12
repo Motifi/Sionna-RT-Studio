@@ -155,7 +155,8 @@ function GridDownload({ tx, rx, buildings, radioMap, freqGhz, maxDepth, solverOp
   const [grid, setGrid] = useState<ChannelGridConfig>({ numSubcarriers: 64, bandwidthMhz: 100 });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const cellCount = radioMap?.cells.length ?? 0;
+  const sampledCells = radioMap?.cells.filter(cell => cell.sampled !== false) ?? [];
+  const cellCount = sampledCells.length;
   const overCap = cellCount > CHANNEL_GRID_MAX_CELLS;
   const disabled = !backendOnline || !cellCount || overCap || busy;
 
@@ -164,7 +165,7 @@ function GridDownload({ tx, rx, buildings, radioMap, freqGhz, maxDepth, solverOp
     setBusy(true);
     setError('');
     try {
-      const cells = radioMap.cells.map(({ x, y, z }) => ({ x, y, z }));
+      const cells = sampledCells.map(({ x, y, z }) => ({ x, y, z }));
       const numSubcarriers = Math.max(1, Math.round(grid.numSubcarriers));
       const subcarrierSpacing = Math.max(1, grid.bandwidthMhz * 1e6 / numSubcarriers);
       const { blob, filename } = await exportChannelGrid(
@@ -182,8 +183,8 @@ function GridDownload({ tx, rx, buildings, radioMap, freqGhz, maxDepth, solverOp
   return (
     <div className="grid gap-2.5 pt-3 text-xs text-[var(--text-mid)]">
       <p>{t(
-        'Trace the coverage cells with the active Tx and Rx arrays and download per-port CFR.',
-        '用当前 Tx 和 Rx 阵列逐格追踪，下载各端口的 CFR。',
+        'Run a new ray trace at the sampled grid locations with the active Tx and Rx arrays. The per-port CFR uses each link’s first arrival as the delay reference.',
+        '用当前 Tx 和 Rx 阵列在已采样的栅格点重新追踪。逐端口 CFR 以各链路首径作为时延参考。',
       )}</p>
       <GridFrequencyFields config={grid} onChange={setGrid} disabled={busy} />
       {cellCount === 0 ? (
