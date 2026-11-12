@@ -1,17 +1,21 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from 'react';
 import {
-  ChevronDown, Copy, Crosshair, Eye, EyeOff, FileBox, FilePlus2, Layers3, Map as MapIcon,
+  Building2, ChevronDown, Copy, Crosshair, Eye, EyeOff, FileBox, FilePlus2, Layers3, Map as MapIcon,
   MapPin, Move, Pentagon, Plus, Search, ShieldCheck, Square, SquareStack,
   Trash2, TriangleAlert, Undo2, X,
 } from 'lucide-react';
 import type { SceneInspection, SceneObjectReport } from '../api';
 import { useI18n } from '../i18n';
 import { withFootprint, type SceneEditor, type SceneLayer, type SceneTool } from '../sceneEditor';
-import type { BuildingFootprint, GeoAnchor } from '../types';
+import type { BuildingFootprint, BuildingSpec, GeoAnchor } from '../types';
+import { isRadioSurface } from '../lib/sceneGeometry';
+import { sceneFloorLabel, sceneGeometrySourceLabel, sceneIssueLabel, sceneNameLabel, sceneObjectName } from '../lib/sceneLabels';
+import { radioMaterialLabel } from '../lib/radioLabels';
+import { SceneErrorNotice } from './SceneErrorNotice';
 
 const layers: SceneLayer[] = ['building', 'infrastructure', 'terrain', 'water'];
 const materials = ['itu_concrete', 'itu_brick', 'itu_glass', 'itu_metal', 'itu_wood',
-  'itu_medium_dry_ground', 'itu_wet_ground'];
+  'itu_asphalt_concrete', 'itu_plasterboard', 'itu_medium_dry_ground', 'itu_wet_ground'];
 const button = 'btn-quiet inline-flex min-h-8 items-center justify-center gap-1.5 px-2.5 py-1 text-xs whitespace-nowrap cursor-pointer disabled:cursor-not-allowed';
 const activeButton = 'border-[var(--accent)]! bg-[var(--accent-soft)]! text-[var(--accent-deep)]!';
 const field = 'rounded-lg border border-[var(--line)] bg-[var(--ink-750)] px-2.5 py-1.5 min-w-0 w-full text-sm';
@@ -22,15 +26,16 @@ type Translate = ReturnType<typeof useI18n>['t'];
 
 function layerLabel(layer: SceneLayer, t: Translate) {
   return {
-    building: t('Physical objects', '物理对象'),
-    infrastructure: t('Roads', '道路'),
-    terrain: t('Landscape', '绿地'),
+    building: t('Buildings and components', '建筑与构件'),
+    infrastructure: t('Roads and fixtures', '道路与设施'),
+    terrain: t('Terrain and vegetation', '地形与绿化'),
     water: t('Water', '水体'),
   }[layer];
 }
 
 function objectLabel(object: BuildingFootprint, t: Translate) {
-  if (object.name) return object.name;
+  const name = sceneObjectName(object, t);
+  if (name) return name;
   if (object.category !== 'building') return object.id;
   const kind = object.kind === 'wall' ? t('Wall', '墙')
     : object.kind === 'mesh' ? t('Mesh', '网格') : t('Building', '建筑');
@@ -66,15 +71,27 @@ interface ToolbarProps {
   meshImport: ReactNode;
   onToggleInspection: () => void;
   compactControls?: ReactNode;
+  onUseUrbanDemo: () => void;
+  onOpenExperiments: () => void;
+  onImportPackage: (file: File) => void;
+  packageBusy: boolean;
+  packageError: string;
+  sceneName?: string;
+  sceneObjects: readonly BuildingFootprint[];
+  floors: string[];
+  sceneFloor?: string;
+  onSelectFloor: (floor: string | undefined) => void;
 }
 
 type ImportSource = 'osm' | 'mesh';
 
 export function SceneToolbar({
   editor, onOpenBlank, onUseStarter, osmImport, meshImport, onToggleInspection, compactControls,
+  onUseUrbanDemo, onOpenExperiments, onImportPackage, packageBusy, packageError, sceneName, sceneObjects, floors, sceneFloor, onSelectFloor,
 }: ToolbarProps) {
   const { t } = useI18n();
   const sourceMenu = useRef<HTMLDetailsElement>(null);
+  const packageInput = useRef<HTMLInputElement>(null);
   const drawingMenu = useRef<HTMLDetailsElement>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const dialogTitle = useId();
@@ -143,12 +160,15 @@ export function SceneToolbar({
   };
 
   const tools = [
+    { tool: 'generate', label: t('Generate a building', '生成建筑'), Icon: Building2 },
     { tool: 'rectangle', label: t('Rectangle', '矩形建筑'), Icon: Square },
     { tool: 'polygon', label: t('Polygon', '多边形建筑'), Icon: Pentagon },
     { tool: 'wall', label: t('Wall', '墙'), Icon: SquareStack },
   ] as const;
   const instructions = {
     select: '',
+    generate: editor.draft.length === 0 ? t('Click the first corner of the building footprint.', '点击建筑占地的第一个角点。')
+      : t('Click the opposite corner to set the building dimensions.', '点击对角点，然后设置建筑尺寸。'),
     rectangle: editor.draft.length === 0 ? t('Click the first corner on the ground.', '在地面点击第一个角点。')
       : t('Click the opposite corner.', '点击对角点。'),
     polygon: t('Click each vertex. Finish when you have at least three.', '依次点击顶点，至少放置三个后即可完成。'),
@@ -162,26 +182,45 @@ export function SceneToolbar({
       <details ref={sourceMenu} onKeyDown={closeOnEscape} className="relative">
         <summary className={summary}><Layers3 size={15} aria-hidden="true" />{t('Scene Source', '场景来源')}<ChevronDown size={12} aria-hidden="true" /></summary>
         <div className={menu}>
+          <button id="btn-open-example-experiments" type="button" className={menuItem}
+            onClick={() => startSource(onOpenExperiments)}>
+            <Layers3 size={15} aria-hidden="true" />{t('Example experiments', '示例实验')}
+          </button>
+          <button id="btn-open-urban-demo" type="button" className={menuItem} disabled={packageBusy}
+            onClick={() => startSource(onUseUrbanDemo)}>
+            <Layers3 size={15} aria-hidden="true" />{t('Open urban example', '打开城市场景示例')}
+          </button>
+          <button type="button" className={menuItem} disabled={packageBusy}
+            onClick={() => startSource(() => packageInput.current?.click())}>
+            <FileBox size={15} aria-hidden="true" />{t('Import scene package', '导入场景包')}
+          </button>
           <button type="button" className={menuItem} onClick={() => startSource(onOpenBlank)}>
             <FilePlus2 size={15} aria-hidden="true" />{t('Start blank scene', '从空白场景开始')}
           </button>
           <button id="btn-use-starter-scene" type="button" className={menuItem} onClick={() => startSource(onUseStarter)}>
-            <Layers3 size={15} aria-hidden="true" />{t('Use the built-in street scene', '使用内置街区')}
+            <Layers3 size={15} aria-hidden="true" />{t('Use the built-in street canyon', '使用内置街谷示例')}
           </button>
           <button type="button" aria-haspopup="dialog" className={menuItem} onClick={() => openImport('osm')}>
             <MapIcon size={15} aria-hidden="true" />{t('Import OpenStreetMap', '导入 OpenStreetMap')}
           </button>
           <button type="button" aria-haspopup="dialog" className={menuItem} onClick={() => openImport('mesh')}>
-            <FileBox size={15} aria-hidden="true" />{t('Import physical meshes', '导入物理网格')}
+            <FileBox size={15} aria-hidden="true" />{t('Import physical meshes', '导入求解网格')}
           </button>
         </div>
       </details>
+      <input ref={packageInput} id="input-scene-package" className="hidden" type="file" accept=".zip,application/zip"
+        aria-label={t('Scene package ZIP', '场景包 ZIP')}
+        onChange={event => {
+          const file = event.currentTarget.files?.[0];
+          event.currentTarget.value = '';
+          if (file) onImportPackage(file);
+        }} />
       <details ref={drawingMenu} onKeyDown={closeOnEscape} className="relative">
         <summary className={`${summary} ${editor.tool !== 'select' && editor.tool !== 'move' ? activeButton : ''}`}>
-          <Plus size={15} aria-hidden="true" />{t('Add Geometry', '添加几何')}<ChevronDown size={12} aria-hidden="true" />
+          <Plus size={15} aria-hidden="true" />{t('Add Geometry', '添加模型')}<ChevronDown size={12} aria-hidden="true" />
         </summary>
         <div className={menu}>
-          {tools.map(({ tool, label, Icon }) => <button type="button" key={tool} className={menuItem} onClick={() => chooseDrawingTool(tool)}>
+          {tools.map(({ tool, label, Icon }) => <button type="button" key={tool} id={`btn-scene-tool-${tool}`} className={menuItem} onClick={() => chooseDrawingTool(tool)}>
             <Icon size={15} aria-hidden="true" />{label}
           </button>)}
         </div>
@@ -190,11 +229,20 @@ export function SceneToolbar({
         <Undo2 size={15} aria-hidden="true" />{t('Undo', '撤销')}
       </button>
       {compactControls}
+      {floors.length > 0 && <select id="select-scene-floor" className={button}
+        aria-label={t('Visible floor', '可见楼层')} value={sceneFloor ?? ''}
+        onChange={event => onSelectFloor(event.currentTarget.value || undefined)}>
+        <option value="">{t('All floors', '全部楼层')}</option>
+        {floors.map(floor => <option key={floor} value={floor}>{sceneFloorLabel(floor, t)}</option>)}
+      </select>}
       <button type="button" aria-pressed={editor.solverMesh} className={`${button} ${editor.solverMesh ? activeButton : ''}`}
         onClick={onToggleInspection}>
         <ShieldCheck size={15} aria-hidden="true" />{t('Solver Check', '求解检查')}
       </button>
     </div>
+    {sceneName && <p className="text-xs text-[var(--text-mid)]">{sceneNameLabel(sceneName, sceneObjects, t)}</p>}
+    {packageBusy && <p role="status" className="text-xs text-[var(--text-mid)]">{t('Loading scene package…', '正在载入场景包…')}</p>}
+    <SceneErrorNotice error={packageError} operation="package" />
     {editor.tool !== 'select' && <div className="flex flex-wrap items-center gap-2 rounded-lg border border-[var(--line)] bg-[var(--ink-750)] px-2.5 py-1.5 text-xs">
       <p role="status" className="flex-1 text-[var(--text-mid)]">{instructions[editor.tool]}</p>
       {editor.tool === 'polygon' && <button type="button" className="btn-signal cursor-pointer px-2.5 py-1 disabled:cursor-not-allowed"
@@ -235,7 +283,8 @@ export function SceneObjectList({ editor, objects, inspection, onSelect }: Objec
     return layers.map(layer => ({
       layer,
       matches: objects.filter(object => object.category === layer &&
-        [objectLabel(object, t), object.id, object.type, object.material].join(' ').toLowerCase().includes(needle)),
+        [objectLabel(object, t), object.name, object.id, object.type, object.material, radioMaterialLabel(object.material, t)]
+          .join(' ').toLowerCase().includes(needle)),
     }));
   }, [objects, query, t]);
 
@@ -320,14 +369,16 @@ function AdvancedGeometry({ object, editor, anchor }: { object: BuildingFootprin
   const updateVertices = (points: BuildingFootprint['enuPoints']) => editor.update(withFootprint(object, points, anchor));
 
   return <details className="panel-flush px-2.5 py-2 text-xs" onToggle={event => setOpen(event.currentTarget.open)}>
-    <summary className="cursor-pointer font-semibold">{t('Advanced geometry', '高级几何')}</summary>
+    <summary className="cursor-pointer font-semibold">{t('Advanced geometry', '几何详情')}</summary>
     {open && <div className="mt-2 space-y-2">
       <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-1 text-[var(--text-mid)]">
         <dt>{t('Object ID', '对象编号')}</dt><dd className="readout break-all">{object.id}</dd>
-        {object.source && <><dt>{t('Source', '来源')}</dt><dd>{provenance[object.source]}</dd></>}
+        {object.source && <><dt>{t('Source', '来源')}</dt><dd>{object.buildingSpec ? t('Building generator', '建筑生成器') : provenance[object.source]}</dd></>}
         {object.heightSource && <><dt>{t('Height source', '高度来源')}</dt><dd>{provenance[object.heightSource]}</dd></>}
         {object.materialSource && <><dt>{t('Material source', '材质来源')}</dt><dd>{provenance[object.materialSource]}</dd></>}
         {object.mesh && <><dt>{t('Mesh triangles', '网格三角形')}</dt><dd className="readout">{object.mesh.triangles.length / 3}</dd></>}
+        {object.floor && <><dt>{t('Floor', '楼层')}</dt><dd>{sceneFloorLabel(object.floor, t)}</dd></>}
+        {object.geometrySource && <><dt>{t('Geometry source', '几何数据来源')}</dt><dd>{sceneGeometrySourceLabel(object, t)}</dd></>}
       </dl>
       {object.category === 'building' && object.kind !== 'mesh' && <>
         <h3 className="font-semibold">{object.kind === 'wall' ? t('Wall endpoints (ENU m)', '墙端点（ENU 米）')
@@ -363,7 +414,7 @@ function SolverReport({ inspection, error, objects, onLocate }: {
   inspection: SceneInspection | null; error: string; objects: BuildingFootprint[]; onLocate: (id: string) => void;
 }) {
   const { t } = useI18n();
-  if (error) return <p role="status" className="break-words rounded-lg border border-[var(--line)] bg-[var(--accent-soft)] p-2.5 text-xs text-[var(--bad)]">{error}</p>;
+  if (error) return <SceneErrorNotice error={error} operation="inspection" className="rounded-lg border border-[var(--line)] bg-[var(--accent-soft)] p-2.5" />;
   if (!inspection) return <p role="status" className="text-sm text-[var(--text-mid)]">{t('Checking solver geometry…', '正在检查求解几何…')}</p>;
 
   const totals = { physical: 0, visual: 0, skipped: 0 };
@@ -397,7 +448,7 @@ function SolverReport({ inspection, error, objects, onLocate }: {
             </div>
             <ReportStatus report={report} />
             {report.issues.length > 0 && <ul className="space-y-1 break-words text-xs text-[var(--text-mid)]">
-              {report.issues.map((issue, index) => <li key={index}>{issue}</li>)}
+              {report.issues.map((issue, index) => <li key={index}>{sceneIssueLabel(issue, t)}</li>)}
             </ul>}
           </li>;
         })}
@@ -409,15 +460,22 @@ interface InspectorProps extends ObjectsProps {
   anchor: GeoAnchor;
   inspectionError: string;
   onLocate: (id: string) => void;
+  onEditGeneratedBuilding: (spec: BuildingSpec) => void;
+  onRemoveGeneratedBuilding: (id: string) => void;
   materialLibrary: ReactNode;
+  materialIds: string[];
 }
 
-export function SceneInspector({ editor, objects, anchor, inspection, inspectionError, onLocate, materialLibrary }: InspectorProps) {
+export function SceneInspector({ editor, objects, anchor, inspection, inspectionError, onLocate,
+  onEditGeneratedBuilding, onRemoveGeneratedBuilding, materialLibrary, materialIds }: InspectorProps) {
   const { t } = useI18n();
   const title = useId();
   const selected = editor.selected;
+  const editableName = selected ? sceneObjectName(selected, t) ?? '' : '';
+  const building = selected?.buildingSpec;
   const report = inspection?.objects.find(item => item.id === selected?.id);
   const selectedIssues = editor.solverMesh ? [] : (report?.issues ?? selected?.importIssues ?? []);
+  const availableMaterials = Array.from(new Set([...materials, ...materialIds]));
 
   return <section aria-labelledby={title} className="panel min-h-0 overflow-y-auto overscroll-contain">
     <h2 id={title} className="panel-title border-b border-[var(--line)] px-3 py-2.5">
@@ -430,6 +488,18 @@ export function SceneInspector({ editor, objects, anchor, inspection, inspection
           <h3 className="truncate text-sm font-semibold" title={objectLabel(selected, t)}>{objectLabel(selected, t)}</h3>
           {report && <ReportStatus report={report} />}
         </div>
+        {building && <div className="panel-flush space-y-2 p-2">
+          <p className="text-xs text-[var(--text-mid)]">
+            {building.length} × {building.width} × {building.height} m · {building.floors} {t('floors', '层')}
+          </p>
+          <div className="flex flex-wrap gap-1">
+            <button id="btn-edit-generated-building" type="button" className={button} onClick={() => onEditGeneratedBuilding(building)}>
+              <Building2 size={14} aria-hidden="true" />{t('Edit building', '编辑整栋建筑')}
+            </button>
+            <button id="btn-remove-generated-building" type="button" className={button + ' text-[var(--bad)]!'}
+              onClick={() => onRemoveGeneratedBuilding(building.id)}>{t('Delete building', '删除整栋')}</button>
+          </div>
+        </div>}
         <div className="flex flex-wrap gap-1">
           <button type="button" className={button} onClick={() => onLocate(selected.id)}>
             <Crosshair size={14} aria-hidden="true" />{t('Locate', '定位')}
@@ -442,40 +512,51 @@ export function SceneInspector({ editor, objects, anchor, inspection, inspection
               }
               editor.chooseTool('move');
             }}><Move size={14} aria-hidden="true" />{t('Move', '移动')}</button>
-          <button type="button" className={button} onClick={editor.duplicate}><Copy size={14} aria-hidden="true" />{t('Duplicate', '复制')}</button>
+          {(selected.enuPoints.length >= 2 || selected.mesh || selected.foliage) &&
+            <button type="button" className={button} onClick={editor.duplicate}><Copy size={14} aria-hidden="true" />{t('Duplicate', '复制')}</button>}
           <button type="button" className={button + ' text-[var(--bad)]!'} onClick={editor.remove}>
             <Trash2 size={14} aria-hidden="true" />{t('Delete', '删除')}
           </button>
         </div>
         <label className="flex flex-col gap-1 text-xs font-medium">{t('Object name', '对象名称')}
-          <input type="text" className={field} key={selected.name} defaultValue={selected.name ?? ''}
+          <input type="text" className={field} key={editableName} defaultValue={editableName}
             onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }}
             onBlur={event => {
-              if (event.currentTarget.value !== (selected.name ?? '')) editor.update({ ...selected, name: event.currentTarget.value });
+              if (event.currentTarget.value !== editableName) editor.update({ ...selected, name: event.currentTarget.value });
             }} />
         </label>
-        {selected.category === 'building' && <>
+        {selected.foliage && <div className="grid grid-cols-2 gap-2">
+          <Coordinate label={t('Canopy loss (dB/m)', '树冠损耗（dB/m）')} value={selected.foliage.attenuationDbPerM} min={0}
+            onCommit={attenuationDbPerM => {
+              if (selected.foliage) editor.update({ ...selected, foliage: { ...selected.foliage, attenuationDbPerM } });
+            }} />
+          <Coordinate label={t('Base elevation (m)', '底部标高（米）')} value={selected.baseZ ?? 0}
+            onCommit={baseZ => editor.update({ ...selected, baseZ })} />
+        </div>}
+        {isRadioSurface(selected) && <>
           <div className="grid grid-cols-2 gap-2">
             {selected.kind !== 'mesh' && <Coordinate label={t('Height (m)', '高度（米）')} value={selected.height} min={0.01}
               onCommit={height => editor.update({ ...selected, height, heightSource: 'manual' })} />}
             <Coordinate label={t('Base elevation (m)', '底部标高（米）')} value={selected.baseZ ?? 0}
               onCommit={baseZ => editor.update({ ...selected, baseZ })} />
           </div>
-          <label className="flex flex-col gap-1 text-xs font-medium">{t('Radio material', '无线材质')}
+          <label className="flex flex-col gap-1 text-xs font-medium">{t('Radio material', '射频材质')}
             <select className={field} value={selected.material} onChange={event => editor.update({
               ...selected, material: event.currentTarget.value, materialSource: 'manual',
             })}>
-              {!materials.includes(selected.material) && <option>{selected.material}</option>}
-              {materials.map(material => <option key={material}>{material}</option>)}
+              {!availableMaterials.includes(selected.material) &&
+                <option value={selected.material}>{radioMaterialLabel(selected.material, t)}</option>}
+              {availableMaterials.map(material => <option key={material} value={material}>{radioMaterialLabel(material, t)}</option>)}
             </select>
           </label>
           {report?.material && <p className="text-xs text-[var(--text-mid)]">
-            {t('Material used by solver', '求解器实际使用的材质')} <span className="readout">{report.material}</span>
+            {t('Material used by solver', '求解器实际使用的材质')}{' '}
+            <span className="readout" title={report.material}>{radioMaterialLabel(report.material, t)}</span>
           </p>}
         </>}
         <AdvancedGeometry object={selected} editor={editor} anchor={anchor} />
         {selectedIssues.length > 0 && <ul className="space-y-1 break-words text-xs text-[var(--warn)]">
-          {selectedIssues.map((issue, index) => <li key={index}>{issue}</li>)}
+          {selectedIssues.map((issue, index) => <li key={index}>{sceneIssueLabel(issue, t)}</li>)}
         </ul>}
       </div> : !editor.solverMesh && <p className="text-sm text-[var(--text-mid)]">
         {t('Select a scene object to edit its properties.', '选择场景对象以编辑属性。')}

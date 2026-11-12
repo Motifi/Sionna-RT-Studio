@@ -3,20 +3,30 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useI18n } from '../i18n';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import type { SolverMesh } from '../api';
+import type { SceneObjectReport, SolverMesh } from '../api';
 import type { SceneEditor } from '../sceneEditor';
-import type { SolverRoof } from '../types';
+import type { SceneVisual, SolverRoof, TrajectoryPoint, WaypointFrame } from '../types';
 import { BuildingFootprint, GeoAnchor, Transmitter, Receiver, PropagationPath, ENUVector, PlacementMode } from '../types';
 import { cn } from '../lib/utils';
-import { enuToLatLon, getDeviceElevation, isPointInPolygon } from '../utils';
+import { enuToLatLon, getDeviceElevation, getWaypointPosition, isPointInPolygon } from '../utils';
 import { RadioMapGrid } from '../types';
 import type { ColormapName } from '../lib/colormaps';
 import { coverageCellValue, coverageDisplayRange, setCoverageColor } from '../lib/coverageDisplay';
-import { Camera, ChevronDown, Eye } from 'lucide-react';
+import { createAccessPointModel, createReceiverModel } from '../lib/deviceGeometry';
+import { generatedBuildingMaterial } from '../lib/generatedBuildingMaterials';
+import { findHorizontalSurface, isFloorSurface } from '../lib/sceneGeometry';
+import { sceneObjectName } from '../lib/sceneLabels';
+import { advanceWalkCamera, createWalkCamera, rotateWalkCamera, type WalkCameraState } from '../lib/sceneWalkCamera';
+import { createFacadeWindows, createJunction, createStreetSegment } from '../lib/streetGeometry';
+import {
+  createFoliageVolume, isSceneObjectVisible, loadSceneVisual, positionVisualObject, type LoadedSceneVisual,
+} from '../lib/sceneVisualGeometry';
+import { Camera, ChevronDown, Eye, Footprints, Hand, Rotate3D } from 'lucide-react';
+import { NumberField } from './NumberField';
 
 // Free the GPU resources (geometry, materials, textures) held by an object tree.
 // three.js does not release these on remove(), so skipping this leaks VRAM.
@@ -146,12 +156,23 @@ function makeStreetLabelMesh(
 }
 
 type DevicePlacement = Exclude<PlacementMode, 'none'>;
+type SceneNavigation = 'orbit' | 'pan' | 'walk';
+
+const WALK_KEYS = new Set([
+  'KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowLeft', 'ArrowDown', 'ArrowRight',
+  'KeyQ', 'KeyE', 'ShiftLeft', 'ShiftRight',
+]);
 
 interface ThreeStudioProps {
   sceneEditor?: SceneEditor;
   onSelectSceneObject?: (id: string | null) => void;
   focusObject?: { id: string };
+  sceneName?: string;
+  sceneVisual?: SceneVisual;
+  sceneFloor?: string;
+  solverCheck?: boolean;
   physicalMeshes?: SolverMesh[];
+  solverObjects?: SceneObjectReport[];
   solverRoofs?: SolverRoof[];
   buildings: BuildingFootprint[];
   anchor: GeoAnchor;
@@ -159,8 +180,6 @@ interface ThreeStudioProps {
   rx: Receiver;
   txs?: Transmitter[];
   rxs?: Receiver[];
-  activeTxId?: string;
-  activeRxId?: string;
   paths: PropagationPath[];
   matrixPaths?: PropagationPath[];
   showRaysOnHeatmap?: boolean;
@@ -169,7 +188,7 @@ interface ThreeStudioProps {
   rmAutoRange: boolean;
   rmVmin: number;
   rmVmax: number;
-  onPlaceDevice: (mode: DevicePlacement, enu: ENUVector) => void;
+  onPlaceDevice: (mode: DevicePlacement, enu: ENUVector, absoluteHeight?: number) => void;
   onSelectDevice: (kind: 'tx' | 'rx', id: string) => void;
   deploymentSelection: 'tx' | 'rx';
   showDevices: boolean;
@@ -182,8 +201,10 @@ interface ThreeStudioProps {
   showOutlines: boolean;
   setShowOutlines: (val: boolean) => void;
   mobilityRxPosition: ENUVector | null;
-  trajectoryPoints: { lat: number; lon: number; enu: { x: number; y: number; z: number } }[];
-  setTrajectoryPoints: (pts: { lat: number; lon: number; enu: { x: number; y: number; z: number } }[]) => void;
+  mobilityRxHeading: number;
+  trajectoryPoints: TrajectoryPoint[];
+  waypointFrame?: WaypointFrame;
+  setTrajectoryPoints: (points: TrajectoryPoint[], frame?: WaypointFrame) => void;
 }
 
 // Map ENU Vector to Three.js vector
@@ -194,11 +215,38 @@ function enuToThree(v: ENUVector): THREE.Vector3 {
   return new THREE.Vector3(v.x, v.z, -v.y);
 }
 
+function expandObjectBounds(bounds: THREE.Box3, object: BuildingFootprint) {
+  const base = object.baseZ ?? 0;
+  if (object.mesh) {
+    const vertices = object.mesh.vertices;
+    const point = new THREE.Vector3();
+    for (let i = 0; i < vertices.length; i += 3) {
+      bounds.expandByPoint(point.set(vertices[i], base + vertices[i + 2], -vertices[i + 1]));
+    }
+    return;
+  }
+  if (object.foliage) {
+    const { center, radii } = object.foliage;
+    bounds.expandByPoint(new THREE.Vector3(center.x - radii.x, base + center.z - radii.z, -center.y - radii.y));
+    bounds.expandByPoint(new THREE.Vector3(center.x + radii.x, base + center.z + radii.z, -center.y + radii.y));
+    return;
+  }
+  for (const point of object.enuPoints) {
+    bounds.expandByPoint(enuToThree({ ...point, z: base }));
+    bounds.expandByPoint(enuToThree({ ...point, z: base + object.height }));
+  }
+}
+
 export function ThreeStudio({
   sceneEditor,
   onSelectSceneObject,
   focusObject,
+  sceneName,
+  sceneVisual,
+  sceneFloor,
+  solverCheck,
   physicalMeshes,
+  solverObjects,
   solverRoofs,
   buildings,
   anchor,
@@ -206,8 +254,6 @@ export function ThreeStudio({
   rx,
   txs,
   rxs,
-  activeTxId,
-  activeRxId,
   paths,
   matrixPaths,
   showRaysOnHeatmap,
@@ -229,7 +275,9 @@ export function ThreeStudio({
   showOutlines,
   setShowOutlines,
   mobilityRxPosition,
+  mobilityRxHeading,
   trajectoryPoints,
+  waypointFrame,
   setTrajectoryPoints
 }: ThreeStudioProps) {
   const { t } = useI18n();
@@ -238,19 +286,39 @@ export function ThreeStudio({
   const captureScreenshotRef = useRef<(() => void) | null>(null);
 
   const [canvasState, setCanvasState] = useState<'initializing' | 'active' | 'unavailable'>('initializing');
+  const [sceneVisualStatus, setSceneVisualStatus] = useState<'idle' | 'loading' | 'incomplete'>('idle');
   const [fps, setFps] = useState<number>(0);
   const [screenshotStatus, setScreenshotStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [performanceMode, setPerformanceMode] = useState<'high' | 'eco'>('high');
   const [cameraMode, setCameraMode] = useState<'orbit' | 'lockTx'>('orbit');
   const [pathDrawingMode, setPathDrawingMode] = useState(false);
+  const [placementFloorId, setPlacementFloorId] = useState<string>();
+  const [floorOffsets, setFloorOffsets] = useState<Partial<Record<'tx' | 'rx', number>>>({});
+  const [placementIssue, setPlacementIssue] = useState<'floor' | 'terrain' | 'route'>();
+  const [navigationMode, setNavigationMode] = useState<SceneNavigation>('orbit');
+  const [walkPhase, setWalkPhase] = useState<'pick' | 'active' | 'no-surface'>('pick');
+  const canNavigateScene = sceneEditor?.tool === 'select';
+  const sceneNavigation = canNavigateScene ? navigationMode : 'orbit';
+
+  useEffect(() => {
+    if (!canNavigateScene) {
+      setNavigationMode('orbit');
+      setWalkPhase('pick');
+    }
+  }, [canNavigateScene]);
 
   const [hoveredCoordinate, setHoveredCoordinate] = useState<ENUVector | null>(null);
   const drawingTrajectory = editing && deploymentSelection === 'rx' && pathDrawingMode && placementMode === 'none';
+  const floors = useMemo(() => buildings.filter(isFloorSurface), [buildings]);
+  const activePlacementFloor = editing ? floors.find(object => object.id === placementFloorId) : undefined;
+  const floorKind = placementMode === 'none' ? deploymentSelection : placementMode.endsWith('tx') ? 'tx' : 'rx';
+  const floorOffset = floorOffsets[floorKind] ?? (floorKind === 'tx' ? 2.5 : 1.5);
 
   useEffect(() => {
     if (!editing || deploymentSelection !== 'rx' || placementMode !== 'none') setPathDrawingMode(false);
   }, [editing, deploymentSelection, placementMode]);
   useEffect(() => { setPathDrawingMode(false); }, [rx.id]);
+  useEffect(() => { setPlacementIssue(undefined); }, [placementMode, drawingTrajectory, placementFloorId, rx.id]);
 
   useEffect(() => {
     if (placementMode === 'none' && !drawingTrajectory) return;
@@ -266,15 +334,13 @@ export function ThreeStudio({
 
   // Keep references to access them in render loops & events stably
   const stateRef = useRef({
-    sceneEditor, physicalMeshes, solverRoofs, onSelectSceneObject, focusObject,
+    sceneEditor, sceneName, sceneVisual, sceneFloor, solverCheck, physicalMeshes, solverObjects, solverRoofs, onSelectSceneObject, focusObject,
     buildings,
     anchor,
     tx,
     rx,
     txs,
     rxs,
-    activeTxId,
-    activeRxId,
     paths,
     matrixPaths,
     showRaysOnHeatmap,
@@ -284,32 +350,36 @@ export function ThreeStudio({
     rmVmin,
     rmVmax,
     placementMode,
+    placementFloorId: activePlacementFloor?.id,
+    floorOffset,
     activeMode,
     cameraMode,
+    sceneNavigation,
     performanceMode,
     showOutlines,
     drawingTrajectory,
     mobilityRxPosition,
+    mobilityRxHeading,
     trajectoryPoints,
+    waypointFrame,
     setTrajectoryPoints,
     onPlaceDevice,
     onSelectDevice,
     editing,
     showDevices,
     visible,
+    t,
   });
 
   useEffect(() => {
     stateRef.current = {
-      sceneEditor, physicalMeshes, solverRoofs, onSelectSceneObject, focusObject,
+      sceneEditor, sceneName, sceneVisual, sceneFloor, solverCheck, physicalMeshes, solverObjects, solverRoofs, onSelectSceneObject, focusObject,
       buildings,
       anchor,
       tx,
       rx,
       txs,
       rxs,
-      activeTxId,
-      activeRxId,
       paths,
       matrixPaths,
       showRaysOnHeatmap,
@@ -319,21 +389,27 @@ export function ThreeStudio({
       rmVmin,
       rmVmax,
       placementMode,
+      placementFloorId: activePlacementFloor?.id,
+      floorOffset,
       activeMode,
       cameraMode,
+      sceneNavigation,
       performanceMode,
       showOutlines,
       drawingTrajectory,
       mobilityRxPosition,
+      mobilityRxHeading,
       trajectoryPoints,
+      waypointFrame,
       setTrajectoryPoints,
       onPlaceDevice,
       onSelectDevice,
       editing,
       showDevices,
       visible,
+      t,
     };
-  }, [sceneEditor, physicalMeshes, solverRoofs, onSelectSceneObject, focusObject, buildings, anchor, tx, rx, txs, rxs, activeTxId, activeRxId, paths, matrixPaths, showRaysOnHeatmap, radioMap, rmColormap, rmAutoRange, rmVmin, rmVmax, placementMode, activeMode, cameraMode, performanceMode, showOutlines, drawingTrajectory, mobilityRxPosition, trajectoryPoints, setTrajectoryPoints, onPlaceDevice, onSelectDevice, editing, showDevices, visible]);
+  }, [sceneEditor, sceneName, sceneVisual, sceneFloor, solverCheck, physicalMeshes, solverObjects, solverRoofs, onSelectSceneObject, focusObject, buildings, anchor, tx, rx, txs, rxs, paths, matrixPaths, showRaysOnHeatmap, radioMap, rmColormap, rmAutoRange, rmVmin, rmVmax, placementMode, activePlacementFloor, floorOffset, activeMode, cameraMode, sceneNavigation, performanceMode, showOutlines, drawingTrajectory, mobilityRxPosition, mobilityRxHeading, trajectoryPoints, waypointFrame, setTrajectoryPoints, onPlaceDevice, onSelectDevice, editing, showDevices, visible, t]);
 
   useEffect(() => {
     if (!containerRef.current || !canvasRef.current) return;
@@ -349,7 +425,12 @@ export function ThreeStudio({
     // 2. Camera Setup. Near plane at 1 (not 0.1) so the depth buffer keeps
     // precision across the large city extent → no z-fighting flicker far out.
     const camera = new THREE.PerspectiveCamera(45, width / height, 1, 6000);
-    camera.position.set(0, 180, 240);
+    if (stateRef.current.buildings.some(object => object.source === 'template' && object.type === 'avenue')) {
+      // Look along the main street so the near buildings leave the devices visible.
+      camera.position.set(-228, 166, 93);
+    } else {
+      camera.position.set(0, 180, 240);
+    }
 
     // 3. WebGL Renderer. logarithmicDepthBuffer eliminates the flicker between
     // the many coplanar flat layers (ground, grid, roads, parks, water).
@@ -408,6 +489,9 @@ export function ThreeStudio({
     // Grid Floor matching Light Minimal GIS setup
     const gridHelper = new THREE.GridHelper(1000, 100, 0x94a3b8, 0xcbd5e1);
     gridHelper.position.y = -0.1;
+    gridHelper.material.transparent = true;
+    gridHelper.material.opacity = 0.34;
+    gridHelper.material.depthWrite = false;
     scene.add(gridHelper);
 
     // Ground slab
@@ -425,8 +509,17 @@ export function ThreeStudio({
 
     // Grouping nodes for logical clear layers
     const buildingGroup = new THREE.Group();
+    const visualSelectionGroup = new THREE.Group();
     const draftGroup = new THREE.Group();
     scene.add(draftGroup);
+    const footprintPositions = new THREE.BufferAttribute(new Float32Array(12), 3).setUsage(THREE.DynamicDrawUsage);
+    const footprintGeometry = new THREE.BufferGeometry().setAttribute('position', footprintPositions);
+    const footprintPreview = new THREE.LineLoop(footprintGeometry,
+      new THREE.LineBasicMaterial({ color: 0xb45309, depthTest: false, depthWrite: false }));
+    footprintPreview.visible = false;
+    footprintPreview.frustumCulled = false;
+    footprintPreview.renderOrder = 25;
+    scene.add(footprintPreview);
     const streetLabelGroup = new THREE.Group();
     const transmitterGroup = new THREE.Group();
     const receiverGroup = new THREE.Group();
@@ -436,6 +529,7 @@ export function ThreeStudio({
     const interactionGroup = new THREE.Group();
 
     scene.add(buildingGroup);
+    scene.add(visualSelectionGroup);
     scene.add(streetLabelGroup);
     scene.add(transmitterGroup);
     scene.add(receiverGroup);
@@ -444,7 +538,36 @@ export function ThreeStudio({
     scene.add(trajectoryGroup);
     scene.add(interactionGroup);
 
-    function addTriangleMesh(data: { vertices: number[]; triangles: number[] }, id: string, base = 0) {
+    let loadedVisual: LoadedSceneVisual | undefined;
+    let visualLoadGeneration = 0;
+    let authoredGroundIds = new Set<string>();
+    let footprintHover: THREE.Vector3 | null = null;
+
+    function replaceSceneVisual(visual?: SceneVisual) {
+      const generation = ++visualLoadGeneration;
+      loadedVisual?.dispose();
+      loadedVisual = undefined;
+      setSceneVisualStatus(visual ? 'loading' : 'idle');
+      if (!visual) return;
+
+      const isCurrent = () => generation === visualLoadGeneration && stateRef.current.sceneVisual === visual;
+      void loadSceneVisual(visual).then(asset => {
+        if (!isCurrent()) {
+          asset.dispose();
+          return;
+        }
+        loadedVisual = asset;
+        scene.add(asset.root);
+        rebuildBuildings3D();
+        setSceneVisualStatus(asset.incomplete ? 'incomplete' : 'idle');
+      }, () => {
+        if (isCurrent()) setSceneVisualStatus('incomplete');
+      });
+    }
+
+    function addTriangleMesh(
+      data: { vertices: number[]; triangles: number[] }, id: string, base = 0, object?: BuildingFootprint,
+    ) {
       const positions = new Float32Array(data.vertices.length);
       for (let i = 0; i < positions.length; i += 3) {
         positions[i] = data.vertices[i];
@@ -456,37 +579,107 @@ export function ThreeStudio({
       geometry.setIndex(data.triangles);
       geometry.computeVertexNormals();
       const selected = id && stateRef.current.sceneEditor?.selected?.id === id;
+      const appearance = object && generatedBuildingMaterial(object);
       const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({
         side: THREE.DoubleSide, flatShading: true,
-        color: selected ? 0xf59e0b : id ? buildingColor(id) : 0x94a3b8,
+        ...appearance,
+        color: selected && !appearance ? 0xf59e0b : appearance?.color ?? (id ? buildingColor(id) : 0x94a3b8),
       }));
       mesh.name = id;
+      mesh.castShadow = !!id && !appearance?.transparent;
+      mesh.receiveShadow = true;
       buildingGroup.add(mesh);
-      if (stateRef.current.physicalMeshes || stateRef.current.showOutlines) {
-        buildingGroup.add(new THREE.LineSegments(new THREE.WireframeGeometry(geometry),
-          new THREE.LineBasicMaterial({ color: 0x334155, transparent: true, opacity: 0.5 })));
+      const { solverCheck, physicalMeshes, showOutlines } = stateRef.current;
+      const check = solverCheck ?? (physicalMeshes !== undefined);
+      const highlight = !!appearance && selected;
+      if (check || showOutlines || highlight) {
+        const edges = check ? new THREE.WireframeGeometry(geometry) : new THREE.EdgesGeometry(geometry);
+        buildingGroup.add(new THREE.LineSegments(edges,
+          new THREE.LineBasicMaterial({
+            color: highlight ? 0xd97706 : 0x334155,
+            transparent: true,
+            opacity: highlight ? 0.9 : appearance ? 0.22 : 0.5,
+          })));
       }
     }
 
     function rebuildDraft() {
       clearGroup(draftGroup);
-      const points = stateRef.current.sceneEditor?.draft ?? [];
+      const editor = stateRef.current.sceneEditor;
+      const points = editor?.draft ?? [];
       if (!points.length) return;
-      const geometry = new THREE.BufferGeometry().setFromPoints(points.map(point => enuToThree({ ...point, z: 0.2 })));
+      const geometry = new THREE.BufferGeometry().setFromPoints(points.map(point => enuToThree({
+        ...point, z: (editor?.tool === 'generate' ? point.z : 0) + 0.2,
+      })));
       draftGroup.add(new THREE.Points(geometry, new THREE.PointsMaterial({ color: 0xb45309, size: 8, sizeAttenuation: false })));
       draftGroup.add(new THREE.Line(geometry.clone(), new THREE.LineBasicMaterial({ color: 0xb45309 })));
+    }
+
+    function updateFootprintPreview() {
+      const editor = stateRef.current.sceneEditor;
+      const start = editor?.draft[0];
+      const end = footprintHover;
+      if (editor?.tool !== 'generate' || !start || !end) {
+        footprintPreview.visible = false;
+        return;
+      }
+      const elevation = (start.z + end.y) / 2 + 0.2;
+      footprintPositions.setXYZ(0, start.x, start.z + 0.2, -start.y);
+      footprintPositions.setXYZ(1, end.x, elevation, -start.y);
+      footprintPositions.setXYZ(2, end.x, end.y + 0.2, end.z);
+      footprintPositions.setXYZ(3, start.x, elevation, end.z);
+      footprintPositions.needsUpdate = true;
+      footprintPreview.visible = true;
     }
 
     // 6. BUILD GENERATOR: Building Geometry Extruders
     function rebuildBuildings3D() {
       clearGroup(buildingGroup);
       clearGroup(streetLabelGroup);
+      clearGroup(visualSelectionGroup);
 
       const current = stateRef.current;
-      ground.visible = current.physicalMeshes === undefined;
-      if (current.physicalMeshes) {
-        for (const mesh of current.physicalMeshes) {
-          if (!mesh.id || !current.sceneEditor?.hiddenLayers.includes('building')) addTriangleMesh(mesh, mesh.id);
+      const check = current.solverCheck ?? (current.physicalMeshes !== undefined);
+      const selectedId = current.sceneEditor?.selected?.id;
+      // Pick a starting point in the cutaway, then show ceilings in first-person view.
+      const visibleFloor = walkView ? undefined : current.sceneFloor;
+      const visibleObject = (object: BuildingFootprint) =>
+        current.placementFloorId
+          ? object.id === current.placementFloorId || object.rfRole === 'ground'
+          : isSceneObjectVisible(object, current.sceneEditor?.hiddenLayers, visibleFloor);
+      const objectsById = new Map<string, BuildingFootprint>(current.buildings.map(object => [object.id, object]));
+      authoredGroundIds = new Set(current.buildings.filter(object => object.rfRole === 'ground' && object.mesh)
+        .map(object => object.id));
+      ground.visible = !check && authoredGroundIds.size === 0;
+      gridHelper.visible = ground.visible;
+
+      if (loadedVisual) {
+        loadedVisual.root.visible = !check && !current.placementFloorId;
+        if (loadedVisual.root.visible) {
+          for (const [id, binding] of loadedVisual.bindings) {
+            const object = objectsById.get(id);
+            binding.node.visible = !!object && visibleObject(object);
+            if (!object || !binding.node.visible) continue;
+            positionVisualObject(binding, object);
+            if (id === selectedId) {
+              const bounds = new THREE.Box3().setFromObject(binding.node);
+              if (!bounds.isEmpty()) visualSelectionGroup.add(new THREE.Box3Helper(bounds, 0xf59e0b));
+            }
+          }
+        }
+      }
+
+      if (check) {
+        for (const mesh of current.physicalMeshes ?? []) {
+          const object = objectsById.get(mesh.id);
+          if (!mesh.id || (object && visibleObject(object))) addTriangleMesh(mesh, mesh.id);
+        }
+        for (const report of current.solverObjects ?? []) {
+          const object = objectsById.get(report.id);
+          if (!object || !report.foliage || !visibleObject(object)) continue;
+          const volume = createFoliageVolume(report.foliage, 0, true, report.id === selectedId);
+          volume.name = report.id;
+          buildingGroup.add(volume);
         }
         return;
       }
@@ -501,20 +694,31 @@ export function ThreeStudio({
         angle: number;
       };
       const namedStreetSegments: NamedStreetSegment[] = [];
-
       current.buildings.forEach(b => {
-        if (current.sceneEditor?.hiddenLayers.includes(b.category)) return;
-        const selected = current.sceneEditor?.selected?.id === b.id;
+        if (!visibleObject(b) || (!current.placementFloorId && loadedVisual?.bindings.has(b.id))) return;
+        const selected = selectedId === b.id;
+        if (b.rfRole === 'foliage' && b.foliage) {
+          const volume = createFoliageVolume(b.foliage, b.baseZ ?? 0, false, selected);
+          volume.name = b.id;
+          buildingGroup.add(volume);
+          return;
+        }
         if (b.kind === 'mesh' && b.mesh) {
-          addTriangleMesh(b.mesh, b.id, b.baseZ);
+          addTriangleMesh(b.mesh, b.id, b.baseZ, b);
           return;
         }
         const pts = b.enuPoints;
         if (pts.length < 2) return;
 
-        // --- 1. ROADS / STREETS (INFRASTRUCTURE) ---
         if (b.category === 'infrastructure') {
-          // Render a thick, stylish asphalt ribbon for each segment
+          if (b.source === 'template' && b.type === 'junction' && pts.length >= 3) {
+            const junction = createJunction(pts, selected);
+            junction.name = b.id;
+            buildingGroup.add(junction);
+            return;
+          }
+          const sidewalks = b.source === 'template' && (b.type === 'avenue' || b.type === 'lane') ? b.type : null;
+          const roadWidth = sidewalks === 'avenue' ? 14 : sidewalks === 'lane' ? 10 : 7.5;
           for (let i = 0; i < pts.length - 1; i++) {
             const p1 = pts[i];
             const p2 = pts[i + 1];
@@ -529,7 +733,7 @@ export function ThreeStudio({
 
             // Preserve every named segment. The layout pass below repeats a
             // street name at controlled intervals across its visible extent.
-            const streetName = b.name?.trim();
+            const streetName = sceneObjectName(b, current.t)?.trim();
             if (streetName) {
               const key = streetName.toLocaleLowerCase();
               let labelAngle = angle;
@@ -549,41 +753,13 @@ export function ThreeStudio({
               });
             }
 
-            // Use a gorgeous, high-contrast dark asphalt ribbon (strongly distinct against ground and buildings)
-            const roadGeom = new THREE.PlaneGeometry(segLen, 7.5);
-            roadGeom.rotateX(-Math.PI / 2); // Lay flat
-            roadGeom.rotateY(angle); // Polar rotate
-
-            const roadMat = new THREE.MeshStandardMaterial({
-              color: selected ? 0xf59e0b : 0x334155,
-              roughness: 0.85,
-              metalness: 0.1
-            });
-
-            const roadMesh = new THREE.Mesh(roadGeom, roadMat);
-            roadMesh.name = b.id;
-            roadMesh.position.set(mx, 0.12, mz); // distinct layer height to prevent z-fighting
-            roadMesh.receiveShadow = true;
-            buildingGroup.add(roadMesh);
-
-            // Add center dashes
-            if (current.showOutlines) {
-              const dashGeom = new THREE.PlaneGeometry(segLen * 0.95, 0.25);
-              dashGeom.rotateX(-Math.PI / 2);
-              dashGeom.rotateY(angle);
-
-              const dashMat = new THREE.MeshBasicMaterial({
-                color: 0xffffff, // brilliant white dashed center lane
-                transparent: true,
-                opacity: 0.9
-              });
-
-              const dashMesh = new THREE.Mesh(dashGeom, dashMat);
-              dashMesh.position.set(mx, 0.018, mz);
-              buildingGroup.add(dashMesh);
-            }
+            const road = createStreetSegment(segLen, roadWidth, { selected, sidewalks, markings: current.showOutlines });
+            road.name = b.id;
+            road.position.set(mx, 0, mz);
+            road.rotation.y = angle;
+            buildingGroup.add(road);
           }
-          return; // skip extrusion
+          return;
         }
 
         // --- 2. VEGETATION / FLAT GREEN TERRAIN ---
@@ -749,6 +925,10 @@ export function ThreeStudio({
         mesh.name = b.id;
 
         buildingGroup.add(mesh);
+        if (b.source === 'template' && b.name) {
+          const windows = createFacadeWindows(b, selected);
+          if (windows) buildingGroup.add(windows);
+        }
 
         // Optional blueprint edge outlines
         if (current.showOutlines) {
@@ -825,127 +1005,71 @@ export function ThreeStudio({
       });
     }
 
-    // 7. NODE RENDERING (Tx and Rx panel tower model representations)
+    let activeReceiverModel: THREE.Group | null = null;
+    const deployedAccessPointPosition = new THREE.Vector3();
+    const deployedReceiverPosition = new THREE.Vector3();
+
+    function updateReceiverPose() {
+      if (!activeReceiverModel) return;
+      const current = stateRef.current;
+      const position = current.mobilityRxPosition;
+      activeReceiverModel.position.copy(position ? enuToThree(position) : deployedReceiverPosition);
+      activeReceiverModel.rotation.y = position ? current.mobilityRxHeading : 0;
+    }
+
     function drawNodes3D() {
       clearGroup(transmitterGroup);
       clearGroup(receiverGroup);
+      activeReceiverModel = null;
 
       const current = stateRef.current;
       if (!current.showDevices) return;
-      const elevation = (device: Transmitter | Receiver) => getDeviceElevation(device, current.buildings, current.solverRoofs);
 
-      // Draw Transmitter Tower (TX)
-      const txThreePos = enuToThree({ ...current.tx.enu, z: elevation(current.tx) });
+      const elevation = (device: Transmitter | Receiver) =>
+        getDeviceElevation(device, current.buildings, current.solverRoofs);
+      const mountHeight = (device: Transmitter | Receiver, top: number) =>
+        device.heightReference === 'enu'
+          ? Math.max(0, top - (elevation({ ...device, heightReference: 'roof', height: 0 }) ?? 0))
+          : device.height;
 
-      // Draw tower pedestal structure
-      const towerBaseGeom = new THREE.CylinderGeometry(0.5, 3, Math.abs(txThreePos.y), 4);
-      const towerBaseMat = new THREE.MeshStandardMaterial({ color: 0x334155, metalness: 0.8, roughness: 0.2 });
-      const towerMesh = new THREE.Mesh(towerBaseGeom, towerBaseMat);
-      towerMesh.userData.deviceId = current.tx.id;
-      towerMesh.position.set(txThreePos.x, txThreePos.y / 2, txThreePos.z);
-      towerMesh.castShadow = true;
-      transmitterGroup.add(towerMesh);
-
-      // Pulse red energy dome at transmitter antenna point
-      const antennaGeom = new THREE.SphereGeometry(1.5, 16, 16);
-      const antennaMat = new THREE.MeshBasicMaterial({ color: 0xef4444 });
-      const antennaMesh = new THREE.Mesh(antennaGeom, antennaMat);
-      antennaMesh.userData.deviceId = current.tx.id;
-      antennaMesh.position.copy(txThreePos);
-      transmitterGroup.add(antennaMesh);
-
-      // Name label (e.g. "Tx 1") floating above the active transmitter.
-      const txLabel = makeLabelSprite(current.tx.name, '#d9aaa2');
-      txLabel.userData.deviceId = current.tx.id;
-      txLabel.position.set(txThreePos.x, txThreePos.y + 8, txThreePos.z);
-      transmitterGroup.add(txLabel);
-
-      // Beam-steering cone — points along the TRUE beam the backend steers.
-      // Convention (must match backend _beam_target): azimuth clockwise from
-      // North (N=0, E=90), elevation above the horizon. ENU dir =
-      // (E=cos(el)sin(az), N=cos(el)cos(az), U=sin(el)); to Three: (E, U, -N).
-      const az = ((current.tx.beamsteeringAzimuth || 0) * Math.PI) / 180;
-      const el = ((current.tx.beamsteeringElevation || 0) * Math.PI) / 180;
-      const beamDir = new THREE.Vector3(
-        Math.cos(el) * Math.sin(az),
-        Math.sin(el),
-        -Math.cos(el) * Math.cos(az),
-      ).normalize();
-
-      const beamLen = 28;
-      const beamConeGeom = new THREE.ConeGeometry(8, beamLen, 16);
-      const beamConeMat = new THREE.MeshBasicMaterial({
-        color: 0xfca5a5,
-        transparent: true,
-        opacity: 0.52,
-        wireframe: true,
-      });
-      const beamCone = new THREE.Mesh(beamConeGeom, beamConeMat);
-      // Cone's default axis is +Y; aim it along the beam direction, base at the antenna.
-      beamCone.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), beamDir);
-      beamCone.position.copy(txThreePos).add(beamDir.clone().multiplyScalar(beamLen / 2));
-      transmitterGroup.add(beamCone);
-
-      // Draw Receiver Terminal (RX). During mobility playback, use the selected
-      // solved sample directly so animation does not mutate the editable Rx state.
-      const rxEnuPos = current.mobilityRxPosition ??
-        { ...current.rx.enu, z: elevation(current.rx) };
-      const rxThreePos = enuToThree(rxEnuPos);
-
-      // Clean glowing reception dome
-      const deviceGeom = new THREE.SphereGeometry(1.2, 16, 16);
-      const deviceMat = new THREE.MeshBasicMaterial({ color: 0x3b82f6 });
-      const deviceMesh = new THREE.Mesh(deviceGeom, deviceMat);
-      deviceMesh.userData.deviceId = current.rx.id;
-      deviceMesh.position.copy(rxThreePos);
-      receiverGroup.add(deviceMesh);
-
-      const devicePoleGeom = new THREE.CylinderGeometry(0.2, 0.2, Math.abs(rxThreePos.y), 8);
-      const devicePoleMat = new THREE.MeshStandardMaterial({ color: 0x475569 });
-      const devicePoleMesh = new THREE.Mesh(devicePoleGeom, devicePoleMat);
-      devicePoleMesh.userData.deviceId = current.rx.id;
-      devicePoleMesh.position.set(rxThreePos.x, rxThreePos.y / 2, rxThreePos.z);
-      receiverGroup.add(devicePoleMesh);
-
-      // Name label (e.g. "Rx 1") floating above the active receiver.
-      const rxLabel = makeLabelSprite(current.rx.name, '#a9c2c9');
-      rxLabel.userData.deviceId = current.rx.id;
-      rxLabel.position.set(rxThreePos.x, rxThreePos.y + 6, rxThreePos.z);
-      receiverGroup.add(rxLabel);
-
-      // ── Markers for the OTHER (non-active) transmitters & receivers ───────
-      // The active Tx/Rx already render above with full tower/device geometry;
-      // here we add simpler poles+domes so every device in the list is visible.
-      const drawMarker = (device: Transmitter | Receiver, color: number, labelColor: string) => {
-        const top = enuToThree({ ...device.enu, z: elevation(device) });
-        const pole = new THREE.Mesh(
-          new THREE.CylinderGeometry(0.3, 0.3, Math.abs(top.y), 8),
-          new THREE.MeshStandardMaterial({ color: 0x475569, metalness: 0.6, roughness: 0.4 }),
-        );
-        pole.position.set(top.x, top.y / 2, top.z);
-        const dome = new THREE.Mesh(
-          new THREE.SphereGeometry(1.3, 16, 16),
-          new THREE.MeshBasicMaterial({ color }),
-        );
-        dome.position.copy(top);
-        const label = makeLabelSprite(device.name, labelColor);
-        label.position.set(top.x, top.y + 6, top.z);
-        const marker = [pole, dome, label];
-        marker.forEach(object => { object.userData.deviceId = device.id; });
-        return marker;
+      const placeModel = (model: THREE.Group, device: Transmitter | Receiver, kind: 'tx' | 'rx', top: number) => {
+        model.position.copy(enuToThree({ ...device.enu, z: top }));
+        const label = makeLabelSprite(device.name, kind === 'tx' ? '#d9aaa2' : '#a9c2c9');
+        label.position.y = kind === 'tx' ? 8 : 6;
+        model.add(label);
+        model.traverse(part => {
+          part.userData.deviceId = device.id;
+          part.userData.deviceKind = kind;
+        });
       };
 
-      (current.txs ?? []).forEach((t) => {
-        if (t.id === current.activeTxId) return; // active already drawn
-        transmitterGroup.add(...drawMarker(t, 0xf87171, '#d9aaa2')); // soft red
-      });
-      (current.rxs ?? []).forEach((r) => {
-        if (r.id === current.activeRxId) return;
-        receiverGroup.add(...drawMarker(r, 0x60a5fa, '#a9c2c9')); // soft blue
-      });
+      for (const ap of current.txs ?? [current.tx]) {
+        const top = elevation(ap);
+        if (top === undefined) continue;
+        const active = ap.id === current.tx.id;
+        const model = createAccessPointModel(
+          mountHeight(ap, top), ap.beamsteeringAzimuth, ap.beamsteeringElevation, active,
+        );
+        placeModel(model, ap, 'tx', top);
+        if (active) deployedAccessPointPosition.copy(model.position);
+        transmitterGroup.add(model);
+      }
+
+      for (const ue of current.rxs ?? [current.rx]) {
+        const active = ue.id === current.rx.id;
+        const phaseCenter = elevation(ue) ?? (active ? current.mobilityRxPosition?.z : undefined);
+        if (phaseCenter === undefined) continue;
+        const model = createReceiverModel(mountHeight(ue, phaseCenter), active);
+        placeModel(model, ue, 'rx', phaseCenter);
+        receiverGroup.add(model);
+        if (active) {
+          activeReceiverModel = model;
+          deployedReceiverPosition.copy(model.position);
+        }
+      }
+      updateReceiverPose();
     }
 
-    // 8. PROPAGATION RAY PATH LINES (LOS & bounces)
     function drawRayPaths3D() {
       clearGroup(pathsGroup);
 
@@ -1005,13 +1129,17 @@ export function ThreeStudio({
       const rm = current.radioMap;
       const metric = rm.metric ?? 'power';
       const size = rm.gridSize;
+      const terrain = current.buildings.some(object => object.rfRole === 'ground' && object.mesh);
 
       const range = coverageDisplayRange(rm, current.rmAutoRange, current.rmVmin, current.rmVmax);
       if (!range) return;
-      const valid: { x: number; y: number; value: number }[] = [];
+      const valid: { position: ENUVector; value: number }[] = [];
       for (const cell of rm.cells) {
+        // Cells outside the authored terrain have no usable coverage value.
         const value = coverageCellValue(cell, metric);
-        if (value !== null) valid.push({ x: cell.x, y: cell.y, value });
+        if (value === null) continue;
+        const z = rm.floorId ? cell.z : terrain ? cell.z - rm.heightOffset + 0.2 : 0.2;
+        valid.push({ position: { x: cell.x, y: cell.y, z }, value });
       }
 
       // Solid cell tiles that tile seamlessly (no gaps), flat on the ground.
@@ -1030,9 +1158,7 @@ export function ThreeStudio({
       const tmp = new THREE.Color();
 
       valid.forEach((cell, idx) => {
-        // Sit just above the ground plane so the field reads as painted on it.
-        const threePos = enuToThree({ x: cell.x, y: cell.y, z: 0.2 });
-        dummy.position.copy(threePos);
+        dummy.position.copy(enuToThree(cell.position));
         dummy.updateMatrix();
         instMesh.setMatrixAt(idx, dummy.matrix);
 
@@ -1050,15 +1176,23 @@ export function ThreeStudio({
       const current = stateRef.current;
       if (current.trajectoryPoints.length === 0) return;
 
-      const pts = current.trajectoryPoints.map((p) => enuToThree({ ...p.enu, z: current.rx.heightReference === 'enu' ? current.rx.height + p.enu.z : 0.35 }));
-      if (pts.length >= 2) {
-        const geom = new THREE.BufferGeometry().setFromPoints(pts);
+      const pts = current.trajectoryPoints.map(({ enu }) => {
+        const position = getWaypointPosition(enu, current.rx, current.buildings, current.solverRoofs, current.waypointFrame);
+        return position && enuToThree(position);
+      });
+      const segments: THREE.Vector3[] = [];
+      for (let i = 1; i < pts.length; i++) {
+        const start = pts[i - 1], end = pts[i];
+        if (start && end) segments.push(start, end);
+      }
+      if (segments.length) {
+        const geom = new THREE.BufferGeometry().setFromPoints(segments);
         const mat = new THREE.LineBasicMaterial({ color: 0x10b981, transparent: true, opacity: 0.95 });
-        const line = new THREE.Line(geom, mat);
-        trajectoryGroup.add(line);
+        trajectoryGroup.add(new THREE.LineSegments(geom, mat));
       }
 
       pts.forEach((pt, idx) => {
+        if (!pt) return;
         const color = idx === 0 ? 0x10b981 : idx === pts.length - 1 ? 0xf27d26 : 0xe2e8f0;
         const marker = new THREE.Mesh(
           new THREE.SphereGeometry(idx === 0 || idx === pts.length - 1 ? 1.1 : 0.75, 12, 12),
@@ -1074,9 +1208,114 @@ export function ThreeStudio({
     // 10. ANCHORED RAYCAST EVENT LISTENER (Snaps Tx / Rx precisely onto ground/roof points)
     const raycaster = new THREE.Raycaster();
     const mouse = new THREE.Vector2();
+    const drawingPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0));
+    const walkKeys = new Set<string>();
+    let walkView: { camera: WalkCameraState; orbitPosition: THREE.Vector3; orbitTarget: THREE.Vector3; near: number } | null = null;
+    let walkDrag: { pointerId: number; x: number; y: number } | null = null;
     let press: { x: number; y: number; dragged: boolean } | null = null;
 
+    function sceneHits(includeGround: boolean) {
+      const objects = includeGround ? [ground, ...buildingGroup.children] : [...buildingGroup.children];
+      if (loadedVisual?.root.visible) {
+        // Raycaster visits invisible objects too. Only include active asset roots.
+        objects.push(...loadedVisual.root.children.filter(object => object.visible));
+      }
+      return raycaster.intersectObjects(objects, true);
+    }
+
+    function scenePointerPoint() {
+      const editor = stateRef.current.sceneEditor;
+      if (editor && editor.tool !== 'select' && authoredGroundIds.size === 0) {
+        return raycaster.ray.intersectPlane(drawingPlane, new THREE.Vector3());
+      }
+      return sceneHits(ground.visible).find(({ object }) => {
+        if (!(object instanceof THREE.Mesh)) return false;
+        if (editor?.tool !== 'generate') return true;
+        const id = selectedObjectId(object);
+        return id !== undefined && authoredGroundIds.has(id);
+      })?.point;
+    }
+
+    function selectedObjectId(hit: THREE.Object3D): string | undefined {
+      for (let part: THREE.Object3D | null = hit; part && part !== scene; part = part.parent) {
+        const id = loadedVisual?.ids.get(part);
+        if (id) return id;
+        if (part.parent === buildingGroup) return part.name || undefined;
+      }
+    }
+
+    function pickHorizontalSurface(floorId?: string) {
+      const { buildings } = stateRef.current;
+      return findHorizontalSurface(sceneHits(ground.visible), object => {
+        const id = selectedObjectId(object);
+        if (floorId) return id === floorId;
+        const role = id ? buildings.find(candidate => candidate.id === id)?.rfRole : undefined;
+        return role !== 'visual' && role !== 'foliage';
+      })?.point;
+    }
+
+    function startWalk(point: THREE.Vector3) {
+      const orbitPosition = camera.position.clone();
+      const orbitTarget = controls.target.clone();
+      // Discard any remaining orbit damping before restoring the saved pose later.
+      controls.enableDamping = false;
+      controls.update();
+      controls.enableDamping = true;
+      walkView = {
+        camera: createWalkCamera(point, orbitTarget.clone().sub(orbitPosition)),
+        orbitPosition, orbitTarget, near: camera.near,
+      };
+      controls.enabled = false;
+      camera.near = 0.08;
+      camera.updateProjectionMatrix();
+      renderer.domElement.focus({ preventScroll: true });
+      setHoveredCoordinate(null);
+      setWalkPhase('active');
+    }
+
+    function stopWalk() {
+      walkKeys.clear();
+      if (walkDrag && renderer.domElement.hasPointerCapture(walkDrag.pointerId)) {
+        renderer.domElement.releasePointerCapture(walkDrag.pointerId);
+      }
+      walkDrag = null;
+      if (walkView) {
+        camera.position.copy(walkView.orbitPosition);
+        controls.target.copy(walkView.orbitTarget);
+        camera.near = walkView.near;
+        camera.updateProjectionMatrix();
+        controls.enabled = true;
+        controls.update();
+        walkView = null;
+      }
+      setWalkPhase('pick');
+    }
+
+    function handleWalkKeyDown(e: KeyboardEvent) {
+      if (!walkView || stateRef.current.sceneNavigation !== 'walk' || !WALK_KEYS.has(e.code) || e.metaKey || e.ctrlKey || e.altKey) return;
+      e.preventDefault();
+      walkKeys.add(e.code);
+    }
+
+    function handleWalkKeyUp(e: KeyboardEvent) { walkKeys.delete(e.code); }
+    function clearWalkKeys() { walkKeys.clear(); }
+
+    function handleWalkEscape(e: KeyboardEvent) {
+      if (e.key !== 'Escape' || e.defaultPrevented || stateRef.current.sceneNavigation === 'orbit') return;
+      if (e.target instanceof Element && e.target.closest('dialog[open], input, select, textarea, [contenteditable]')) return;
+      e.preventDefault();
+      stopWalk();
+      setNavigationMode('orbit');
+    }
+
     function handlePointerDown(e: PointerEvent) {
+      if (walkView && stateRef.current.sceneNavigation === 'walk' && e.button === 0 && e.isPrimary) {
+        e.preventDefault();
+        renderer.domElement.focus({ preventScroll: true });
+        renderer.domElement.setPointerCapture(e.pointerId);
+        walkDrag = { pointerId: e.pointerId, x: e.clientX, y: e.clientY };
+        return;
+      }
       press = e.button === 0 ? { x: e.clientX, y: e.clientY, dragged: false } : null;
     }
 
@@ -1086,6 +1325,7 @@ export function ThreeStudio({
       if (e.button !== 0 || dragged) return;
       const current = stateRef.current;
       if (!current.sceneEditor && !current.editing) return;
+      if (current.sceneNavigation === 'pan' || walkView) return;
 
       // Calculate mouse canvas click coords
       const rect = renderer.domElement.getBoundingClientRect();
@@ -1094,16 +1334,26 @@ export function ThreeStudio({
 
       raycaster.setFromCamera(mouse, camera);
 
+      if (current.sceneNavigation === 'walk') {
+        const point = pickHorizontalSurface();
+        if (point) startWalk(point);
+        else setWalkPhase('no-surface');
+        return;
+      }
+
       if (current.sceneEditor) {
         if (current.sceneEditor.tool === 'select') {
-          const hit = raycaster.intersectObjects(buildingGroup.children, true).find(({ object }) =>
-            object.name || object.parent?.name);
-          current.onSelectSceneObject?.(hit?.object.name || hit?.object.parent?.name || null);
+          let id: string | undefined;
+          for (const { object } of sceneHits(false)) {
+            id = selectedObjectId(object);
+            if (id) break;
+          }
+          current.onSelectSceneObject?.(id ?? null);
           return;
         }
-        const point = raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0)), new THREE.Vector3());
+        const point = scenePointerPoint();
         if (!point) return;
-        current.sceneEditor.click({ x: point.x, y: -point.z, z: 0 });
+        current.sceneEditor.click({ x: point.x, y: -point.z, z: current.sceneEditor.tool === 'generate' ? point.y : 0 });
         return;
       }
 
@@ -1111,39 +1361,77 @@ export function ThreeStudio({
         const hit = raycaster.intersectObjects([transmitterGroup, receiverGroup], true)
           .find(({ object }) => typeof object.userData.deviceId === 'string');
         if (hit) {
-          const kind = hit.object.parent === transmitterGroup ? 'tx' : 'rx';
-          current.onSelectDevice(kind, hit.object.userData.deviceId);
+          const { deviceId, deviceKind } = hit.object.userData;
+          current.onSelectDevice(deviceKind, deviceId);
         }
         return;
       }
 
-      // Target buildings first for roof placement, fallback to ground slab
-      const intersects = raycaster.intersectObjects([ground, ...buildingGroup.children], true);
+      const floorId = current.placementFloorId;
+      const device = current.placementMode.endsWith('tx') ? current.tx : current.rx;
+      const point = floorId ? pickHorizontalSurface(floorId) : scenePointerPoint();
+      if (!point) {
+        if (floorId) setPlacementIssue('floor');
+        else if (device.heightReference === 'ground') setPlacementIssue('terrain');
+        return;
+      }
 
-      const hit = intersects[0]?.point;
-      if (!hit) return;
-
-      // The solver handles rooftop height from the horizontal position.
-      const enu = { x: hit.x, y: -hit.z, z: 0 };
+      const enu = { x: point.x, y: -point.z, z: floorId ? point.y + current.floorOffset : 0 };
       if (current.placementMode !== 'none') {
-        current.onPlaceDevice(current.placementMode, enu);
+        if (!floorId && getDeviceElevation({ ...device, enu }, current.buildings, current.solverRoofs) === undefined) {
+          setPlacementIssue('terrain');
+          return;
+        }
+        setPlacementIssue(undefined);
+        current.onPlaceDevice(current.placementMode, enu, floorId ? enu.z : undefined);
       } else if (current.drawingTrajectory) {
-        const { lat, lon } = enuToLatLon(enu, current.anchor);
-        current.setTrajectoryPoints([...current.trajectoryPoints, { lat, lon, enu }]);
+        const resolve = (position: ENUVector) => getWaypointPosition(position, current.rx, current.buildings, current.solverRoofs);
+        const frame = floorId ? 'ENU_m' : current.waypointFrame;
+        const next = floorId ? enu : resolve(enu);
+        if (!next) {
+          setPlacementIssue('terrain');
+          return;
+        }
+        let points = current.trajectoryPoints;
+        if (floorId && !current.waypointFrame) {
+          points = [];
+          for (const entry of current.trajectoryPoints) {
+            const position = resolve(entry.enu);
+            if (!position) {
+              setPlacementIssue('route');
+              return;
+            }
+            points.push({ ...entry, enu: position });
+          }
+        }
+        setPlacementIssue(undefined);
+        current.setTrajectoryPoints([...points, { ...enuToLatLon(enu, current.anchor), enu: frame ? next : enu }], frame);
       }
     }
 
     function handlePointerMove(e: PointerEvent) {
+      if (walkView) {
+        if (walkDrag?.pointerId === e.pointerId) {
+          rotateWalkCamera(walkView.camera, e.clientX - walkDrag.x, e.clientY - walkDrag.y);
+          walkDrag.x = e.clientX;
+          walkDrag.y = e.clientY;
+        }
+        return;
+      }
       if (press && Math.hypot(e.clientX - press.x, e.clientY - press.y) > 5) press.dragged = true;
       const rect = renderer.domElement.getBoundingClientRect();
       mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
       mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
 
       raycaster.setFromCamera(mouse, camera);
-      const intersects = raycaster.intersectObjects([ground, ...buildingGroup.children], true);
-
-      if (intersects.length > 0) {
-        const hitPt = intersects[0].point;
+      const current = stateRef.current;
+      const hitPt = current.sceneNavigation === 'walk' || current.placementFloorId
+        ? pickHorizontalSurface(current.placementFloorId) : scenePointerPoint();
+      if (stateRef.current.sceneEditor?.tool === 'generate') {
+        footprintHover = hitPt ?? null;
+        updateFootprintPreview();
+      }
+      if (hitPt) {
         setHoveredCoordinate({
           x: hitPt.x,
           y: -hitPt.z,
@@ -1154,15 +1442,30 @@ export function ThreeStudio({
       }
     }
 
+    function handleWalkPointerEnd(e: PointerEvent) {
+      if (walkDrag?.pointerId === e.pointerId) walkDrag = null;
+    }
+
     renderer.domElement.addEventListener('pointerdown', handlePointerDown);
     renderer.domElement.addEventListener('pointermove', handlePointerMove);
-    const clearCoordinates = () => setHoveredCoordinate(null);
+    renderer.domElement.addEventListener('lostpointercapture', handleWalkPointerEnd);
+    renderer.domElement.addEventListener('keydown', handleWalkKeyDown);
+    renderer.domElement.addEventListener('keyup', handleWalkKeyUp);
+    renderer.domElement.addEventListener('blur', clearWalkKeys);
+    window.addEventListener('blur', clearWalkKeys);
+    window.addEventListener('keydown', handleWalkEscape);
+    const clearCoordinates = () => {
+      footprintHover = null;
+      updateFootprintPreview();
+      setHoveredCoordinate(null);
+    };
     renderer.domElement.addEventListener('pointerleave', clearCoordinates);
     renderer.domElement.addEventListener('click', handleContainerClick);
 
     // 11. CENTRALIZED REALTIME ANIMATION DRAW LOOP
     let animationFrameId: number;
     let lastTime = performance.now();
+    let lastFrameTime = lastTime;
     let frameCount = 0;
 
     // Redraw each dynamic layer only when one of its inputs actually changed.
@@ -1170,6 +1473,7 @@ export function ThreeStudio({
     // string keys, no polling interval, no rebuild churn.
     type Snapshot = Partial<typeof stateRef.current>;
     let prev: Snapshot | null = null;
+    let previousWalk = false;
 
     const watchAndRedraw = () => {
       const c = stateRef.current;
@@ -1179,43 +1483,115 @@ export function ThreeStudio({
       if (c.performanceMode !== p.performanceMode) {
         renderer.setPixelRatio(Math.min(window.devicePixelRatio, c.performanceMode === 'high' ? 2 : 0.85));
       }
-      if (c.buildings !== p.buildings || c.showOutlines !== p.showOutlines ||
-          c.physicalMeshes !== p.physicalMeshes || c.sceneEditor?.selected?.id !== p.sceneEditor?.selected?.id ||
+      if (c.sceneVisual !== p.sceneVisual) replaceSceneVisual(c.sceneVisual);
+      const authoredScene = !!(c.sceneName || c.sceneVisual);
+      const openingGeneratedScene = (first || c.anchor !== p.anchor) && c.buildings.some(object => object.buildingSpec);
+      if (c.sceneName !== p.sceneName || c.sceneVisual !== p.sceneVisual ||
+          (authoredScene && c.anchor !== p.anchor) || openingGeneratedScene) {
+        if (c.sceneNavigation === 'walk') {
+          stopWalk();
+          setNavigationMode('orbit');
+        }
+        frameScene(authoredScene, c.buildings, openingGeneratedScene);
+      }
+      if (walkView && (c.sceneFloor !== p.sceneFloor || c.sceneNavigation !== 'walk')) stopWalk();
+      const walking = !!walkView;
+      if (walking !== previousWalk || c.t !== p.t || c.buildings !== p.buildings || c.showOutlines !== p.showOutlines || c.sceneVisual !== p.sceneVisual ||
+          c.sceneFloor !== p.sceneFloor || c.placementFloorId !== p.placementFloorId || c.solverCheck !== p.solverCheck || c.physicalMeshes !== p.physicalMeshes ||
+          c.solverObjects !== p.solverObjects || c.sceneEditor?.selected?.id !== p.sceneEditor?.selected?.id ||
           c.sceneEditor?.hiddenLayers !== p.sceneEditor?.hiddenLayers) rebuildBuildings3D();
-      if (c.sceneEditor?.draft !== p.sceneEditor?.draft) rebuildDraft();
+      if (c.sceneEditor?.draft !== p.sceneEditor?.draft || c.sceneEditor?.tool !== p.sceneEditor?.tool) {
+        if (c.sceneEditor?.tool !== 'generate') footprintHover = null;
+        rebuildDraft();
+        updateFootprintPreview();
+      }
       if (first || c.buildings !== p.buildings || c.solverRoofs !== p.solverRoofs || c.tx !== p.tx || c.rx !== p.rx || c.txs !== p.txs || c.rxs !== p.rxs ||
-          c.activeTxId !== p.activeTxId || c.activeRxId !== p.activeRxId ||
-          c.activeMode !== p.activeMode || c.mobilityRxPosition !== p.mobilityRxPosition || c.showDevices !== p.showDevices ||
-          c.showOutlines !== p.showOutlines) {
+          Boolean(c.mobilityRxPosition) !== Boolean(p.mobilityRxPosition) ||
+          c.showDevices !== p.showDevices) {
         drawNodes3D();
+      } else if (c.mobilityRxPosition !== p.mobilityRxPosition || c.mobilityRxHeading !== p.mobilityRxHeading) {
+        updateReceiverPose();
       }
       if (first || c.paths !== p.paths || c.matrixPaths !== p.matrixPaths ||
           c.activeMode !== p.activeMode || c.showRaysOnHeatmap !== p.showRaysOnHeatmap) {
         drawRayPaths3D();
       }
-      if (first || c.radioMap !== p.radioMap || c.activeMode !== p.activeMode ||
+      if (first || c.radioMap !== p.radioMap || c.activeMode !== p.activeMode || c.buildings !== p.buildings ||
           c.rmColormap !== p.rmColormap || c.rmAutoRange !== p.rmAutoRange ||
           c.rmVmin !== p.rmVmin || c.rmVmax !== p.rmVmax) {
         drawRadioMap3D();
       }
-      if (first || c.rx !== p.rx || c.trajectoryPoints !== p.trajectoryPoints) drawTrajectory3D();
+      if (first || c.rx !== p.rx || c.trajectoryPoints !== p.trajectoryPoints || c.waypointFrame !== p.waypointFrame ||
+          c.solverRoofs !== p.solverRoofs || c.buildings !== p.buildings) drawTrajectory3D();
 
       prev = { ...c };
+      previousWalk = walking;
     };
 
     let followingTx = false;
     let overhead = false;
     let lastFocus: ThreeStudioProps['focusObject'];
-    const updateCamera = () => {
+
+    function frameScene(authoredScene: boolean, objects: BuildingFootprint[], openingGeneratedScene: boolean) {
+      const bounds = new THREE.Box3();
+      if (authoredScene || openingGeneratedScene) objects.forEach(object => expandObjectBounds(bounds, object));
+
+      const lowPoint = authoredScene && !bounds.isEmpty() ? Math.min(0, bounds.min.y) : 0;
+      ground.position.y = lowPoint - 0.2;
+      gridHelper.position.y = lowPoint - 0.1;
+      if (bounds.isEmpty()) {
+        controls.target.set(0, 0, 0);
+        if (objects.some(object => object.source === 'template' && object.type === 'avenue')) {
+          camera.position.set(-228, 166, 93);
+        } else {
+          camera.position.set(0, 180, 240);
+        }
+      } else {
+        const { center, radius } = bounds.getBoundingSphere(new THREE.Sphere());
+        const vertical = THREE.MathUtils.degToRad(camera.fov / 2);
+        const halfFov = Math.min(vertical, Math.atan(Math.tan(vertical) * camera.aspect));
+        const distance = Math.max(7, 0.95 * radius / Math.sin(halfFov));
+        const offset = new THREE.Vector3(0.88, 0.8, 1).setLength(distance);
+        controls.target.copy(center);
+        camera.position.copy(center).add(offset);
+      }
+      controls.update();
+      controls.saveState();
+      if (overhead) {
+        const distance = camera.position.distanceTo(controls.target);
+        camera.position.copy(controls.target).add(new THREE.Vector3(0, distance, distance * 0.001));
+      }
+    }
+
+    const updateCamera = (deltaSeconds = 0) => {
       const current = stateRef.current;
       const top = !!current.sceneEditor?.top;
+      const locating = current.focusObject && current.focusObject !== lastFocus;
+      if (walkView && (current.sceneNavigation !== 'walk' || locating || top !== overhead)) {
+        stopWalk();
+        if (current.sceneNavigation === 'walk') setNavigationMode('orbit');
+      }
+      if (walkView) {
+        advanceWalkCamera(walkView.camera, walkKeys, deltaSeconds);
+        const { position, yaw, pitch } = walkView.camera;
+        camera.position.copy(position);
+        camera.rotation.set(pitch, yaw, 0, 'YXZ');
+        return;
+      }
+
+      const panning = current.sceneNavigation === 'pan';
+      controls.mouseButtons.LEFT = panning ? THREE.MOUSE.PAN : THREE.MOUSE.ROTATE;
+      controls.touches.ONE = panning ? THREE.TOUCH.PAN : THREE.TOUCH.ROTATE;
+      controls.zoomToCursor = !!current.sceneEditor;
       if (top !== overhead) {
         if (top) {
           controls.saveState();
           const distance = camera.position.distanceTo(controls.target);
           camera.position.copy(controls.target).add(new THREE.Vector3(0, distance, distance * 0.001));
         } else {
-          controls.reset();
+          const distance = camera.position.distanceTo(controls.target);
+          const offset = controls.position0.clone().sub(controls.target0).setLength(distance);
+          camera.position.copy(controls.target).add(offset);
         }
         controls.enableRotate = !top;
         overhead = top;
@@ -1234,23 +1610,38 @@ export function ThreeStudio({
       followingTx = shouldFollowTx;
 
       if (shouldFollowTx) {
-        const txPos = enuToThree({ ...current.tx.enu, z: current.tx.height });
-        controls.target.lerp(txPos, 0.1);
+        controls.target.lerp(deployedAccessPointPosition, 0.1);
       }
-      if (current.focusObject && current.focusObject !== lastFocus) {
+      if (locating) {
         lastFocus = current.focusObject;
         const object = current.buildings.find(building => building.id === lastFocus?.id);
-        if (object?.enuPoints.length) {
+        if (object) {
           const bounds = new THREE.Box3();
-          for (const point of object.enuPoints) {
-            bounds.expandByPoint(enuToThree({ ...point, z: object.baseZ ?? 0 }));
-            bounds.expandByPoint(enuToThree({ ...point, z: (object.baseZ ?? 0) + object.height }));
+          const groupId = object.buildingSpec?.id;
+          if (groupId) {
+            for (const part of current.buildings) {
+              if (part.buildingSpec?.id === groupId &&
+                isSceneObjectVisible(part, current.sceneEditor?.hiddenLayers, current.sceneFloor)) {
+                expandObjectBounds(bounds, part);
+              }
+            }
+          } else {
+            const visual = loadedVisual?.bindings.get(object.id)?.node;
+            if (visual?.visible && loadedVisual?.root.visible) bounds.setFromObject(visual);
+            else expandObjectBounds(bounds, object);
           }
-          const center = bounds.getCenter(new THREE.Vector3());
-          const distance = Math.max(30, bounds.getSize(new THREE.Vector3()).length() * 1.6);
-          const offset = camera.position.clone().sub(controls.target).setLength(distance);
-          controls.target.copy(center);
-          camera.position.copy(center).add(offset);
+          if (!bounds.isEmpty()) {
+            const center = bounds.getCenter(new THREE.Vector3());
+            const span = bounds.getSize(new THREE.Vector3()).length();
+            const vertical = THREE.MathUtils.degToRad(camera.fov / 2);
+            const halfFov = Math.min(vertical, Math.atan(Math.tan(vertical) * camera.aspect));
+            const distance = groupId
+              ? Math.max(7, span * 0.55 / Math.sin(halfFov))
+              : Math.max(current.sceneName || current.sceneVisual ? 5 : 30, span * 1.6);
+            const offset = camera.position.clone().sub(controls.target).setLength(distance);
+            controls.target.copy(center);
+            camera.position.copy(center).add(offset);
+          }
         }
       }
       controls.update();
@@ -1258,11 +1649,13 @@ export function ThreeStudio({
 
     const animate = () => {
       animationFrameId = requestAnimationFrame(animate);
+      const time = performance.now();
+      const deltaSeconds = (time - lastFrameTime) / 1000;
+      lastFrameTime = time;
       if (!stateRef.current.visible) return;
 
       // FPS tracking counter (skip the state update when the reading is stable
       // so an idle scene doesn't re-render React every second).
-      const time = performance.now();
       frameCount++;
       if (time >= lastTime + 1000) {
         const fpsNow = Math.round((frameCount * 1000) / (time - lastTime));
@@ -1272,7 +1665,7 @@ export function ThreeStudio({
       }
 
       watchAndRedraw();
-      updateCamera();
+      updateCamera(deltaSeconds);
       renderer.render(scene, camera);
     };
 
@@ -1320,18 +1713,27 @@ export function ThreeStudio({
 
     return () => {
       captureScreenshotRef.current = null;
+      ++visualLoadGeneration;
+      loadedVisual?.dispose();
       cancelAnimationFrame(animationFrameId);
       resizeObserver.disconnect();
       renderer.domElement.removeEventListener('webglcontextlost', onContextLost);
       renderer.domElement.removeEventListener('webglcontextrestored', onContextRestored);
       renderer.domElement.removeEventListener('pointerdown', handlePointerDown);
       renderer.domElement.removeEventListener('pointermove', handlePointerMove);
+      renderer.domElement.removeEventListener('lostpointercapture', handleWalkPointerEnd);
+      renderer.domElement.removeEventListener('keydown', handleWalkKeyDown);
+      renderer.domElement.removeEventListener('keyup', handleWalkKeyUp);
+      renderer.domElement.removeEventListener('blur', clearWalkKeys);
+      window.removeEventListener('blur', clearWalkKeys);
+      window.removeEventListener('keydown', handleWalkEscape);
       renderer.domElement.removeEventListener('pointerleave', clearCoordinates);
       renderer.domElement.removeEventListener('click', handleContainerClick);
       controls.dispose();
       // Release every GPU resource this effect created.
-      [buildingGroup, draftGroup, streetLabelGroup, transmitterGroup, receiverGroup, pathsGroup,
+      [buildingGroup, visualSelectionGroup, draftGroup, streetLabelGroup, transmitterGroup, receiverGroup, pathsGroup,
        heatmapGroup, trajectoryGroup, interactionGroup].forEach(clearGroup);
+      disposeObject3D(footprintPreview);
       ground.geometry.dispose();
       groundMat.dispose();
       gridHelper.geometry.dispose();
@@ -1353,11 +1755,35 @@ export function ThreeStudio({
     'move-tx': t(`Click the new location for ${tx.name}. Esc cancels.`, `点击场景移动 ${tx.name}，按 Esc 取消。`),
     'move-rx': t(`Click the new location for ${rx.name}. Esc cancels.`, `点击场景移动 ${rx.name}，按 Esc 取消。`),
   }[placementMode];
+  const placementFeedback = placementIssue === 'floor'
+    ? t('No supporting surface on this floor. Choose a solid part of the slab.', '此处没有楼板支撑面。请选择楼板实体区域。')
+    : placementIssue === 'terrain'
+      ? t('No terrain surface at that point. Choose a point on the terrain.', '此处没有地形表面。请在地形上重新选点。')
+      : placementIssue === 'route'
+        ? t('An existing waypoint has no terrain surface. Adjust the route before placing a floor waypoint.',
+          '已有控制点下方没有地形。请先调整轨迹，再添加楼板控制点。')
+        : activePlacementFloor && (placementMode !== 'none' || drawingTrajectory)
+          ? t('Click the slab to place the antenna at the specified height above it.', '点击楼板，天线将放在指定的离板高度。')
+          : placementHint || (drawingTrajectory ? t('Click to add a waypoint. Esc ends drawing.', '点击添加轨迹点，按 Esc 结束绘制。') : '');
 
   const viewButton = 'flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-[var(--ink-750)]';
+  const navigationButtons = [
+    { mode: 'orbit', Icon: Rotate3D, label: t('Orbit', '旋转'), title: t('Drag to orbit. Right-drag or Shift-drag to pan.', '拖动旋转视角。右键拖动或按住 Shift 拖动可平移。') },
+    { mode: 'pan', Icon: Hand, label: t('Pan', '平移'), title: t('Drag to move the view.', '直接拖动即可平移视图。') },
+    { mode: 'walk', Icon: Footprints, label: t('Walk', '漫游'), title: t('Choose a point on the ground or a floor to enter first-person view.', '点击地面或楼板，进入第一人称视角。') },
+  ] as const;
+  const navigationHint = sceneNavigation === 'pan'
+    ? t('Drag to pan · Scroll or pinch to zoom', '拖动平移 · 滚动或双指捏合缩放')
+    : sceneNavigation === 'walk'
+      ? walkPhase === 'active'
+        ? t('Drag to look · WASD or arrows to move · Q/E down/up · Esc to exit', '拖动转头 · WASD 或方向键移动 · Q/E 下降／上升 · Esc 退出')
+        : walkPhase === 'no-surface'
+          ? t('No floor at that point. Click the ground or select a floor and try again.', '该处未找到地面或楼板。请选择楼层，再点击可见的楼板。')
+          : t('Select a floor to see inside. Click the ground or a floor to start walking.', '查看室内时先选择楼层。点击地面或楼板开始漫游。')
+      : '';
   const coordinates = hoveredCoordinate && (
     <span className="readout">
-      {t('ENU (m)', 'ENU（米）')} · {hoveredCoordinate.x.toFixed(1)}, {hoveredCoordinate.y.toFixed(1)}, {hoveredCoordinate.z.toFixed(1)}
+      {t('East / North / Up (m)', '东向 / 北向 / 高程（米）')} · {hoveredCoordinate.x.toFixed(1)}, {hoveredCoordinate.y.toFixed(1)}, {hoveredCoordinate.z.toFixed(1)}
     </span>
   );
 
@@ -1367,9 +1793,25 @@ export function ThreeStudio({
         <canvas
           ref={canvasRef}
           id="canvas-3d"
-          className={cn('absolute inset-0 block h-full w-full', (placementHint || drawingTrajectory || (sceneEditor && sceneEditor.tool !== 'select')) && 'cursor-crosshair')}
+          tabIndex={sceneEditor ? 0 : undefined}
+          className={cn('absolute inset-0 block h-full w-full',
+            (placementHint || drawingTrajectory || (sceneEditor && sceneEditor.tool !== 'select') ||
+              (sceneNavigation === 'walk' && walkPhase !== 'active')) && 'cursor-crosshair',
+            (sceneNavigation === 'pan' || (sceneNavigation === 'walk' && walkPhase === 'active')) && 'cursor-grab active:cursor-grabbing')}
           aria-label={t('3D propagation scene', '三维传播场景')}
         />
+
+        {sceneEditor && <div role="group" aria-label={t('Scene navigation', '场景浏览')}
+          className="absolute left-2 top-2 z-10 flex max-w-[calc(100%-90px)] flex-wrap gap-1">
+          {navigationButtons.map(({ mode, Icon, label, title }) => <button key={mode} id={`btn-scene-${mode}`}
+            type="button" className="studio-tool" title={title} aria-pressed={sceneNavigation === mode}
+            disabled={!canNavigateScene || canvasState !== 'active'} onClick={() => {
+              setWalkPhase('pick');
+              setNavigationMode(mode === 'walk' && sceneNavigation === 'walk' ? 'orbit' : mode);
+            }}>
+            <Icon className="h-4 w-4" aria-hidden="true" />{label}
+          </button>)}
+        </div>}
 
         {editing && (
           <div className="absolute left-2 top-2 z-10 flex max-w-[calc(100%-90px)] flex-wrap gap-1">
@@ -1398,9 +1840,30 @@ export function ThreeStudio({
             )}
             {drawingTrajectory && (
               <button id="btn-undo-3d-mobility-path" type="button" className="studio-tool"
-                disabled={trajectoryPoints.length === 0} onClick={() => setTrajectoryPoints(trajectoryPoints.slice(0, -1))}>
+                disabled={trajectoryPoints.length === 0}
+                onClick={() => setTrajectoryPoints(trajectoryPoints.slice(0, -1), trajectoryPoints.length > 1 ? waypointFrame : undefined)}>
                 {t('Undo point', '撤销轨迹点')}
               </button>
+            )}
+            {floors.length > 0 && (
+              <label className="studio-tool">
+                {t('Placement surface', '放置表面')}
+                <select id="deployment-floor" className="max-w-48 truncate rounded border border-[var(--line)] bg-white"
+                  value={activePlacementFloor?.id ?? ''} onChange={event => setPlacementFloorId(event.target.value || undefined)}>
+                  <option value="">{t('Scene', '场景')}</option>
+                  {floors.map(object => <option key={object.id} value={object.id}>
+                    {sceneObjectName(object, t) ?? object.floor} · {object.id}
+                  </option>)}
+                </select>
+              </label>
+            )}
+            {activePlacementFloor && (placementMode !== 'none' || drawingTrajectory) && (
+              <label className="studio-tool">
+                {t('Height above slab (m)', '离板高度（米）')}
+                <NumberField id="deployment-floor-offset" value={floorOffset} min={0} step="any"
+                  className="w-16 rounded border border-[var(--line)] bg-white px-1"
+                  onChange={offset => setFloorOffsets(previous => ({ ...previous, [floorKind]: offset }))} />
+              </label>
             )}
           </div>
         )}
@@ -1415,7 +1878,10 @@ export function ThreeStudio({
             {sceneEditor ? (
               <>
                 <label className={viewButton}>
-                  <input type="checkbox" checked={sceneEditor.top} onChange={event => sceneEditor.setTop(event.target.checked)} />
+                  <input type="checkbox" checked={sceneEditor.top} onChange={event => {
+                    if (sceneNavigation === 'walk' && walkPhase === 'active') setNavigationMode('orbit');
+                    sceneEditor.setTop(event.target.checked);
+                  }} />
                   {t('Top view', '俯视')}
                 </label>
                 <label className={viewButton}>
@@ -1452,14 +1918,23 @@ export function ThreeStudio({
         </details>
 
         <div className="pointer-events-none absolute bottom-2 left-2 z-10 flex max-w-[85%] flex-col items-start gap-1 text-xs">
-          {(placementHint || drawingTrajectory) && (
+          {navigationHint && <p role="status" className="rounded border border-[var(--line)] bg-white/95 px-2 py-1 font-semibold">
+            {navigationHint}
+          </p>}
+          {placementFeedback && (
             <p role="status" className="rounded border border-[var(--line)] bg-white/95 px-2 py-1 font-semibold">
-              {placementHint || t('Click to add a waypoint. Esc ends drawing.', '点击添加轨迹点，按 Esc 结束绘制。')}
+              {placementFeedback}
             </p>
           )}
           {canvasState !== 'active' && (
             <p role="status" className="rounded bg-white/95 px-2 py-1">
               WebGL · {canvasState === 'unavailable' ? t('Unavailable', '不可用') : t('Starting', '正在启动')}
+            </p>
+          )}
+          {sceneVisual && !solverCheck && sceneVisualStatus !== 'idle' && (
+            <p role="status" className="rounded bg-white/95 px-2 py-1">
+              {sceneVisualStatus === 'loading' ? t('Loading 3D scene model…', '正在加载三维场景模型…')
+                : t('Some model geometry is unavailable. Showing available geometry.', '部分模型无法加载，已显示可用的几何。')}
             </p>
           )}
           {coordinates && <p className="rounded bg-white/90 px-2 py-0.5 text-[var(--text-mid)]">{coordinates}</p>}

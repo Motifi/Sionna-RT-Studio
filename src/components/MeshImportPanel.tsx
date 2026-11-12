@@ -2,6 +2,9 @@ import { useState, type FormEvent } from 'react';
 import { importMesh, type MeshImportResult } from '../api';
 import { useI18n } from '../i18n';
 import type { BuildingFootprint } from '../types';
+import { radioMaterialLabel } from '../lib/radioLabels';
+import { sceneIssueLabel } from '../lib/sceneLabels';
+import { SceneErrorNotice } from './SceneErrorNotice';
 
 interface Props {
   online: boolean;
@@ -53,8 +56,12 @@ export function MeshImportPanel({ online, onImport }: Props) {
     <form onSubmit={inspect}>
       <fieldset disabled={busy} className="grid gap-3 text-xs sm:grid-cols-2">
         <label className="flex min-w-0 flex-col gap-1 font-medium sm:col-span-2">{t('Mesh file', '网格文件')}
-          <input type="file" accept=".ply,.obj,.zip" className={field + ' file:mr-2 file:cursor-pointer file:font-semibold'}
+          <input type="file" accept=".ply,.obj,.zip" className="peer sr-only" aria-label={t('Mesh file', '网格文件')}
             onChange={event => { setFile(event.target.files?.[0] ?? null); clearReview(); }} />
+          <span className={`${field} flex cursor-pointer items-center gap-2 peer-focus-visible:outline-2 peer-focus-visible:outline-[var(--accent)] peer-disabled:cursor-not-allowed`}>
+            <span className="shrink-0 font-semibold">{t('Choose file', '选择文件')}</span>
+            <span className="truncate text-[var(--text-mid)]" title={file?.name}>{file?.name ?? t('No file selected', '未选择文件')}</span>
+          </span>
         </label>
         <label className="flex min-w-0 flex-col gap-1 font-medium">{t('Source coordinate axes', '源坐标轴')}
           <select className={field} value={axes} onChange={event => { setAxes(event.target.value); clearReview(); }}>
@@ -62,13 +69,13 @@ export function MeshImportPanel({ online, onImport }: Props) {
             <option value="y-up">{t('Y up · X east, −Z north', 'Y 朝上 · X 东，−Z 北')}</option>
           </select>
         </label>
-        <label className="flex min-w-0 flex-col gap-1 font-medium">{t('Meters per source unit', '每源单位对应的米数')}
+        <label className="flex min-w-0 flex-col gap-1 font-medium">{t('Meters per source unit', '源单位换算为米')}
           <input type="number" step="any" min="0.000001" max="1000000" className={field} value={scale}
             onChange={event => { setScale(event.target.value); clearReview(); }} />
         </label>
-        <label className="flex min-w-0 flex-col gap-1 font-medium">{t('Default radio material', '默认无线材质')}
+        <label className="flex min-w-0 flex-col gap-1 font-medium">{t('Default radio material', '默认射频材质')}
           <select className={field} value={material} onChange={event => { setMaterial(event.target.value); clearReview(); }}>
-            {materials.map(id => <option key={id}>{id}</option>)}
+            {materials.map(id => <option key={id} value={id}>{radioMaterialLabel(id, t)}</option>)}
           </select>
         </label>
         <label className="flex min-w-0 flex-col gap-1 font-medium">{t('Import mode', '导入方式')}
@@ -79,30 +86,30 @@ export function MeshImportPanel({ online, onImport }: Props) {
         </label>
         <div className="flex flex-wrap items-center gap-2 sm:col-span-2">
           <button type="submit" className="btn-quiet min-h-9 cursor-pointer px-3 py-1.5 text-sm disabled:cursor-not-allowed"
-            disabled={!canInspect || busy}>{busy ? t('Inspecting…', '检查中…') : t('Inspect import', '检查导入')}</button>
+            disabled={!canInspect || busy}>{busy ? t('Inspecting…', '检查中…') : t('Inspect import', '检查网格')}</button>
           {!online && <p className="text-[var(--text-mid)]">{t('Mesh conversion requires the local solver service.', '网格转换需要本机求解服务。')}</p>}
         </div>
       </fieldset>
     </form>
-    {error && <p role="alert" className="rounded-lg bg-[var(--accent-soft)] p-2.5 text-xs text-[var(--bad)]">{error}</p>}
+    <SceneErrorNotice error={error} operation="mesh" className="rounded-lg bg-[var(--accent-soft)] p-2.5" />
     {review && <div className="panel-flush space-y-2.5 p-3 text-xs">
       <p className="font-semibold">{t('Vertices', '顶点')} <span className="readout">{review.vertexCount}</span>
         {' · '}{t('Triangles', '三角形')} <span className="readout">{review.triangleCount}</span></p>
       <ul className="max-h-40 divide-y divide-[var(--line)] overflow-y-auto">
         {review.objects.map(object => <li key={object.id} className="space-y-1 break-words py-2">
-          <p className="font-semibold">{object.name || object.id} · {object.material}</p>
+          <p className="font-semibold">{object.name || object.id} · {radioMaterialLabel(object.material, t)}</p>
           {object.rawTags?.boundsMinENU && object.rawTags.boundsMaxENU && <p className="readout text-[var(--text-mid)]">
-            ENU m {object.rawTags.boundsMinENU} → {object.rawTags.boundsMaxENU}
+            {t('ENU bounds (m)', '东向、北向与高程范围（米）')} {object.rawTags.boundsMinENU} → {object.rawTags.boundsMaxENU}
           </p>}
-          {object.importIssues?.map((issue, index) => <p key={index} className="text-[var(--warn)]">{issue}</p>)}
+          {object.importIssues?.map((issue, index) => <p key={index} className="text-[var(--warn)]">{sceneIssueLabel(issue, t)}</p>)}
         </li>)}
       </ul>
-      {review.issues.map((issue, index) => <p key={index} className="text-[var(--warn)]">{issue}</p>)}
+      {review.issues.map((issue, index) => <p key={index} className="text-[var(--warn)]">{sceneIssueLabel(issue, t)}</p>)}
       <button type="button" className="btn-signal min-h-9 cursor-pointer px-3 py-1.5 text-sm" onClick={() => {
         onImport(review.objects, replace);
         setAppliedCount(review.objects.length);
         setReview(null);
-      }}>{t('Apply mesh import', '应用网格导入')}</button>
+      }}>{t('Apply mesh import', '导入网格')}</button>
     </div>}
     {appliedCount !== null && <p role="status" className="text-sm text-[var(--ok)]">
       {t(`Imported ${appliedCount} mesh ${appliedCount === 1 ? 'object' : 'objects'}.`, `已导入 ${appliedCount} 个网格对象。`)}

@@ -4,7 +4,9 @@ Scene packaging is tested with a fixture in place of a Mitsuba scene build.
 
 Run with:  .venv/bin/python -m unittest discover backend/tests
 """
+import ast
 import io
+import json
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -18,6 +20,7 @@ from backend.scene_build import (
     GROUND_COLOR,
     GROUND_MATERIAL,
     _write_scene_xml,
+    material_target_ids,
 )
 from backend.models import (
     BuildingFootprint,
@@ -84,6 +87,34 @@ class TestGeneratedScript(unittest.TestCase):
             script = archive.read("load_scene.py").decode()
         self.assertIn("from srts_runtime import configure_drjit_llvm_path", script)
         self.assertLess(script.index("configure_drjit_llvm_path()"), script.index("import mitsuba"))
+
+    def test_export_replays_world_space_foliage_volumes(self):
+        crown = _building()
+        crown = BuildingFootprint.model_validate(crown.model_dump() | {
+            "rfRole": "foliage", "baseZ": 3,
+            "foliage": {"center": {"x": 3, "y": 5, "z": 6}, "radii": {"x": 1, "y": 2, "z": 3},
+                        "attenuationDbPerM": 0.7},
+        })
+        with tempfile.TemporaryDirectory() as folder:
+            scene_dir = Path(folder)
+            (scene_dir / "scene.xml").write_text("<scene/>", encoding="utf-8")
+            with (
+                patch("backend.scene_export.build_scene_dir", return_value=scene_dir),
+                patch("backend.scene_export.solver_runtime", return_value={}),
+                patch("backend.scene_export.inspect_scene", return_value={"groundModel": "terrain"}),
+            ):
+                exported = scene_export_zip(_request(buildings=[crown]))
+
+        with zipfile.ZipFile(io.BytesIO(exported)) as archive:
+            script = ast.parse(archive.read("load_scene.py"))
+            manifest = json.loads(archive.read("manifest.json"))
+            compile(archive.read("srts_foliage.py"), "srts_foliage.py", "exec")
+        crown_assignment = next(node for node in script.body if isinstance(node, ast.Assign)
+                                and getattr(node.targets[0], "id", None) == "FOLIAGE_CROWNS")
+        self.assertEqual(ast.literal_eval(crown_assignment.value), (((3, 5, 9), (1, 2, 3), 0.7),))
+        self.assertEqual(manifest["groundModel"], "terrain")
+        self.assertEqual(manifest["foliageModel"], "ellipsoidPathLength")
+        self.assertEqual(manifest["buildingCount"], 0)
 
     def test_loads_the_relative_scene_and_sets_frequency(self):
         script = _load_scene_script(_request(freqGhz=3.5))
@@ -321,6 +352,20 @@ class TestSceneXml(unittest.TestCase):
     def test_buildings_keep_their_own_materials(self):
         refs = [shape.find("ref").get("id") for shape in self._root().findall("shape")]
         self.assertEqual(refs, [GROUND_BSDF_ID, "itu_concrete", "itu_brick"])
+
+    def test_named_custom_material_uses_a_standalone_radio_bsdf(self):
+        config = MaterialConfig(id="mat-itu_partition & glass", relativePermittivity=4.1, conductivity=0.02)
+        with tempfile.TemporaryDirectory() as folder:
+            refs = [("meshes/b0.ply", config.id, "mesh-b0")]
+            path = _write_scene_xml(Path(folder), refs, {config.id}, [config])
+            root = ET.parse(path).getroot()
+        bsdf = root.find("bsdf")
+        self.assertEqual(len(root.findall("bsdf")), 1)
+        self.assertEqual(bsdf.get("type"), "radio-material")
+        self.assertEqual(bsdf.get("id"), root.find("shape/ref").get("id"))
+        self.assertEqual((bsdf.get("id"),), material_target_ids(config.id))
+        self.assertEqual({prop.get("name"): float(prop.get("value")) for prop in bsdf.findall("float")},
+                         {"relative_permittivity": 4.1, "conductivity": 0.02})
 
 
 class TestDeviceHelpers(unittest.TestCase):

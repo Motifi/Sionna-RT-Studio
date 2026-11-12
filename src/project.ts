@@ -2,19 +2,24 @@ import { HandoverConfig } from './api';
 import { ColormapName } from './lib/colormaps';
 import {
   BuildingFootprint,
+  BuildingSpec,
   CoverageMetric,
+  CoverageRegion,
   GeoAnchor,
   MaterialConfig,
   MobilityCombineMode,
   Receiver,
+  SceneVisual,
   SolverOptions,
   TrajectoryPoint,
   Transmitter,
+  WaypointFrame,
 } from './types';
 
-export const PROJECT_SCHEMA_VERSION = 3;
+export const PROJECT_SCHEMA_VERSION = 5;
 // Keep the existing key to migrate old localStorage autosaves.
 export const PROJECT_STORAGE_KEY = 'sionna-rt-studio.project.v1';
+const PROJECT_BACKUP_KEY = `${PROJECT_STORAGE_KEY}.pre-v5`;
 const PROJECT_DATABASE = 'sionna-rt-studio';
 const PROJECT_STORE = 'projects';
 
@@ -39,6 +44,8 @@ export interface StudioProjectState {
     anchor: GeoAnchor;
     buildings: BuildingFootprint[];
     hiddenLayers?: BuildingFootprint['category'][];
+    name?: string;
+    visual?: SceneVisual;
   };
   devices: {
     transmitters: Transmitter[];
@@ -56,6 +63,9 @@ export interface StudioProjectState {
   csi: StudioCsiSettings;
   coverage: {
     metric: CoverageMetric;
+    region?: CoverageRegion | null;
+    floorId?: string | null;
+    thresholdDb?: number | null;
     bandwidthMhz: number;
     noiseFigureDb: number;
     heightM: number;
@@ -65,6 +75,7 @@ export interface StudioProjectState {
   };
   mobility: {
     trajectoriesByRxId: Record<string, TrajectoryPoint[]>;
+    waypointFrameByRxId?: Record<string, WaypointFrame>;
     combineMode: MobilityCombineMode;
     handover: HandoverConfig;
     speedKmh: number;
@@ -85,6 +96,7 @@ export interface StudioProjectState {
 export interface StudioProjectDocument {
   format: 'SionnaRTStudio Project';
   schemaVersion: typeof PROJECT_SCHEMA_VERSION;
+  projectId: string;
   savedAtUtc: string;
   state: StudioProjectState;
 }
@@ -95,11 +107,25 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const isFiniteNumber = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value);
 
-const isVector = (value: unknown): boolean =>
+const isVector = (value: unknown): value is { x: number; y: number; z: number } =>
   isRecord(value) && isFiniteNumber(value.x) && isFiniteNumber(value.y) && isFiniteNumber(value.z);
 
 const isAnchor = (value: unknown): value is GeoAnchor =>
-  isRecord(value) && isFiniteNumber(value.latitude) && isFiniteNumber(value.longitude);
+  isRecord(value) && isFiniteNumber(value.latitude) && isFiniteNumber(value.longitude) &&
+  (value.elevation === undefined || isFiniteNumber(value.elevation)) &&
+  (value.verticalDatum === undefined || typeof value.verticalDatum === 'string');
+
+const isSceneVisual = (value: unknown): value is SceneVisual =>
+  isRecord(value) && typeof value.glb === 'string' && value.glb.length >= 16 &&
+  value.glb.length <= 24 * 1024 * 1024 && value.glb.startsWith('Z2xURg') &&
+  Array.isArray(value.bindings) && value.bindings.length <= 4096 &&
+  value.bindings.every(binding => isRecord(binding) && typeof binding.id === 'string' && isVector(binding.origin)) &&
+  new Set(value.bindings.map(binding => binding.id)).size === value.bindings.length;
+
+const isFoliage = (value: unknown): boolean =>
+  isRecord(value) && isVector(value.center) && isVector(value.radii) &&
+  Math.min(value.radii.x, value.radii.y, value.radii.z) > 0 &&
+  isFiniteNumber(value.attenuationDbPerM) && value.attenuationDbPerM >= 0;
 
 const isArraySize = (value: unknown): boolean =>
   Array.isArray(value) &&
@@ -113,7 +139,7 @@ const isTransmitter = (value: unknown): value is Transmitter =>
   isFiniteNumber(value.latitude) &&
   isFiniteNumber(value.longitude) &&
   isFiniteNumber(value.height) &&
-  (value.heightReference === undefined || value.heightReference === 'roof' || value.heightReference === 'enu') &&
+  (value.heightReference === undefined || value.heightReference === 'roof' || value.heightReference === 'ground' || value.heightReference === 'enu') &&
   isVector(value.enu) &&
   isFiniteNumber(value.powerDbm) &&
   isArraySize(value.antennaArraySize) &&
@@ -127,9 +153,21 @@ const isReceiver = (value: unknown): value is Receiver =>
   isFiniteNumber(value.latitude) &&
   isFiniteNumber(value.longitude) &&
   isFiniteNumber(value.height) &&
-  (value.heightReference === undefined || value.heightReference === 'roof' || value.heightReference === 'enu') &&
+  (value.heightReference === undefined || value.heightReference === 'roof' || value.heightReference === 'ground' || value.heightReference === 'enu') &&
   isVector(value.enu) &&
   isArraySize(value.antennaArraySize);
+
+const isBuildingSpec = (value: unknown): value is BuildingSpec =>
+  isRecord(value) && typeof value.id === 'string' && /^[A-Za-z0-9_-]{1,100}$/.test(value.id) &&
+  typeof value.name === 'string' && value.name.trim().length > 0 && Array.from(value.name.trim()).length <= 120 &&
+  [value.east, value.north, value.baseZ].every(coordinate => isFiniteNumber(coordinate) && Math.abs(coordinate) <= 100_000) &&
+  isFiniteNumber(value.length) && value.length >= 8 && value.length <= 150 &&
+  isFiniteNumber(value.width) && value.width >= 8 && value.width <= 150 &&
+  isFiniteNumber(value.height) && value.height >= 3 && value.height <= 120 &&
+  (value.rotationDeg === undefined || isFiniteNumber(value.rotationDeg)) &&
+  (value.floors === undefined || (isFiniteNumber(value.floors) && Number.isInteger(value.floors) && value.floors >= 1 && value.floors <= 30 &&
+    value.height / value.floors >= 2.7 - 1e-9 && value.height / value.floors <= 6 + 1e-9)) &&
+  (value.layout === 'office' || value.layout === 'apartments');
 
 const isBuilding = (value: unknown): value is BuildingFootprint =>
   isRecord(value) &&
@@ -146,6 +184,12 @@ const isBuilding = (value: unknown): value is BuildingFootprint =>
   typeof value.type === 'string' &&
   typeof value.material === 'string' &&
   (value.kind === undefined || ['building', 'wall', 'mesh'].includes(String(value.kind))) &&
+  (value.rfRole === undefined || ['surface', 'ground', 'foliage', 'visual'].includes(String(value.rfRole))) &&
+  (value.rfRole !== 'ground' || value.kind === 'mesh') &&
+  (value.rfRole === 'foliage' ? isFoliage(value.foliage) : value.foliage === undefined) &&
+  (value.floor === undefined || typeof value.floor === 'string') &&
+  (value.geometrySource === undefined || typeof value.geometrySource === 'string') &&
+  (value.buildingSpec === undefined || (isBuildingSpec(value.buildingSpec) && value.id.startsWith(`${value.buildingSpec.id}--`))) &&
   (value.baseZ === undefined || isFiniteNumber(value.baseZ)) &&
   (value.source === undefined || ['template', 'osm', 'manual', 'import'].includes(String(value.source))) &&
   (value.heightSource === undefined || ['tag', 'levels', 'estimated', 'manual'].includes(String(value.heightSource))) &&
@@ -194,6 +238,10 @@ const isMaterialConfig = (value: unknown): value is MaterialConfig =>
   (value.conductivity == null || isFiniteNumber(value.conductivity)) &&
   (value.thickness == null || isFiniteNumber(value.thickness));
 
+const isCoverageRegion = (value: unknown): value is CoverageRegion =>
+  isRecord(value) && isFiniteNumber(value.minX) && isFiniteNumber(value.maxX) &&
+  isFiniteNumber(value.minY) && isFiniteNumber(value.maxY);
+
 const isProjectState = (value: unknown): value is StudioProjectState => {
   if (!isRecord(value)) return false;
   const { scene, devices, solver, csi, coverage, mobility, display } = value;
@@ -212,6 +260,8 @@ const isProjectState = (value: unknown): value is StudioProjectState => {
   const materialConfigs = solver.materialConfigs;
 
   return scene.coordinateFrame === 'ENU_m' && isAnchor(scene.anchor) &&
+    (scene.name === undefined || typeof scene.name === 'string') &&
+    (scene.visual === undefined || isSceneVisual(scene.visual)) &&
     Array.isArray(scene.buildings) &&
     scene.buildings.every(isBuilding) &&
     new Set(scene.buildings.map(object => object.id)).size === scene.buildings.length &&
@@ -240,6 +290,9 @@ const isProjectState = (value: unknown): value is StudioProjectState => {
     isFiniteNumber(csi.subcarrierSpacingKhz) && csi.subcarrierSpacingKhz > 0 &&
     typeof csi.normalizeDelays === 'boolean' &&
     ['power', 'sinr'].includes(String(coverage.metric)) &&
+    (coverage.region == null || isCoverageRegion(coverage.region)) &&
+    (coverage.floorId == null || (typeof coverage.floorId === 'string' && coverage.floorId.length > 0)) &&
+    (coverage.thresholdDb == null || isFiniteNumber(coverage.thresholdDb)) &&
     isFiniteNumber(coverage.bandwidthMhz) &&
     isFiniteNumber(coverage.noiseFigureDb) &&
     isFiniteNumber(coverage.heightM) &&
@@ -250,6 +303,10 @@ const isProjectState = (value: unknown): value is StudioProjectState => {
     Object.entries(mobility.trajectoriesByRxId).every(([id, points]) =>
       receivers.some(rx => rx.id === id) && Array.isArray(points) && points.every(isTrajectoryPoint),
     ) &&
+    (mobility.waypointFrameByRxId === undefined || (isRecord(mobility.waypointFrameByRxId) &&
+      Object.entries(mobility.waypointFrameByRxId).every(([id, frame]) =>
+        receivers.some(rx => rx.id === id) && frame === 'ENU_m',
+      ))) &&
     ['best_server', 'sum'].includes(String(mobility.combineMode)) &&
     isRecord(mobility.handover) &&
     isFiniteNumber(mobility.handover.hysteresisDb) &&
@@ -284,10 +341,21 @@ function migrateV1(value: unknown): unknown {
   };
 }
 
-export function createProjectDocument(state: StudioProjectState): StudioProjectDocument {
+export function newProjectId(): string {
+  if (typeof globalThis.crypto.randomUUID === 'function') return globalThis.crypto.randomUUID();
+  // getRandomValues is also available when the web app is served over LAN HTTP.
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+export function createProjectDocument(state: StudioProjectState, projectId = newProjectId()): StudioProjectDocument {
   return {
     format: 'SionnaRTStudio Project',
     schemaVersion: PROJECT_SCHEMA_VERSION,
+    projectId,
     savedAtUtc: new Date().toISOString(),
     state,
   };
@@ -303,17 +371,23 @@ export function parseProjectDocument(value: string | unknown): StudioProjectDocu
   if (!isRecord(parsed) || parsed.format !== 'SionnaRTStudio Project') {
     throw new Error('This is not a SionnaRTStudio project file.');
   }
-  if (parsed.schemaVersion !== 1 && parsed.schemaVersion !== 2 && parsed.schemaVersion !== PROJECT_SCHEMA_VERSION) {
+  if (parsed.schemaVersion !== 1 && parsed.schemaVersion !== 2 && parsed.schemaVersion !== 3 &&
+      parsed.schemaVersion !== 4 && parsed.schemaVersion !== PROJECT_SCHEMA_VERSION) {
     throw new Error(`Unsupported project schema version: ${String(parsed.schemaVersion)}.`);
   }
   let state = parsed.schemaVersion === 1 ? migrateV1(parsed.state) : parsed.state;
-  if (parsed.schemaVersion < PROJECT_SCHEMA_VERSION && isRecord(state) && isRecord(state.scene)) {
+  if (parsed.schemaVersion < 3 && isRecord(state) && isRecord(state.scene)) {
     state = { ...state, scene: { ...state.scene, coordinateFrame: 'ENU_m' } };
   }
   if (typeof parsed.savedAtUtc !== 'string' || !isProjectState(state)) {
     throw new Error('The project file is incomplete or contains invalid settings.');
   }
-  return { format: 'SionnaRTStudio Project', schemaVersion: PROJECT_SCHEMA_VERSION, savedAtUtc: parsed.savedAtUtc, state };
+  const projectId = parsed.schemaVersion === PROJECT_SCHEMA_VERSION ? parsed.projectId : newProjectId();
+  if (typeof projectId !== 'string' ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(projectId)) {
+    throw new Error('The project ID is invalid.');
+  }
+  return { format: 'SionnaRTStudio Project', schemaVersion: PROJECT_SCHEMA_VERSION, projectId, savedAtUtc: parsed.savedAtUtc, state };
 }
 
 export class UnreadableAutosaveError extends Error {
@@ -407,24 +481,23 @@ async function projectTransaction<T>(
 export function loadAutosavedProject(): Promise<StudioProjectDocument | null> {
   return queueStorageOperation(async () => {
     let migrated: { raw: string; oldSchema: boolean } | undefined;
-    const saved = await projectTransaction<unknown>((store, setResult, reject) => {
+    const saved = await projectTransaction<StudioProjectDocument | null>((store, setResult, reject) => {
       const request = store.get(PROJECT_STORAGE_KEY);
       request.onsuccess = () => {
-        if (request.result !== undefined) {
-          setResult(request.result);
-          return;
-        }
-        // The read and first write share a transaction so another window's save
-        // cannot be overwritten by a migration that observed an empty store.
         try {
-          const raw = window.localStorage.getItem(PROJECT_STORAGE_KEY);
-          if (raw === null) {
+          // Read and migrate under the same IndexedDB transaction so other
+          // windows see the persisted ID on their first open.
+          const fromLegacy = request.result === undefined;
+          const raw = fromLegacy ? window.localStorage.getItem(PROJECT_STORAGE_KEY) : null;
+          const original = fromLegacy ? raw : request.result;
+          if (original === null) {
             setResult(null);
             return;
           }
-          const { project, oldSchema } = parseStoredProject(raw);
-          store.put(project, PROJECT_STORAGE_KEY);
-          migrated = { raw, oldSchema };
+          const { project, oldSchema } = parseStoredProject(original);
+          if (oldSchema) store.put(original, PROJECT_BACKUP_KEY);
+          if (oldSchema || fromLegacy) store.put(project, PROJECT_STORAGE_KEY);
+          if (raw !== null) migrated = { raw, oldSchema };
           setResult(project);
         } catch (error) {
           reject(error);
@@ -442,13 +515,13 @@ export function loadAutosavedProject(): Promise<StudioProjectDocument | null> {
         console.warn('Could not update the legacy project backup.', error);
       }
     }
-    return saved === null ? null : parseStoredProject(saved).project;
+    return saved;
   });
 }
 
-export function saveAutosavedProject(state: StudioProjectState): Promise<void> {
+export function saveAutosavedProject(state: StudioProjectState, projectId?: string): Promise<void> {
   return queueStorageOperation(() => projectTransaction<void>(store => {
-    store.put(createProjectDocument(state), PROJECT_STORAGE_KEY);
+    store.put(createProjectDocument(state, projectId), PROJECT_STORAGE_KEY);
   }));
 }
 
@@ -462,9 +535,9 @@ function removeLegacyAutosave(expected?: string) {
   }
 }
 
-export function replaceUnreadableAutosave(state: StudioProjectState): Promise<boolean> {
+export function replaceUnreadableAutosave(state: StudioProjectState, projectId?: string): Promise<boolean> {
   return queueStorageOperation(async () => {
-    const replacement = parseProjectDocument(createProjectDocument(state));
+    const replacement = parseProjectDocument(createProjectDocument(state, projectId));
     let replacedLegacy: string | null = null;
     const replaced = await projectTransaction<boolean>((store, setResult, reject) => {
       const request = store.get(PROJECT_STORAGE_KEY);

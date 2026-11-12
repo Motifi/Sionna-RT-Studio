@@ -24,6 +24,9 @@ import zipfile
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from verify_scene_workbench import runtime_packages, source_revision, verify, write_json
+
 
 HTTP = build_opener(ProxyHandler({}))  # Local Studio requests must bypass system proxies.
 CFR_AXES = ["time", "ue", "rx_port", "ap", "tx_port", "subcarrier"]
@@ -70,7 +73,8 @@ def fixture():
 
 def read_archive(data):
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
-        require(set(archive.namelist()) == {"manifest.json", "csi.npz"}, "Unexpected ZIP entries")
+        require({"manifest.json", "csi.npz", "request.json", "scene.xml", "replay_csi.py"} <= set(archive.namelist()),
+                "Reproducible CSI ZIP entries are missing")
         return json.loads(archive.read("manifest.json")), archive.read("csi.npz")
 
 
@@ -233,19 +237,24 @@ def main():
     folder.mkdir(parents=True)
     print(f"Studio verification files: {folder}", flush=True)
     report = {"ok": False, "cudaPassed": False, "requireCuda": not args.allow_cpu,
-              "mode": "headless" if args.headless else "desktop", "results": {}}
+              "mode": "headless" if args.headless else "desktop", "results": {},
+              "startedAtUtc": datetime.now(timezone.utc).isoformat(), "verificationPython": runtime_packages()}
     child, origin = None, None
+    session_folder = folder
     with ExitStack() as stack:
-        try:
-            report["nvidiaSmi"] = nvidia_diagnostics()
+        def launch(directory):
+            nonlocal child, origin, session_folder
+            session_folder = directory
+            directory.mkdir(exist_ok=True)
             token = None
+            env = dict(os.environ, SRTS_RUNS_DIR=str(folder / "runs"))
+            env.pop("PYTHONHOME", None)
+            env.pop("PYTHONPATH", None)
+            env["PYTHONNOUSERSITE"] = "1"
             if args.headless:
                 token = secrets.token_hex(32)
-                env = dict(os.environ, SRTS_DESKTOP_LAUNCH_TOKEN=token,
-                           SRTS_DESKTOP_PORT_FILE=str(folder / "server-port.txt"))
-                env.pop("PYTHONHOME", None)
-                env.pop("PYTHONPATH", None)
-                log = stack.enter_context((folder / "studio.log").open("wb"))
+                env.update(SRTS_DESKTOP_LAUNCH_TOKEN=token, SRTS_DESKTOP_PORT_FILE=str(directory / "server-port.txt"))
+                log = stack.enter_context((directory / "studio.log").open("wb"))
                 trace_startup = (
                     "import faulthandler, runpy; faulthandler.dump_traceback_later(45); "
                     "runpy.run_module('desktop.studio_server', run_name='__main__', alter_sys=True)"
@@ -254,10 +263,26 @@ def main():
                                          cwd=args.runtime.resolve(), env=env, stdin=subprocess.PIPE,
                                          stdout=log, stderr=subprocess.STDOUT)
             else:
-                child = subprocess.Popen([str(args.app.resolve()), "--acceptance", str(folder)])
-            ready = wait_ready(child, folder, token)
+                child = subprocess.Popen([str(args.app.resolve()), "--acceptance", str(directory)], env=env)
+            ready = wait_ready(child, directory, token)
             origin = ready["origin"].rstrip("/")
             require(re.fullmatch(r"http://127\.0\.0\.1:\d{1,5}", origin), "Studio did not report a loopback origin")
+            return ready
+
+        def restart():
+            nonlocal child, origin
+            stop(child, session_folder, origin)
+            child, origin = None, None
+            ready = launch(folder / "restart")
+            report["restartedBackendPid"] = ready["backendPid"]
+            return origin
+
+        try:
+            report["nvidiaSmi"] = nvidia_diagnostics()
+            metadata = args.runtime.resolve().parent / "build-info.json"
+            build = json.loads(metadata.read_text(encoding="utf-8")) if metadata.is_file() else None
+            report["build"] = build if build is not None else source_revision()
+            ready = launch(folder)
             health = json.loads(request(origin, "/api/health"))
             report["health"] = health
             report["uiReady"] = ready.get("uiReady")
@@ -269,6 +294,8 @@ def main():
                         "Studio did not finish workspace navigation and autosave in WebView2")
             report["backendPid"] = ready["backendPid"]
             require(health.get("ok") is True and health.get("engine") == "Sionna RT", "Studio solver is unhealthy")
+            if build:
+                require(health.get("appVersion") == build["appVersion"], "Installed app version differs from build-info.json")
             require(b'id="root"' in request(origin, "/"), "The packaged Studio interface is missing")
             is_cuda = health.get("gpu") is True and health.get("variant") == "cuda_ad_mono_polarized"
             print(f"Tracing with {health['variant']}", flush=True)
@@ -285,18 +312,22 @@ def main():
                 origin, folder, trajectory, [0, 1, 2], [[[20, y, 1.5]] for y in positions],
             )
             print("PASS single-UE trajectory CIR and reconstructed response", flush=True)
-            workbench = Path(__file__).resolve().parents[2] / "scripts" / "verify_scene_workbench.py"
-            subprocess.run([sys.executable, "-B", str(workbench), origin, str(folder / "scene-workbench")], check=True)
+            write_json(folder / "fixtures.json", {"static": static, "trajectory": trajectory})
+            report["fixtures"] = "fixtures.json"
+            workbench = verify(origin, folder / "scene-workbench", expected_variant=health["variant"],
+                               restart=restart, build_info=build)
             report["results"]["sceneWorkbench"] = "scene-workbench/verification.json"
+            require(workbench["ok"], f"Scene workbench failed: {workbench.get('failure')}")
             report["cudaPassed"] = is_cuda
             require(is_cuda or args.allow_cpu,
                     f"CUDA acceptance requires an NVIDIA-backed solve. Studio used {health['variant']}.")
         except Exception as exc:
             report["error"] = str(exc)
+            report["failureStage"] = "verification" if "health" in report else "startup"
         finally:
             if child is not None:
                 try:
-                    stop(child, folder, origin)
+                    stop(child, session_folder, origin)
                     report["backendStopped"] = bool(origin)
                 except Exception as exc:
                     report["shutdownError"] = str(exc)

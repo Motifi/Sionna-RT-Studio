@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useLayoutEffect, useRef, useState } from 'react';
+import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { ArrowRight, FileDown, Loader2 } from 'lucide-react';
 import { ApiRequestError, exportCsiRun, exportScene, readBackendHealth, type CIRExportOptions, type CsiRun } from '../api';
 import { useI18n } from '../i18n';
@@ -34,6 +34,9 @@ interface ExportPanelProps {
   materials: MaterialConfig[];
   backendOnline: boolean;
   csiRun?: CsiRun | null;
+  csiProjectId?: string;
+  historical?: boolean;
+  historyPicker?: ReactNode;
   csiStale?: boolean;
   csiExpired?: boolean;
   csiGrid?: CIRExportOptions;
@@ -65,7 +68,7 @@ const sha256Hex = async (value: unknown): Promise<string> => {
 export function ExportPanel({
   buildings, anchor, paths, txs, rxs, tx, freqGhz, maxDepth, solverOptions, radioMap, materials, backendOnline,
   csiRun = null, csiStale = false, csiExpired = false, csiGrid = DEFAULT_CSI_GRID, fronthaulMbpsByTxId = {},
-  onOpenPreview, onOpenDiagnostics, onOpenCoverage, onCsiExpired,
+  csiProjectId, historical = false, historyPicker, onOpenPreview, onOpenDiagnostics, onOpenCoverage, onCsiExpired,
 }: ExportPanelProps) {
   const { t } = useI18n();
   const [expiredRunId, setExpiredRunId] = useState<string | null>(null);
@@ -85,7 +88,7 @@ export function ExportPanel({
   useLayoutEffect(() => {
     setCsiBusy(false);
     return () => { csiRequest.current = null; };
-  }, [exportableRunId]);
+  }, [exportableRunId, csiProjectId, historical]);
 
   const handleExportCsiRun = async () => {
     if (!csiRun || !exportableRunId || !backendOnline || csiRequest.current) return;
@@ -94,8 +97,8 @@ export function ExportPanel({
     setCsiBusy(true);
     setCsiError(null);
     try {
-      const fronthaul = Object.fromEntries(csiRun.txIds.map((id) => [id, fronthaulMbpsByTxId[id] ?? null]));
-      const { blob, filename } = await exportCsiRun(exportableRunId, fronthaul);
+      const fronthaul = historical ? undefined : Object.fromEntries(csiRun.txIds.map(id => [id, fronthaulMbpsByTxId[id] ?? null]));
+      const { blob, filename } = await exportCsiRun(exportableRunId, fronthaul, csiProjectId);
       if (csiRequest.current === request) downloadFile(blob, filename);
     } catch (error) {
       if (csiRequest.current !== request) return;
@@ -157,6 +160,10 @@ export function ExportPanel({
             gridSizeM: radioMap.gridSize,
             heightOffsetM: radioMap.heightOffset,
             metric: radioMap.metric,
+            solverMethod: radioMap.solverMethod,
+            floorId: radioMap.floorId,
+            floorElevationM: radioMap.floorElevationM,
+            sceneId: radioMap.sceneId,
             samplesPerTx: radioMap.samplesPerTx,
             seed: radioMap.seed,
             stats: radioMap.stats,
@@ -246,9 +253,10 @@ export function ExportPanel({
   return (
     <div id="export-suite-panel" className="panel mx-auto grid max-w-5xl gap-4 p-4 sm:p-5">
       <h1 className="panel-title">{t('Export results', '导出结果')}</h1>
+      {historyPicker}
       <section id="csi-run-export-panel" className="panel-flush grid gap-3 p-4" aria-labelledby="csi-export-heading">
         <div className="flex flex-wrap items-baseline justify-between gap-2">
-          <h2 id="csi-export-heading" className="panel-title">{t('CSI from this run', '本次运行的 CSI')}</h2>
+          <h2 id="csi-export-heading" className="panel-title">{historical ? t('Saved CSI run', '已保存的 CSI 运行') : t('CSI from this run', '本次运行的 CSI')}</h2>
           <p role="status" className={`text-xs font-semibold ${exportableRunId && backendOnline ? 'text-[var(--ok)]' : 'text-[var(--text-mid)]'}`}>{csiStatus}</p>
         </div>
         {csiRun && (
@@ -269,6 +277,13 @@ export function ExportPanel({
               </dd>
             </div>
             <div className="sm:col-span-2">
+              <dt className="sr-only">{t('Delay reference', '时延参考')}</dt>
+              <dd>{csiRun.normalizeDelays ? t('First arrival per link', '各链路首径归零')
+                : t('Absolute propagation delay', '绝对传播时延')}
+                {csiRun.mode === 'trajectory' && t(' · independent geometric snapshots', ' · 独立几何快照')}
+              </dd>
+            </div>
+            <div className="sm:col-span-2">
               <dt className="sr-only">{t('CFR shape', 'CFR 张量形状')}</dt>
               <dd>
                 {csiRun.output === 'cir' && t('Reconstructible CFR ', '可重建的 CFR ')}
@@ -279,7 +294,9 @@ export function ExportPanel({
           </dl>
         )}
         {exportableRunId && <p className="text-xs text-[var(--text-mid)]">
-          {csiRun?.output === 'cir'
+          {historical
+            ? t('The ZIP contains the saved CSI, simulation inputs, solver scene and replay instructions.', 'ZIP 包含已保存的 CSI、仿真输入、求解场景和复算说明。')
+            : csiRun?.output === 'cir'
             ? t('Reconstruct CFR from the path coefficients, delays, valid-path mask, and frequency grid in csi.npz. The manifest includes current AP fronthaul settings.', '可用 csi.npz 中的路径复系数、时延、有效路径掩码和频率网格重建 CFR。清单记录当前 AP 前传配置。')
             : t('The ZIP includes csi.npz from this run and manifest.json with current AP fronthaul settings.', 'ZIP 包含本次计算的 csi.npz，以及记录当前 AP 前传配置的 manifest.json。')}
         </p>}
@@ -305,7 +322,7 @@ export function ExportPanel({
         </div>
       </section>
 
-      <details className="rounded-lg border border-[var(--line)] p-3">
+      {!historical && <details className="rounded-lg border border-[var(--line)] p-3">
         <summary className="cursor-pointer text-sm font-semibold">{t('Advanced exports', '高级导出')}</summary>
         <ul className="mt-2 divide-y divide-[var(--line)]">
           {additionalFiles.map(({ id, title, description, format, onClick, disabled, busy, error }) => (
@@ -331,8 +348,8 @@ export function ExportPanel({
             <div>
               <h3 className="text-sm font-semibold">{t('Coverage proxy', '覆盖近似')}</h3>
               <p className="text-xs text-[var(--text-mid)]">{t(
-                'Approximate scalar channel using received power and a deterministic phase for each cell.',
-                '按每个栅格的接收功率和确定相位生成标量信道近似。',
+                'Synthetic scalar channel from coverage power and a deterministic phase. Use the ray-traced CFR export for per-port channel data.',
+                '用覆盖功率和确定相位合成标量信道。逐端口信道数据请使用射线追踪 CFR 导出。',
               )}</p>
             </div>
             <GridFrequencyFields config={proxyGrid} onChange={setProxyGrid} />
@@ -353,7 +370,7 @@ export function ExportPanel({
             </button>
           </li>
         </ul>
-      </details>
+      </details>}
     </div>
   );
 }

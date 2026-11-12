@@ -4,12 +4,9 @@ The backend already traces a real Mitsuba scene: :func:`scene_build.build_scene`
 writes ``scene.xml`` plus ``meshes/*.ply`` and hands that to ``load_scene``. Every
 shape reference in the XML is relative, so the directory is relocatable as-is.
 
-What the XML cannot carry is everything Sionna keeps on the Python side — the
-carrier frequency, radio-material overrides, the ``PlanarArray`` configuration,
-the transmitters/receivers, and the ``PathSolver`` switches. This module copies
-the scene tree into a ZIP and generates a ``load_scene.py`` that replays exactly
-those Python-side steps, so running it in a notebook reproduces the app's solve
-without the app.
+The ZIP includes a ``load_scene.py`` script that sets the carrier frequency,
+applies radio-material overrides, creates arrays and devices, runs PathSolver,
+and applies the Studio foliage attenuation model to the resulting paths.
 
 The generated script preserves each transmitter's configured ``power_dbm``.
 Sionna's CIR/CFR coefficients are independent of transmit power, but retaining
@@ -33,10 +30,11 @@ from .models import (
 )
 from .solver_runtime import solver_runtime
 from .scene_build import (
-    inspect_scene,
-    GROUND_BSDF_ID,
-    GROUND_MATERIAL,
     build_scene_dir,
+    foliage_crowns,
+    inspect_scene,
+    material_target_ids,
+    resolved_rf_role,
 )
 from .solver import _beam_target, _device_z
 
@@ -59,7 +57,7 @@ def _safe_name(value: str, index: int, prefix: str) -> str:
 
 
 def _position(device, buildings: list[BuildingFootprint]) -> list[float]:
-    """Device position in scene coordinates, roof-aware like the solver."""
+    """Resolve the device phase center with the solver's height reference."""
     return [float(device.enu.x), float(device.enu.y),
             _device_z(device.enu, device.height, buildings, device.heightReference)]
 
@@ -75,10 +73,7 @@ def _material_lines(materials: list[MaterialConfig]) -> tuple[list[str], list[st
         "# presets are computed first and explicit values win (scene_build.py).",
     ]
     for cfg in {config.id: config for config in materials}.values():
-        target_ids = [cfg.id]
-        if cfg.id == GROUND_MATERIAL:
-            target_ids.append(GROUND_BSDF_ID)
-        for target_id in target_ids:
+        for target_id in material_target_ids(cfg.id):
             lines.append(f"material = scene.radio_materials.get({target_id!r})")
             lines.append("if material is not None:")
             lines.append(
@@ -221,6 +216,7 @@ def _load_scene_script(req: SceneExportRequest) -> str:
         "from pathlib import Path",
         "import os",
         "from srts_runtime import configure_drjit_llvm_path, trace_paths_for_runtime",
+        "from srts_foliage import attenuate_paths",
         "",
         "configure_drjit_llvm_path()",
         "import mitsuba as mi",
@@ -247,6 +243,7 @@ def _load_scene_script(req: SceneExportRequest) -> str:
         f"TX_SPECS = {tx_specs!r}",
         f"RX_SPECS = {rx_specs!r}",
         f"CHANNEL_GROUPS = {groups!r}",
+        f"FOLIAGE_CROWNS = {foliage_crowns(req.buildings)!r}",
         "",
         "",
         "def _planar_array(size, pattern, polarization):",
@@ -311,6 +308,7 @@ def _load_scene_script(req: SceneExportRequest) -> str:
         f"        edge_diffraction={bool(opts.edgeDiffraction)},",
         "        synthetic_array=True,",
         "    )",
+        "    paths = attenuate_paths(paths, FOLIAGE_CROWNS)",
         "",
         "    # a: [num_rx, num_rx_ant, num_tx, num_tx_ant, paths, time]",
         f"    a, tau = paths.cir(normalize_delays={bool(req.normalizeDelays)}, "
@@ -363,9 +361,11 @@ def _load_scene_script(req: SceneExportRequest) -> str:
     return "\n".join(body)
 
 
-def _manifest(req: SceneExportRequest, mesh_members: list[str]) -> dict:
+def _manifest(req: SceneExportRequest, mesh_members: list[str], *, inspection: dict | None = None) -> dict:
     """Machine-readable record of what produced this scene."""
-    buildings = [b for b in req.buildings if b.category == "building"]
+    buildings = [b for b in req.buildings if b.category == "building" and resolved_rf_role(b) == "surface"]
+    ground_model = (inspection or {}).get("groundModel", "flat")
+    ground_description = "ground elevations from terrain meshes" if ground_model == "terrain" else "ground plane at z=0"
     array_groups = _array_groups(req)
     if not array_groups:
         channel_mode = "none"
@@ -386,7 +386,9 @@ def _manifest(req: SceneExportRequest, mesh_members: list[str]) -> dict:
         "materials": [material.model_dump() for material in req.materials],
         "buildingCount": len(buildings),
         "meshFiles": mesh_members,
-        "coordinateSystem": "ENU metres (x=East, y=North, z=Up); ground plane at z=0",
+        "coordinateSystem": f"ENU metres (x=East, y=North, z=Up); {ground_description}",
+        "groundModel": ground_model,
+        "foliageModel": "ellipsoidPathLength" if foliage_crowns(req.buildings) else None,
         "channelExportMode": channel_mode,
         "arrayGroups": array_groups,
         "transmitters": [
@@ -418,10 +420,11 @@ _README = """# SionnaRTStudio — standalone Sionna RT scene
 This folder is the exact Mitsuba scene the studio ray-traces, plus a script that
 replays the Python-side configuration Sionna does not store in the XML.
 
-    scene.xml       Mitsuba scene, ITU radio-material BSDFs, relative mesh paths
-    meshes/*.ply    ground plane + one extruded prism per building
-    load_scene.py   frequency, material overrides, arrays, devices, PathSolver
+    scene.xml       Mitsuba scene with radio materials and relative mesh paths
+    meshes/*.ply    solver surfaces and terrain, or a generated flat ground
+    load_scene.py   frequency, material overrides, arrays, devices, channel solve
     srts_runtime.py LLVM discovery and initialization for the replay script
+    srts_foliage.py foliage attenuation based on path length through ellipsoids
     manifest.json   the settings this export was generated from
     channels/*.npz exact array-compatible tensors created by load_scene.py
 
@@ -456,8 +459,10 @@ maps every group to its output file.
 
 ## Notes
 
-- Coordinates are ENU metres (x=East, y=North, z=Up), ground plane at z=0.
-- Device heights are roof-aware: a device over a building footprint sits on it.
+- Coordinates are ENU metres (x=East, y=North, z=Up). The manifest records the
+  ground model and the resolved device elevations.
+- The generated script applies foliage attenuation to CIR and CFR coefficients
+  using the length of each ray through the configured ellipsoids.
 - Each transmitter is loaded with its configured `power_dbm`. This does not
   scale CIR/CFR coefficients, but it preserves later RSS/radio-map calculations.
 - If either side has no devices, the scene remains loadable and inspectable but
@@ -486,10 +491,12 @@ def scene_export_zip(req: SceneExportRequest) -> bytes:
             archive.writestr(member, (scene_dir / member).read_bytes())
         archive.writestr("load_scene.py", _load_scene_script(req))
         archive.writestr("srts_runtime.py", Path(__file__).with_name("runtime_env.py").read_bytes())
-        manifest = _manifest(req, mesh_members)
+        archive.writestr("srts_foliage.py", Path(__file__).with_name("foliage.py").read_bytes())
+        inspection = inspect_scene(req.buildings, req.freqGhz, req.materials, include_meshes=False)
+        manifest = _manifest(req, mesh_members, inspection=inspection)
         manifest["solverRuntime"] = solver_runtime()
-        manifest["anchor"] = req.anchor.model_dump() if req.anchor else None
-        manifest["scene"] = inspect_scene(req.buildings, req.freqGhz, req.materials, include_meshes=False)
+        manifest["anchor"] = req.anchor.model_dump(exclude_none=True) if req.anchor else None
+        manifest["scene"] = inspection
         archive.writestr("manifest.json", json.dumps(manifest, indent=2))
         archive.writestr("README.md", _README)
     return output.getvalue()

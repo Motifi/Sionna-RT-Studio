@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { ArrowRight, Loader2, Pause, Play, Waves } from 'lucide-react';
 import type { CsiLinkPreview, CsiRun, CsiRunMode, CsiRunOutput, CsiSelection } from '../api';
 import { useI18n } from '../i18n';
+import type { trajectorySampling } from '../lib/trajectory';
 import { CIR_SIZE_LIMIT, FULL_CSI_SIZE_LIMIT, formatCsiBytes, type CsiSizeEstimate } from '../lib/csiSize';
 
 interface CsiPreviewPanelProps {
@@ -31,6 +32,10 @@ interface CsiPreviewPanelProps {
   onOpenDiagnostics?: () => void;
   onOpenTrajectory?: () => void;
   active?: boolean;
+  historical?: boolean;
+  presetMode?: { mode: CsiRunMode };
+  sampling?: ReturnType<typeof trajectorySampling>;
+  jobStatus?: ReactNode;
 }
 
 function FrequencyResponse({ link }: { link: CsiLinkPreview }) {
@@ -56,28 +61,22 @@ function FrequencyResponse({ link }: { link: CsiLinkPreview }) {
   const displayFrequency = (frequency: number) => (frequency / 1e6).toFixed(2);
 
   return (
-    <figure className="rounded border border-[var(--line)] bg-[#f5f3ec] px-3 pt-3 pb-2">
-      <figcaption className="mb-1 text-xs font-semibold text-slate-800">
-        {t('Subcarrier response · mean |H|² (dB)', '子载波响应 · 平均 |H|²（dB）')}
-      </figcaption>
-      <svg id="csi-frequency-response" role="img" aria-label={t('Channel gain versus frequency offset', '信道增益随频偏变化的曲线')} viewBox="0 0 306 125" className="h-32 w-full">
-        {[highDb, (highDb + lowDb) / 2, lowDb].map((db) => (
-          <g key={db}>
-            <line x1="42" y1={y(db)} x2="292" y2={y(db)} stroke="#ded9cc" />
-            <text x="36" y={y(db) + 3} textAnchor="end" fontSize="9" fill="#6b6862">{db}</text>
-          </g>
-        ))}
-        <path d={d} stroke="#4a727e" strokeWidth="2" fill="none" />
-        {defined.length === 1 && <circle cx={x(defined[0].frequency)} cy={y(defined[0].db!)} r="3" fill="#4a727e" />}
-        {frequenciesSpan ? (
-          <>
-            <text x="42" y="114" fontSize="9" fill="#6b6862">{displayFrequency(firstHz)}</text>
-            <text x="292" y="114" textAnchor="end" fontSize="9" fill="#6b6862">{displayFrequency(lastHz)}</text>
-          </>
-        ) : <text x="167" y="114" textAnchor="middle" fontSize="9" fill="#6b6862">{displayFrequency(firstHz)}</text>}
-      </svg>
-      <p className="text-center text-[11px] text-slate-600">{t('Frequency offset from carrier (MHz)', '相对载频的频偏（MHz）')}</p>
-    </figure>
+    <svg id="csi-frequency-response" role="img" aria-label={t('Channel gain versus frequency offset', '信道增益随频偏变化的曲线')} viewBox="0 0 306 125" className="h-full w-full">
+      {[highDb, (highDb + lowDb) / 2, lowDb].map((db) => (
+        <g key={db}>
+          <line x1="42" y1={y(db)} x2="292" y2={y(db)} stroke="#ded9cc" />
+          <text x="36" y={y(db) + 3} textAnchor="end" fontSize="9" fill="#6b6862">{db}</text>
+        </g>
+      ))}
+      <path d={d} stroke="#4a727e" strokeWidth="2" fill="none" />
+      {defined.length === 1 && <circle cx={x(defined[0].frequency)} cy={y(defined[0].db!)} r="3" fill="#4a727e" />}
+      {frequenciesSpan ? (
+        <>
+          <text x="42" y="114" fontSize="9" fill="#6b6862">{displayFrequency(firstHz)}</text>
+          <text x="292" y="114" textAnchor="end" fontSize="9" fill="#6b6862">{displayFrequency(lastHz)}</text>
+        </>
+      ) : <text x="167" y="114" textAnchor="middle" fontSize="9" fill="#6b6862">{displayFrequency(firstHz)}</text>}
+    </svg>
   );
 }
 
@@ -85,7 +84,7 @@ export function CsiPreviewPanel({
   run, stale, expired, running, error, staticDisabledReason, trajectoryDisabledReason, trajectoryReceiverName,
   trajectoryReceiver, gridControls, trajectoryControls, mixedArrays,
   staticEstimate, trajectoryEstimate, output, onOutputChange,
-  onRun, selection, onSelect, link, linkLoading, linkError, onOpenExport, onOpenDiagnostics, onOpenTrajectory, active = true,
+  onRun, selection, onSelect, link, linkLoading, linkError, onOpenExport, onOpenDiagnostics, onOpenTrajectory, active = true, historical = false, presetMode, sampling, jobStatus,
 }: CsiPreviewPanelProps) {
   const { t } = useI18n();
   const [mode, setMode] = useState<CsiRunMode>('static');
@@ -93,7 +92,7 @@ export function CsiPreviewPanel({
   const sampleIndex = selection?.sampleIndex ?? 0;
   const sampleCount = run?.timeSeconds.length ?? 0;
   const unavailable = stale || expired;
-  const resultDisabled = unavailable || !!running;
+  const resultDisabled = unavailable || (!!running && !historical);
   const canPlay = active && !resultDisabled && run?.mode === 'trajectory' && !!selection && sampleCount > 1;
   const playing = canPlay && playingRunId === run.runId && sampleIndex < sampleCount - 1;
   const isTrajectory = mode === 'trajectory';
@@ -102,6 +101,13 @@ export function CsiPreviewPanel({
   const estimateId = `csi-size-estimate-${mode}`;
   const disabledReasonId = `csi-run-disabled-${mode}`;
   const runDescription = [estimate && estimateId, disabledReason && disabledReasonId].filter(Boolean).join(' ');
+
+  useEffect(() => {
+    if (presetMode) {
+      setMode(presetMode.mode);
+      setPlayingRunId(null);
+    }
+  }, [presetMode]);
 
   useEffect(() => {
     if (!canPlay) setPlayingRunId(null);
@@ -140,6 +146,7 @@ export function CsiPreviewPanel({
         <h3 className="panel-title">{t('CSI simulation', 'CSI 仿真')}</h3>
       </div>
 
+      {!historical && <>
       <div role="group" aria-label={t('CSI run mode', 'CSI 仿真模式')}
         className="grid grid-cols-2 gap-1 rounded-md border border-[var(--line)] bg-[var(--ink-750)] p-1">
         {([
@@ -170,7 +177,23 @@ export function CsiPreviewPanel({
         <p className="text-xs text-slate-700">{t(`Moving UE · ${trajectoryReceiverName}`, `移动 UE · ${trajectoryReceiverName}`)}</p>
       )))}
       {gridControls}
-      {isTrajectory && trajectoryControls}
+      {isTrajectory && <>
+        {trajectoryControls}
+        <p className="text-[11px] leading-relaxed text-slate-600">
+          {t('Each trajectory sample traces an independent geometric snapshot. Use it for position-by-position comparisons.',
+            '轨迹中每个采样点独立追踪几何信道，适合逐位置比较。')}
+        </p>
+        {sampling && <p id="csi-actual-trajectory-sampling" className="readout text-xs text-slate-700">
+          {t(
+            `${sampling.sampleCount} samples · ${sampling.durationSeconds.toFixed(2)} s · mean interval ${sampling.intervalMs.toFixed(1)} ms`,
+            `${sampling.sampleCount} 个样点 · ${sampling.durationSeconds.toFixed(2)} 秒 · 平均间隔 ${sampling.intervalMs.toFixed(1)} 毫秒`,
+          )}
+          {sampling.capped && <span className="mt-1 block text-amber-800">
+            {t('The 100-sample cap increased the interval. Shorten the route to keep the requested spacing.',
+              '已达到 100 个样点上限。若要保持所设间隔，请缩短路线。')}
+          </span>}
+        </p>}
+      </>}
 
       <div className="grid gap-1">
         <label htmlFor="select-csi-output" className="text-xs font-semibold text-slate-800">
@@ -220,7 +243,7 @@ export function CsiPreviewPanel({
         >
           {running && <Loader2 size={15} className="animate-spin" aria-hidden="true" />}
           {running
-            ? running === 'trajectory' ? t('Tracing UE trajectory…', '正在追踪 UE 轨迹…') : t('Tracing static links…', '正在追踪静态链路…')
+            ? t('Simulation in progress…', '仿真任务进行中…')
             : isTrajectory ? t('Run trajectory CSI', '计算轨迹 CSI') : t('Run static CSI', '计算静态 CSI')}
         </button>
         {disabledReason && (
@@ -240,7 +263,9 @@ export function CsiPreviewPanel({
         )}
       </div>
 
+      {jobStatus}
       {error && <p role="alert" className="rounded border border-red-200 bg-red-50 p-2 text-xs text-red-700">{error}</p>}
+      </>}
 
       {hasMatrix && (
         <>
@@ -258,6 +283,13 @@ export function CsiPreviewPanel({
           <p id="csi-run-output" className="text-[11px] text-slate-600">
             {run.output === 'cir' ? t('CIR only · CFR reconstructed from paths', '仅 CIR · CFR 由路径重建') : t('CIR + full CFR', 'CIR + 完整 CFR')}
             {' · '}{formatCsiBytes(run.uncompressedBytes)} {t('uncompressed', '未压缩')}
+          </p>
+          <p id="csi-result-delay-reference" className="text-xs text-slate-600">
+            {run.normalizeDelays ? t('Exported CIR/CFR delays · first arrival per link', '导出 CIR/CFR 时延 · 各链路首径归零')
+              : t('Exported CIR/CFR delays · absolute propagation', '导出 CIR/CFR 时延 · 绝对传播时延')}
+            {run.mode === 'trajectory' && <span className="block">
+              {t('Trajectory samples · independent geometric snapshots', '轨迹样点 · 独立几何快照')}
+            </span>}
           </p>
           {run.mode === 'trajectory' && (
             <div className="flex flex-col gap-2 rounded border border-[var(--line)] p-3">
@@ -327,7 +359,7 @@ export function CsiPreviewPanel({
                             aria-label={`${run.txNames[txIndex] ?? txId} → ${run.rxNames[rxIndex] ?? rxId}`}
                             onClick={() => onSelect({ txId, rxId, sampleIndex })}
                             disabled={resultDisabled}
-                            className={`w-full whitespace-nowrap rounded px-1.5 py-1 readout ${active ? 'bg-[#ebe7dc] font-bold text-slate-900' : 'text-slate-700 hover:bg-[#f5f3ec]'}`}
+                            className={`w-full min-w-[8ch] whitespace-nowrap rounded px-1.5 py-1 readout ${active ? 'bg-[#ebe7dc] font-bold text-slate-900' : 'text-slate-700 hover:bg-[#f5f3ec]'}`}
                           >
                             {paths && power != null ? power.toFixed(1) : '—'}
                           </button>
@@ -340,17 +372,33 @@ export function CsiPreviewPanel({
             </table>
           </div>
 
-          {linkLoading && !unavailable && <p role="status" className="text-xs text-slate-600">{t('Loading the selected link…', '正在读取所选链路…')}</p>}
-          {linkError && !unavailable && <p role="alert" className="text-xs text-red-700">{linkError}</p>}
-          {link && !linkLoading && !unavailable && (
-            <>
-              <div className="flex flex-wrap gap-x-2 gap-y-1 text-xs text-slate-700">
-                <span>{link.metrics.numPaths ? link.metrics.losStatus : t('No resolved path', '无可解析路径')}</span>
-                {link.metrics.numPaths > 0 && <span className="readout font-semibold">{link.metrics.totalRxPowerDbm.toFixed(1)} dBm</span>}
-                <span>{t(`${link.metrics.numPaths} paths`, `${link.metrics.numPaths} 条路径`)}</span>
+          {!unavailable && (
+            <figure className="rounded border border-[var(--line)] bg-[#f5f3ec] px-3 pt-3 pb-2">
+              <figcaption className="mb-1 text-xs font-semibold text-slate-800">
+                {t('Subcarrier response · mean |H|² (dB)', '子载波响应 · 平均 |H|²（dB）')}
+              </figcaption>
+              {/* Keep the preview the same height as playback advances through samples. */}
+              <div className="flex h-8 flex-wrap content-start gap-x-2 overflow-auto text-xs text-slate-700">
+                {link && !linkLoading && <>
+                  <span>{link.metrics.numPaths ? link.metrics.losStatus : t('No resolved path', '无可解析路径')}</span>
+                  {link.metrics.numPaths > 0 && <span className="readout font-semibold">{link.metrics.totalRxPowerDbm.toFixed(1)} dBm</span>}
+                  <span>{t(`${link.metrics.numPaths} paths`, `${link.metrics.numPaths} 条路径`)}</span>
+                  {link.metrics.firstArrivalDelayNs != null && (
+                    <span id="csi-first-arrival-delay" className="readout">
+                      {t('Absolute first arrival', '绝对首径')} {link.metrics.firstArrivalDelayNs.toFixed(2)} ns
+                    </span>
+                  )}
+                </>}
               </div>
-              <FrequencyResponse link={link} />
-            </>
+              <div className="h-32 overflow-auto">
+                {linkLoading ? (
+                  <p role="status" className="text-xs text-slate-600">{t('Loading the selected link…', '正在读取所选链路…')}</p>
+                ) : linkError ? (
+                  <p role="alert" className="break-words text-xs text-red-700">{linkError}</p>
+                ) : link && <FrequencyResponse link={link} />}
+              </div>
+              <p className="text-center text-[11px] text-slate-600">{t('Frequency offset from carrier (MHz)', '相对载频的频偏（MHz）')}</p>
+            </figure>
           )}
 
           {run.mode === 'trajectory' && run.handover && (

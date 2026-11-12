@@ -48,11 +48,38 @@ cp "$desktop/studio_server.py" "$studio/LICENSE" "$studio/NOTICE" "$resources/"
 version="$("$python" -c 'import runpy, sys; print(runpy.run_path(sys.argv[1])["APP_VERSION"])' "$studio/backend/version.py")"
 bundled_python=""
 if [[ -n "${SRTS_BUNDLED_PYTHON:-}" ]]; then
-  test -x "$SRTS_BUNDLED_PYTHON/bin/python3.12"
+  if [[ ! -x "$SRTS_BUNDLED_PYTHON/bin/python3.12" ]]; then
+    echo 'SRTS_BUNDLED_PYTHON must point to a relocatable arm64 CPython 3.12 prefix with Studio dependencies installed.' >&2
+    exit 1
+  fi
   ditto "$SRTS_BUNDLED_PYTHON" "$resources/python"
   bundled_python="python/bin/python3.12"
-  (cd "$resources"; "./$bundled_python" -I -c 'import fastapi, mitsuba, numpy, trimesh, shapely')
+  "$resources/$bundled_python" -B -I - "$resources/python" <<'PY'
+from importlib.util import find_spec
+from pathlib import Path
+import platform
+import sys
+
+import fastapi, mapbox_earcut, mitsuba, numpy, shapely, trimesh, uvicorn
+
+root = Path(sys.argv[1]).resolve()
+assert platform.machine() == "arm64" and sys.version_info[:2] == (3, 12), "Expected arm64 CPython 3.12"
+assert Path(sys.base_prefix).resolve() == root, "Python relies on a prefix outside the app bundle"
+for module in (fastapi, mapbox_earcut, mitsuba, numpy, shapely, trimesh, uvicorn):
+    assert Path(module.__file__).resolve().is_relative_to(root), f"{module.__name__} is outside the app bundle"
+assert find_spec("sionna") is not None, "Sionna RT is missing from the bundled Python"
+PY
+  metadata_python="$resources/$bundled_python"
+  package_kind="macos-arm64-bundled"
+else
+  metadata_python="$python"
+  package_kind="macos-arm64-development"
 fi
+build_info_args=("$resources/build-info.json" "$package_kind")
+if [[ -n "${SRTS_DESKTOP_ASSETS:-}" ]]; then
+  build_info_args+=(--prebuilt-frontend)
+fi
+"$metadata_python" -B -I "$studio/scripts/candidate_info.py" "${build_info_args[@]}"
 
 /usr/bin/sips -c 132 132 --cropOffset 0 0 "$studio/assets/logo-app-bone.png" \
   --out "$staging/icon.png" >/dev/null

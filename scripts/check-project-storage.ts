@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
   clearAutosavedProject, createProjectDocument, DEFAULT_CSI_SETTINGS, loadAutosavedProject,
-  PROJECT_STORAGE_KEY, replaceUnreadableAutosave, saveAutosavedProject, type StudioProjectState,
+  parseProjectDocument, PROJECT_STORAGE_KEY, replaceUnreadableAutosave, saveAutosavedProject, type StudioProjectState,
 } from '../src/project';
 import { DEFAULT_SOLVER_OPTIONS } from '../src/types';
 
@@ -26,6 +26,38 @@ const project: StudioProjectState = {
     radioMapColormap: 'viridis', radioMapAutoRange: true, radioMapVmin: -120, radioMapVmax: -50,
   },
 };
+
+test('round trips a scene with georeferencing, tree physics, and offline visual bindings', () => {
+  const state = structuredClone(project);
+  state.scene.anchor = { latitude: 31, longitude: 121, elevation: 8.2, verticalDatum: 'local' };
+  state.scene.buildings = [{
+    id: 'tree', name: 'Tree', kind: 'building', category: 'terrain', type: 'tree',
+    rfRole: 'foliage', geometrySource: 'example', material: 'itu_wood', height: 6,
+    enuPoints: [enu], points: [{ lat: 31, lon: 121 }],
+    foliage: { center: { ...enu, z: 4 }, radii: { x: 2, y: 2, z: 3 }, attenuationDbPerM: 0.8 },
+  }];
+  state.scene.visual = { glb: 'Z2xURgIAAAAAAA==', bindings: [{ id: 'tree', origin: enu }] };
+  const doc = createProjectDocument(state);
+  assert.equal(doc.schemaVersion, 5);
+  assert.deepEqual(parseProjectDocument(JSON.stringify(doc)).state.scene, state.scene);
+  assert.equal(parseProjectDocument({ ...createProjectDocument(project), schemaVersion: 3 }).schemaVersion, 5);
+  state.scene.buildings[0].foliage!.radii.x = 0;
+  assert.throws(() => parseProjectDocument(createProjectDocument(state)), /invalid settings/);
+});
+
+test('restores an editable generated building with its mesh and generation parameters', () => {
+  const state = structuredClone(project);
+  state.scene.buildings = [{
+    id: 'office--1f-facade', kind: 'mesh', category: 'building', type: 'generated_facade',
+    rfRole: 'surface', material: 'itu_concrete', height: 4, floor: '1F', enuPoints: [], points: [],
+    mesh: { vertices: [0, 0, 0, 1, 0, 0, 0, 0, 1], triangles: [0, 1, 2] },
+    buildingSpec: { id: 'office', name: '研究楼', layout: 'office', east: 0, north: 0, baseZ: 0,
+      length: 24, width: 16, height: 12, floors: 3, rotationDeg: 20 },
+  }];
+  assert.deepEqual(parseProjectDocument(JSON.stringify(createProjectDocument(state))).state.scene, state.scene);
+  state.scene.buildings[0].buildingSpec!.id = 'another-building';
+  assert.throws(() => parseProjectDocument(createProjectDocument(state)), /invalid settings/);
+});
 
 // Model the Web Storage quota and the boundary at which an IndexedDB transaction
 // commits. The fixture can abort a write after its requests have run.
@@ -99,6 +131,7 @@ function setupStorage() {
     afterNextWrite: (callback: () => void) => { afterWrite = callback; },
     seedAutosave: (value: unknown) => records.set(PROJECT_STORAGE_KEY, value),
     readAutosave: () => records.get(PROJECT_STORAGE_KEY),
+    readBackup: () => records.get(`${PROJECT_STORAGE_KEY}.pre-v5`),
   };
 }
 
@@ -206,7 +239,7 @@ test('treats a newer autosave as incompatible and preserves it during recovery',
   const { localStorage, seedAutosave, readAutosave } = setupStorage();
   localStorage.setItem(PROJECT_STORAGE_KEY, '{unreadable');
   await assert.rejects(loadAutosavedProject, { name: 'UnreadableAutosaveError' });
-  const future = { ...createProjectDocument(project), schemaVersion: 4 };
+  const future = { ...createProjectDocument(project), schemaVersion: 6 };
   seedAutosave(future);
   await assert.rejects(loadAutosavedProject, { name: 'FutureAutosaveError' });
   assert.equal(await replaceUnreadableAutosave(project), false);
@@ -221,4 +254,39 @@ test('preserves a different legacy value written during a recovery transaction',
   assert.equal(await replaceUnreadableAutosave(project), true);
   assert.equal(localStorage.getItem(PROJECT_STORAGE_KEY), newer);
   assert.deepEqual((await loadAutosavedProject())?.state, project);
+});
+
+test('migrates an existing IndexedDB v4 autosave once and keeps a rollback copy', async () => {
+  const { seedAutosave, readAutosave, readBackup } = setupStorage();
+  const v4 = { format: 'SionnaRTStudio Project', schemaVersion: 4, savedAtUtc: '2026-11-11T00:00:00Z', state: project };
+  seedAutosave(v4);
+  const [first, second] = await Promise.all([loadAutosavedProject(), loadAutosavedProject()]);
+  assert.ok(first && second);
+  assert.match(first.projectId, /^[0-9a-f-]{36}$/);
+  assert.equal(first.projectId, second.projectId);
+  assert.equal(first.schemaVersion, 5);
+  assert.deepEqual(readAutosave(), first);
+  assert.deepEqual(readBackup(), v4);
+  await saveAutosavedProject(project, first.projectId);
+  assert.equal((await loadAutosavedProject())?.projectId, first.projectId);
+});
+
+test('round trips a v5 project identity and an absolute ENU trajectory', () => {
+  const state = structuredClone(project);
+  state.mobility.trajectoriesByRxId[device.id] = [{ lat: 0, lon: 0, enu: { ...enu, z: 6 } }];
+  state.mobility.waypointFrameByRxId = { [device.id]: 'ENU_m' };
+  const exported = createProjectDocument(state, '11111111-2222-4333-8444-555555555555');
+  const restored = parseProjectDocument(JSON.stringify(exported));
+  assert.equal(restored.projectId, exported.projectId);
+  assert.deepEqual(restored.state.mobility, state.mobility);
+  assert.throws(() => parseProjectDocument({ ...exported, projectId: '../another-project' }), /project ID/i);
+});
+
+test('a project reopens while the user is still editing inverted coverage bounds', () => {
+  const state = structuredClone(project);
+  state.coverage.region = { minX: 40, maxX: 30, minY: -5, maxY: 20 };
+  state.coverage.floorId = 'removed-slab';
+  state.coverage.thresholdDb = -90;
+  const saved = createProjectDocument(state);
+  assert.deepEqual(parseProjectDocument(JSON.stringify(saved)).state.coverage, state.coverage);
 });

@@ -9,6 +9,8 @@ jobs:
   windows-x64:
     runs-on: windows-2025
     timeout-minutes: 25
+    env:
+      SRTS_MITSUBA_VARIANT: llvm_ad_mono_polarized
     defaults:
       run:
         shell: powershell
@@ -39,6 +41,8 @@ jobs:
         run: |
           npm.cmd run lint -- --noUnusedLocals
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node.exe --import tsx --test scripts/check-project-storage.ts scripts/check-scene-devices.ts scripts/check-csi-history.ts scripts/check-quick-start.ts scripts/check-coverage-comparison.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm.cmd run check:osm-parser
           exit $LASTEXITCODE
       - name: Run installed backend CSI and CIR smoke test on CPU
@@ -50,52 +54,39 @@ jobs:
         if: github.event_name != 'push'
         run: |
           $app = Join-Path $env:RUNNER_TEMP 'Studio Windows Test\app'
-          $portable = Join-Path $env:RUNNER_TEMP 'Studio Portable Review\SionnaRTStudio'
-          # Copy the base interpreter and installed wheels. A moved venv would
-          # still look for the runner's Python installation in pyvenv.cfg.
-          @'
-          import os
-          from pathlib import Path
-          import shutil
-          import sys
-
-          installed, portable = map(Path, sys.argv[1:])
-          home = Path(sys.base_prefix)
-          shutil.copytree(installed, portable, ignore=shutil.ignore_patterns(".venv", "__pycache__"))
-          python = portable / "runtime" / "python"
-          python.mkdir()
-          for name in ("python.exe", "python3.dll", "python312.dll", "LICENSE.txt"):
-              shutil.copy2(home / name, python)
-          for library in home.glob("vcruntime*.dll"):
-              shutil.copy2(library, python)
-          shutil.copytree(home / "DLLs", python / "DLLs")
-          shutil.copytree(home / "Lib", python / "Lib",
-                          ignore=shutil.ignore_patterns("site-packages", "__pycache__"))
-          shutil.copytree(installed / "runtime" / ".venv" / "Lib" / "site-packages",
-                          python / "Lib" / "site-packages",
-                          ignore=shutil.ignore_patterns("__pycache__"))
-          (portable / "README.txt").write_text(
-              "Sionna RT Studio review build for Windows 11 x64.\n"
-              "Extract the entire ZIP, then open SionnaRTStudio.exe.\n"
-              "Requires Microsoft Edge WebView2 Runtime and either an NVIDIA driver "
-              "with CUDA/OptiX support or an x64 LLVM runtime for CPU tracing.\n"
-              f"Build commit: {os.environ['GITHUB_SHA']}\n",
-              encoding="utf-8",
-          )
-          '@ | python.exe -I - $app $portable
+          $staging = Join-Path $env:RUNNER_TEMP 'Studio Portable Staging'
+          $artifacts = Join-Path $env:RUNNER_TEMP 'studio-candidate'
+          $extracted = Join-Path $env:RUNNER_TEMP 'Studio Portable Review'
+          New-Item -ItemType Directory -Path $staging, $artifacts, $extracted | Out-Null
+          $installedPython = Join-Path $app 'runtime\.venv\Scripts\python.exe'
+          & $installedPython -B -I .\desktop\windows\package_studio.py $app (Join-Path $staging 'SionnaRTStudio')
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $build = Get-Content -Raw -LiteralPath (Join-Path $staging 'SionnaRTStudio\build-info.json') | ConvertFrom-Json
+          if ($build.commit -ne $env:GITHUB_SHA -or $build.sourceDirty) { throw 'Candidate metadata does not match CI checkout' }
+          $name = "SionnaRTStudio-$($build.appVersion)-windows-x64-$($build.commit.Substring(0, 12))-candidate.zip"
+          $archive = Join-Path $artifacts $name
+          tar.exe -a -cf $archive -C $staging SionnaRTStudio
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          "$sha  $name" | Set-Content -Encoding ASCII -LiteralPath (Join-Path $artifacts 'SHA256SUMS.txt')
+          tar.exe -xf $archive -C $extracted
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $portable = Join-Path $extracted 'SionnaRTStudio'
           $python = Join-Path $portable 'runtime\python\python.exe'
           & $python -I -c 'from pathlib import Path; import sys; assert Path(sys.base_prefix) == Path(sys.executable).parent'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $report = Join-Path $env:RUNNER_TEMP 'studio-acceptance\portable'
+          New-Item -ItemType Directory -Path $report | Out-Null
+          Copy-Item -LiteralPath (Join-Path $artifacts 'SHA256SUMS.txt') -Destination $report
           & .\desktop\windows\Test-Studio.ps1 -InstallDirectory $portable -Headless -AllowCpu -ReportDirectory $report
       - name: Save portable Windows x64 build
         if: github.event_name != 'push'
         uses: actions/upload-artifact@v7
         with:
-          name: SionnaRTStudio-windows-x64-review
-          path: ${{ runner.temp }}/Studio Portable Review/SionnaRTStudio
+          name: SionnaRTStudio-windows-x64-candidate
+          path: ${{ runner.temp }}/studio-candidate
           if-no-files-found: error
+          compression-level: 0
           retention-days: 14
       - name: Show recent native Python crash events
         if: failure()

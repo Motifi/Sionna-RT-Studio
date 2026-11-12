@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "datasetKind": "synthetic",
+  "coordinateFrame": "ENU_m",
+  "source": "Analytic Friis free-space path loss and geometric flight time inside the supplied synthetic room.",
+  "carrierFrequencyGhz": 3.5,
+  "rxDeviceId": "ue-reference",
+  "delayReference": "absolute_propagation",
+  "materialNotes": "The walls use the ITU brick preset with a 0.2 m thickness setting. These interior LOS-only links provide no evidence for fitting material properties.",
+  "foliageNotes": "The scene contains no foliage. No crown geometry or attenuation coefficient is estimated.",
+  "equipmentNotes": "Single isotropic vertically polarized Tx/Rx elements at 1.5 m ENU. Transmit powers are 20 dBm for ap-west and 17 dBm for ap-east."
+}

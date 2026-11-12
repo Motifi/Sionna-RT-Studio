@@ -7,7 +7,8 @@ import unittest
 
 import numpy as np
 
-from backend.models import CIRRequest, ENUVector, PropagationPath, Receiver, Transmitter
+from backend.models import BuildingFootprint, CIRRequest, ENUVector, MobilityRequest, PropagationPath, Receiver, Transmitter
+from backend.scene_export import _position as _export_position
 from backend.solver import (
     _az_el,
     _beam_target,
@@ -15,7 +16,9 @@ from backend.solver import (
     _channel_metrics,
     _coverage_stats,
     _default_threshold,
+    _device_positions,
     _empty_metrics,
+    _mobility_kinematics,
     _mobility_step,
     _notebook_tau_shape,
     _path_type,
@@ -253,6 +256,58 @@ class TestMobilityAggregation(unittest.TestCase):
         self.assertEqual(weak_reachable_step.numPaths, 1)
 
 
+class TestDeviceElevation(unittest.TestCase):
+    def setUp(self):
+        self.point = ENUVector(x=2, y=2, z=0)
+        self.ground = BuildingFootprint(
+            id="slope", category="terrain", kind="mesh", rfRole="ground", enuPoints=[], height=0,
+            mesh={"vertices": [0, 0, 0, 4, 0, 4, 4, 4, 4, 0, 4, 0], "triangles": [0, 1, 2, 0, 2, 3]},
+        )
+        self.building = BuildingFootprint(
+            id="roof", category="building", baseZ=7, height=12,
+            enuPoints=[ENUVector(x=x, y=y, z=0) for x, y in [(0, 0), (4, 0), (4, 4), (0, 4)]],
+        )
+
+    def test_ground_follows_terrain_under_the_building_in_solver_and_export(self):
+        buildings = [self.ground, self.building]
+        devices = [
+            Receiver(enu=self.point, height=1.5, heightReference="ground"),
+            Receiver(enu=self.point, height=5.5, heightReference="enu"),
+            Receiver(enu=self.point, height=8.5, heightReference="enu"),
+            Receiver(enu=self.point, height=5),
+            Receiver(enu=self.point, height=-2, heightReference="enu"),
+        ]
+        expected = [[2, 2, z] for z in [3.5, 5.5, 8.5, 24, -2]]
+        self.assertEqual(_device_positions(devices, buildings), expected)
+        self.assertEqual([_export_position(device, buildings) for device in devices], expected)
+        self.assertEqual(_device_positions(devices[:1], [self.building]), [[2, 2, 1.5]])
+
+    def test_ground_terrain_gap_reports_the_coordinates(self):
+        partial_ground = self.ground.model_copy(
+            update={"mesh": self.ground.mesh.model_copy(update={"triangles": [0, 1, 2]})},
+        )
+        device = Receiver(enu=ENUVector(x=1, y=3, z=0), height=1.5, heightReference="ground")
+        with self.assertRaisesRegex(ValueError, r"terrain.*E=1.*N=3"):
+            _device_positions([device], [partial_ground])
+        with self.assertRaisesRegex(ValueError, r"terrain.*E=1.*N=3"):
+            _mobility_kinematics([device.enu], device.height, [partial_ground], 1, "ground")
+
+    def test_legacy_absolute_device_route_offsets_remain_relative_to_the_ue(self):
+        points = [self.point.model_copy(update={"z": 2})]
+        positions, _ = _mobility_kinematics(points, 5, [self.ground, self.building], 1, "enu")
+        self.assertEqual(positions, [[2, 2, 7]])
+
+    def test_absolute_waypoint_frame_keeps_vertical_route_and_speed(self):
+        points = [self.point.model_copy(update={"z": 5.5 + i * 0.5}) for i in range(7)]
+        request = MobilityRequest(rx=Receiver(enu=self.point), buildings=[self.ground, self.building],
+                                  waypoints=points, waypointFrame="ENU_m")
+        positions, velocities = _mobility_kinematics(
+            request.waypoints, request.rx.height, request.buildings, 1, waypoint_frame=request.waypointFrame,
+        )
+        self.assertEqual(positions, [[2, 2, 5.5 + i * 0.5] for i in range(7)])
+        self.assertEqual(velocities, [[0, 0, 1]] * 7)
+
+
 class TestPathType(unittest.TestCase):
     def test_classification(self):
         self.assertEqual(_path_type(0, []), "LOS")
@@ -267,10 +322,10 @@ class TestCoverageStats(unittest.TestCase):
         self.assertEqual(_default_threshold("sinr", None), 0.0)
         self.assertEqual(_default_threshold("power", -75.0), -75.0)
 
-    def test_served_percent_ignores_non_finite(self):
+    def test_served_percent_counts_non_finite_as_unserved(self):
         vals = np.array([-80.0, -100.0, -np.inf, np.nan])
         s = _coverage_stats(vals, "power", -90.0)
-        self.assertAlmostEqual(s.servedPercent, 50.0)  # of the 2 finite cells
+        self.assertAlmostEqual(s.servedPercent, 25.0)  # one of four sampled cells
         self.assertEqual(s.minVal, -100.0)
         self.assertEqual(s.maxVal, -80.0)
 

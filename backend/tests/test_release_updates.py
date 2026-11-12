@@ -1,3 +1,5 @@
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,6 +7,7 @@ from unittest.mock import patch
 
 from backend.release_updates import RELEASES_URL, ReleaseChecker, select_update
 from backend.version import APP_VERSION
+from scripts.release_manifest import MANIFEST_NAME, sign, verify
 
 
 def release(tag="v1.10.0", *names, **flags):
@@ -48,3 +51,34 @@ class TestReleaseSelection(unittest.TestCase):
                 checker = ReleaseChecker(Path(root) / "updates.json")
                 checker._refresh()
                 self.assertEqual(checker.status()["status"], status)
+
+
+@unittest.skipUnless(shutil.which("openssl"), "requires openssl")
+class TestReleaseManifest(unittest.TestCase):
+    def test_rejects_changes_to_package_or_signed_manifest(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            private_key, public_key = root / "private.pem", root / "public.pem"
+            assets = root / "assets"
+            assets.mkdir()
+            mac = f"SionnaRTStudio-{APP_VERSION}-macos-arm64-min14.0.zip"
+            windows = f"SionnaRTStudio-{APP_VERSION}-windows-x64-min10.0.22000.zip"
+            for name in (mac, windows):
+                (assets / name).write_bytes(b"fixture")
+            subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-out", str(private_key)],
+                           check=True, capture_output=True)
+            subprocess.run(["openssl", "pkey", "-in", str(private_key), "-pubout", "-out", str(public_key)],
+                           check=True, capture_output=True)
+            sign(assets, private_key, [mac, windows])
+            entries = verify(assets, public_key, APP_VERSION)["assets"]
+            self.assertEqual([(asset["os"], asset["architecture"], asset["minimumOs"]) for asset in entries],
+                             [("macos", "arm64", "14.0"), ("windows", "x64", "10.0.22000")])
+            with self.assertRaisesRegex(ValueError, "version"):
+                verify(assets, public_key, "0.0.0")
+            (assets / mac).write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "hash"):
+                verify(assets, public_key, APP_VERSION)
+            manifest = assets / MANIFEST_NAME
+            manifest.write_bytes(manifest.read_bytes() + b" ")
+            with self.assertRaises(subprocess.CalledProcessError):
+                verify(assets, public_key, APP_VERSION)

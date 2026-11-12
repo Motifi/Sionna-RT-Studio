@@ -7,8 +7,11 @@
  */
 import {
   BuildingFootprint,
+  BuildingSpec,
   ChannelMetrics,
   CoverageMetric,
+  CoveragePreflight,
+  CoverageRegion,
   DEFAULT_SOLVER_OPTIONS,
   ENUVector,
   GeoAnchor,
@@ -17,9 +20,13 @@ import {
   PropagationPath,
   RadioMapGrid,
   Receiver,
+  FoliageVolume,
+  RadioRole,
+  SceneVisual,
   SolverRoof,
   SolverOptions,
   Transmitter,
+  WaypointFrame,
 } from './types';
 import { withRequestTimeout } from './utils';
 
@@ -118,6 +125,9 @@ export type CsiRunMode = 'static' | 'trajectory';
 export type CsiRunOutput = 'cir_cfr' | 'cir';
 
 export interface CsiRunRequest extends CIRExportOptions {
+  projectId?: string;
+  fronthaulMbpsByTxId?: Record<string, number | null>;
+  waypointFrame?: WaypointFrame;
   anchor?: GeoAnchor;
   mode: CsiRunMode;
   output?: CsiRunOutput;
@@ -132,6 +142,7 @@ export interface CsiRunRequest extends CIRExportOptions {
   materials: MaterialConfig[];
   waypoints?: ENUVector[];
   timeSeconds?: number[];
+  deriveTimeFromSpeed?: boolean;
   speedKmh?: number;
   combineMode?: MobilityCombineMode;
   handover?: HandoverConfig;
@@ -147,6 +158,7 @@ export interface CsiRun {
   rxNames: string[];
   timeSeconds: number[];
   rxPositions: number[][][];
+  txPositions: number[][];
   frequenciesHz: number[];
   shape: number[];
   pathCount: number;
@@ -161,6 +173,27 @@ export interface CsiRun {
   steps?: MobilityStep[];
   handover?: HandoverAnalysis | null;
   execution?: MobilityExecution;
+}
+
+export interface CsiHistoryEntry {
+  runId: string;
+  createdAtUtc: string;
+  mode: CsiRunMode;
+  output: CsiRunOutput;
+  sceneId: string;
+  uncompressedBytes: number;
+}
+
+export interface CsiHistoryRun {
+  run: CsiRun;
+  snapshot: {
+    buildings: BuildingFootprint[];
+    anchor?: GeoAnchor | null;
+    txs: Transmitter[];
+    rxs: Receiver[];
+    materials: MaterialConfig[];
+  };
+  fronthaulMbpsByTxId: Record<string, number | null>;
 }
 
 export interface CsiSelection {
@@ -178,7 +211,7 @@ export interface CsiLinkPreview extends SolveResponse {
 // for our HTTPExceptions but an ARRAY of {loc,msg,type} objects for 422 request
 // validation errors — JSON.stringify'ing that array is what produced the old
 // "[object Object]" toast. Flatten it to "field: message" lines instead.
-async function errorDetail(res: Response): Promise<string> {
+export async function errorDetail(res: Response): Promise<string> {
   try {
     const j = await res.json();
     const d = j?.detail;
@@ -246,12 +279,31 @@ export function createCsiRun(input: CsiRunRequest): Promise<CsiRun> {
   return postJson('/api/csi-runs', input);
 }
 
-export function inspectCsiLink(runId: string, selection: CsiSelection): Promise<CsiLinkPreview> {
+function readCsiHistory<T>(url: string): Promise<T> {
+  return withRequestTimeout(POLL_TIMEOUT_MS, async signal => {
+    const response = await fetch(url, { signal });
+    if (!response.ok) throw new ApiRequestError(response.status, await errorDetail(response));
+    return await response.json() as T;
+  });
+}
+
+const csiHistoryPath = (projectId: string) => `/api/projects/${encodeURIComponent(projectId)}/csi-runs`;
+
+export function listCsiRuns(projectId: string): Promise<CsiHistoryEntry[]> {
+  return readCsiHistory(csiHistoryPath(projectId));
+}
+
+export function readCsiRun(projectId: string, runId: string): Promise<CsiHistoryRun> {
+  return readCsiHistory(`${csiHistoryPath(projectId)}/${encodeURIComponent(runId)}`);
+}
+
+export function inspectCsiLink(runId: string, selection: CsiSelection, projectId?: string): Promise<CsiLinkPreview> {
   const query = new URLSearchParams({
     sampleIndex: String(selection.sampleIndex),
     txId: selection.txId,
     rxId: selection.rxId,
   });
+  if (projectId) query.set('projectId', projectId);
   return withRequestTimeout(POLL_TIMEOUT_MS, async (signal) => {
     const res = await fetch(`/api/csi-runs/${encodeURIComponent(runId)}/preview?${query}`, { signal });
     if (!res.ok) throw new ApiRequestError(res.status, await errorDetail(res));
@@ -261,16 +313,18 @@ export function inspectCsiLink(runId: string, selection: CsiSelection): Promise<
 
 export function exportCsiRun(
   runId: string,
-  fronthaulMbpsByTxId: Record<string, number | null>,
+  fronthaulMbpsByTxId: Record<string, number | null> | undefined,
+  projectId?: string,
 ): Promise<{ blob: Blob; filename: string }> {
-  return postForBlob(`/api/csi-runs/${encodeURIComponent(runId)}/export`, {
+  const scope = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
+  return postForBlob(`/api/csi-runs/${encodeURIComponent(runId)}/export${scope}`, {
     fronthaulMbpsByTxId,
   }, 'sionna_rt_studio_csi.zip');
 }
 
 export interface SolverActivity {
   operation: string;
-  status: 'running' | 'succeeded' | 'failed';
+  status: 'running' | 'succeeded' | 'failed' | 'cancelled';
   startedAt: string;
   finishedAt?: string;
   durationMs?: number;
@@ -337,6 +391,8 @@ export interface SceneObjectReport {
   id: string;
   status: 'physical' | 'visual' | 'skipped';
   material?: string;
+  rfRole?: RadioRole;
+  foliage?: FoliageVolume;
   issues: string[];
 }
 
@@ -353,8 +409,9 @@ export function inspectScene(buildings: BuildingFootprint[], freqGhz: number, ma
 
 export function readSolverRoofs(buildings: BuildingFootprint[]): Promise<SolverRoof[]> {
   // Only send building footprints. Imported triangle arrays are irrelevant here.
-  const footprints = buildings.filter(b => b.category === 'building' && (b.kind ?? 'building') === 'building')
-    .map(({ id, category, enuPoints, height, baseZ }) => ({ id, category, enuPoints, height, baseZ }));
+  const footprints = buildings.filter(b => (b.rfRole === 'surface' || (!b.rfRole && b.category === 'building')) &&
+    (b.kind ?? 'building') === 'building')
+    .map(({ id, category, enuPoints, height, baseZ, rfRole }) => ({ id, category, enuPoints, height, baseZ, rfRole }));
   return footprints.length ? postJson<SolverRoof[]>('/api/scene-roofs', footprints, POLL_TIMEOUT_MS) : Promise.resolve([]);
 }
 
@@ -363,6 +420,26 @@ export interface MeshImportResult {
   issues: string[];
   vertexCount: number;
   triangleCount: number;
+}
+
+export interface ScenePackage {
+  name: string;
+  anchor: GeoAnchor;
+  objects: BuildingFootprint[];
+  materials: MaterialConfig[];
+  visual?: SceneVisual;
+}
+
+export function importScenePackage(file: Blob) {
+  return withRequestTimeout(SOLVE_TIMEOUT_MS, async signal => {
+    const response = await fetch('/api/scene-package', { method: 'POST', body: file, signal });
+    if (!response.ok) throw new Error(await errorDetail(response));
+    return await response.json() as ScenePackage;
+  });
+}
+
+export function generateBuilding(spec: BuildingSpec) {
+  return postJson<{ spec: BuildingSpec; objects: BuildingFootprint[] }>('/api/building-generate', spec, 30_000);
 }
 
 export function importMesh(file: File, axes: string, scale: number, material: string) {
@@ -392,8 +469,25 @@ export interface CoverageOptions {
   bandwidthHz?: number;
   noiseFigureDb?: number;
   coverageThresholdDb?: number | null;
+  region?: CoverageRegion | null;
+  floorId?: string | null;
   samplesPerTx?: number;
   seed?: number;
+}
+
+export interface CoverageJobRequest extends CoverageOptions {
+  txs: Transmitter[];
+  buildings: BuildingFootprint[];
+  freqGhz: number;
+  gridSize: number;
+  gridHeight: number;
+  maxDepth: number;
+  options: SolverOptions;
+  materials: MaterialConfig[];
+}
+
+export function readCoveragePreflight(input: CoverageJobRequest): Promise<CoveragePreflight> {
+  return postJson('/api/radiomap/preflight', input, 15_000);
 }
 
 export function solveRadioMap(
@@ -692,10 +786,10 @@ export interface ChannelGridExportOptions {
 }
 
 /**
- * Ray-traced channel-grid export. Every radio-map cell is retraced on the
- * backend and the full per-Rx/per-Tx-port CFR (`paths.cfr()`) is returned as a
- * NumPy `.npz`. `cells` are the radio-map cell centers (ENU); all of those
- * virtual receivers share the active receiver's scene.rx_array.
+ * Ray-traced channel-grid export. The caller supplies the sampled radio-map
+ * cell centers (ENU). The backend retraces those positions and returns the
+ * full per-Rx/per-Tx-port CFR (`paths.cfr()`) as a NumPy `.npz`. The virtual
+ * receivers share the active receiver's scene.rx_array.
  */
 export function exportChannelGrid(
   tx: Transmitter,
@@ -713,6 +807,7 @@ export function exportChannelGrid(
     rx,
     buildings,
     cells,
+    cellsAreSampled: true,
     freqGhz,
     maxDepth,
     options,
@@ -740,6 +835,7 @@ export function solveMobility(
   combineMode: MobilityCombineMode = 'best_server',
   executionMode: 'auto' | 'batched' | 'serial_reference' = 'auto',
   handover?: HandoverConfig,
+  waypointFrame?: WaypointFrame,
 ): Promise<MobilityResponse> {
   return postJson<MobilityResponse>('/api/mobility', {
     txs,
@@ -753,6 +849,7 @@ export function solveMobility(
     materials,
     combineMode,
     executionMode,
+    waypointFrame,
     ...(handover ? { handover } : {}),
   });
 }

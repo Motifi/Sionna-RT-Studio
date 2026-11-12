@@ -5,10 +5,11 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { Settings } from 'lucide-react';
-import type { Receiver, SolverOptions, Transmitter } from '../types';
+import type { BuildingFootprint, HeightReference, Receiver, SolverOptions, SolverRoof, Transmitter } from '../types';
 import { NumberField } from './NumberField';
 import { useI18n } from '../i18n';
 import type { StudioCsiSettings } from '../project';
+import { getDeviceElevation } from '../utils';
 
 const FREQUENCY_PRESETS_GHZ = [2.4, 5.8, 28];
 const FIELD = 'w-full min-w-0 rounded border border-[var(--line)] bg-white px-2 py-1.5 text-sm text-slate-900 focus:outline-none focus:border-[var(--accent)]';
@@ -209,17 +210,20 @@ export function SolverControls({
 interface DeviceRfControlsProps {
   tx: Transmitter;
   rx: Receiver;
+  buildings: BuildingFootprint[];
+  solverRoofs?: SolverRoof[];
   onTxUpdate: (tx: Transmitter) => void;
   onRxUpdate: (rx: Receiver) => void;
   kind: 'tx' | 'rx';
 }
 
-export function DeviceRfControls({ tx, rx, onTxUpdate, onRxUpdate, kind }: DeviceRfControlsProps) {
+export function DeviceRfControls({ tx, rx, buildings, solverRoofs, onTxUpdate, onRxUpdate, kind }: DeviceRfControlsProps) {
   const { t } = useI18n();
   const isTransmitter = kind === 'tx';
   const device = isTransmitter ? tx : rx;
   const [columns, rows] = device.antennaArraySize;
   const arrayInputId = isTransmitter ? 'input-ant' : 'input-rx-ant';
+  const phaseCenter = getDeviceElevation(device, buildings, solverRoofs);
 
   const updateDevice = (changes: Partial<Pick<Receiver, 'height' | 'heightReference' | 'antennaArraySize'>>) => {
     if (isTransmitter) onTxUpdate({ ...tx, ...changes });
@@ -236,8 +240,9 @@ export function DeviceRfControls({ tx, rx, onTxUpdate, onRxUpdate, kind }: Devic
         <label className={LABEL}>
           {t('Height reference', '高度基准')}
           <select id={`select-${kind}-height-reference`} className={FIELD} value={device.heightReference ?? 'roof'}
-            onChange={event => updateDevice({ heightReference: event.target.value === 'enu' ? 'enu' : 'roof' })}>
+            onChange={event => updateDevice({ heightReference: event.target.value as HeightReference })}>
             <option value="roof">{t('Ground / roof', '地面或屋顶')}</option>
+            <option value="ground">{t('Terrain', '地形')}</option>
             <option value="enu">{t('Absolute ENU', 'ENU 绝对标高')}</option>
           </select>
         </label>
@@ -247,6 +252,12 @@ export function DeviceRfControls({ tx, rx, onTxUpdate, onRxUpdate, kind }: Devic
             step="any" min={device.heightReference === 'enu' ? undefined : 0} className={FIELD} />
         </label>
       </div>
+      <p className="readout text-xs text-slate-600">
+        {t('Phase center E / N / U (m)', '相位中心 东 / 北 / 高（米）')} · {device.enu.x.toFixed(3)} / {device.enu.y.toFixed(3)} / {phaseCenter?.toFixed(3) ?? '—'}
+      </p>
+      {phaseCenter === undefined && <p role="status" className="text-xs text-slate-700">
+        {t('No terrain below this position. Move the device onto the terrain.', '此位置下方没有地形。请将设备移到地形上。')}
+      </p>}
 
       <fieldset className="grid grid-cols-2 gap-2">
         <legend className="mb-1 text-xs font-semibold text-slate-700">{t('Antenna array', '天线阵列')}</legend>
@@ -332,6 +343,10 @@ export function CsiGridControls({ settings, onChange, bandwidthMhz }: CsiGridCon
         />
         {t('Use each link’s first arrival as its delay reference', '以每条链路的首径作为时延参考')}
       </label>
+      <p className="col-span-2 text-[11px] leading-relaxed text-slate-600">
+        {t('Clear this option to retain absolute propagation delays when comparing arrivals from different APs.',
+          '需要比较不同 AP 的到达时延时，取消勾选以保留绝对传播时延。')}
+      </p>
     </div>
   );
 }

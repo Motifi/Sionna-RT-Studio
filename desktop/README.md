@@ -19,3 +19,9 @@ Run `./setup.sh` and then `./desktop/build.sh` from the Studio checkout. The bui
 Quit the old app before opening the new build. Use the bottom bar to visit Scene, Deployment, Simulation, and Export. Solve all static links or one UE trajectory in Simulation, then save that run's CSI ZIP with the macOS save dialog in Export. Use the Project menu to save editable settings and control points.
 
 For a development smoke check, launch the bundle executable with `--smoke-report /path/to/report.json`. Set `SRTS_DESKTOP_TEST_PORT` to use a separate loopback port and inspect the resulting JSON report.
+
+## Portable candidates
+
+For a relocatable macOS build with Python bundled, see [desktop release
+candidates](RELEASE.md). The local development build uses the Python path
+specified at build time.

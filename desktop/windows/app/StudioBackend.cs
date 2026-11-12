@@ -10,6 +10,7 @@ internal sealed class StudioBackend : IDisposable
 {
     private const int DesktopPort = 43110;
     private readonly string portFile;
+    private readonly string logPath;
     private readonly bool ephemeralPort;
     private readonly string launchToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
     private readonly object logLock = new();
@@ -19,6 +20,7 @@ internal sealed class StudioBackend : IDisposable
 
     public StudioBackend(string logPath, string? acceptanceDirectory)
     {
+        this.logPath = logPath;
         ephemeralPort = acceptanceDirectory is not null;
         portFile = acceptanceDirectory is null
             ? Path.Combine(Path.GetTempPath(), $"sionna-studio-{Guid.NewGuid():N}.port")
@@ -28,7 +30,8 @@ internal sealed class StudioBackend : IDisposable
         if (!File.Exists(python))
             python = Path.Combine(runtime, ".venv", "Scripts", "python.exe");
         if (!File.Exists(python))
-            throw new FileNotFoundException("Install-Studio.ps1 is required to set up the Studio Python environment.", python);
+            throw new FileNotFoundException("Extract the entire Studio ZIP into one folder and reopen Studio. "
+                + "If building from source, rerun Install-Studio.ps1 to restore Python.", python);
 
         var start = new ProcessStartInfo(python)
         {
@@ -82,7 +85,10 @@ internal sealed class StudioBackend : IDisposable
         {
             cancellation.ThrowIfCancellationRequested();
             if (HasExited)
-                throw new InvalidOperationException($"The ray-tracing service exited with code {process.ExitCode}.");
+            {
+                process.WaitForExit(); // Drain captured startup errors before displaying them.
+                throw new InvalidOperationException($"The ray-tracing service exited with code {process.ExitCode}.{StartupDiagnostics()}");
+            }
             var origin = GetOrigin();
             if (origin is not null)
             {
@@ -105,7 +111,25 @@ internal sealed class StudioBackend : IDisposable
             }
             await Task.Delay(250, cancellation);
         }
-        throw new TimeoutException("The ray-tracing service did not become ready within 90 seconds.");
+        throw new TimeoutException($"The ray-tracing service did not become ready within 90 seconds.{StartupDiagnostics()}");
+    }
+
+    private string StartupDiagnostics()
+    {
+        try
+        {
+            using var file = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            file.Seek(Math.Max(0, file.Length - 3000), SeekOrigin.Begin);
+            using var reader = new StreamReader(file, Encoding.UTF8);
+            var details = reader.ReadToEnd().Trim();
+            if (details.Contains("ModuleNotFoundError", StringComparison.Ordinal))
+                details += "\n\nExtract the full Studio ZIP again, or rerun Install-Studio.ps1 for a source installation.";
+            return string.IsNullOrWhiteSpace(details) ? "" : $"\n\n{details}";
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            return "";
+        }
     }
 
     private Uri? GetOrigin()

@@ -5,20 +5,36 @@ and consumes maps 1:1 with no alias gymnastics.
 """
 from __future__ import annotations
 
+import math
 from typing import List, Literal, Optional, Tuple
 
-from pydantic import BaseModel, Field, FiniteFloat, model_validator
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, field_validator, model_validator
 
 
 class GeoAnchor(BaseModel):
     latitude: FiniteFloat = Field(ge=-90, le=90)
     longitude: FiniteFloat = Field(ge=-180, le=180)
+    elevation: FiniteFloat | None = None
+    verticalDatum: str | None = None
 
 
 class ENUVector(BaseModel):
     x: FiniteFloat  # East (m)
     y: FiniteFloat  # North (m)
     z: FiniteFloat  # Up (m)
+
+
+class FoliageVolume(BaseModel):
+    center: ENUVector
+    radii: ENUVector
+    attenuationDbPerM: FiniteFloat = Field(ge=0)
+
+    @field_validator("radii")
+    @classmethod
+    def positive_radii(cls, radii: ENUVector) -> ENUVector:
+        if min(radii.x, radii.y, radii.z) <= 0:
+            raise ValueError("Foliage radii must be positive")
+        return radii
 
 
 class TriangleMesh(BaseModel):
@@ -34,14 +50,63 @@ class TriangleMesh(BaseModel):
         return self
 
 
+RfRole = Literal["surface", "ground", "foliage", "visual"]
+HeightReference = Literal["roof", "enu", "ground"]
+WaypointFrame = Literal["ENU_m"]
+
+
+class BuildingSpec(BaseModel):
+    """Meter-scale recipe for a rectangular, layered building in ENU."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,100}$")
+    name: str = Field(min_length=1, max_length=120)
+    east: FiniteFloat = Field(ge=-100_000, le=100_000)
+    north: FiniteFloat = Field(ge=-100_000, le=100_000)
+    length: FiniteFloat = Field(ge=8, le=150)
+    width: FiniteFloat = Field(ge=8, le=150)
+    height: FiniteFloat = Field(ge=3, le=120)
+    baseZ: FiniteFloat = Field(default=0, ge=-100_000, le=100_000)
+    floors: int | None = Field(default=None, strict=True, ge=1, le=30)
+    rotationDeg: FiniteFloat = 0
+    layout: Literal["office", "apartments"]
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, name: str) -> str:
+        name = name.strip()
+        if not name:
+            raise ValueError("Building name must not be empty.")
+        return name
+
+    @model_validator(mode="after")
+    def normalize_recipe(self):
+        if self.floors is None:
+            target_height = 3.6 if self.layout == "office" else 3.2
+            max_floors = math.floor((self.height + 1e-9) / 2.7)
+            self.floors = min(30, max_floors, max(1, math.floor(self.height / target_height + 0.5)))
+        if not 2.7 - 1e-9 <= self.height / self.floors <= 6 + 1e-9:
+            raise ValueError("Building height divided by floors must be 2.7–6 meters.")
+        self.rotationDeg %= 360
+        if self.rotationDeg == 360:
+            self.rotationDeg = 0.0
+        return self
+
+
 class BuildingFootprint(BaseModel):
-    id: str
+    id: str = Field(min_length=1)
     name: Optional[str] = None
     enuPoints: List[ENUVector]
     height: FiniteFloat
     kind: Literal["building", "wall", "mesh"] = "building"
     baseZ: FiniteFloat = 0.0
     mesh: TriangleMesh | None = None
+    rfRole: RfRole | None = None
+    floor: str | None = None
+    geometrySource: str | None = None
+    buildingSpec: BuildingSpec | None = None
+    foliage: FoliageVolume | None = None
     source: Literal["template", "osm", "manual", "import"] | None = None
     heightSource: Literal["tag", "levels", "estimated", "manual"] | None = None
     materialSource: Literal["tag", "estimated", "manual"] | None = None
@@ -54,13 +119,21 @@ class BuildingFootprint(BaseModel):
     # `points` (lat/lon) is sent by the frontend but unused by the solver.
     points: Optional[list] = None
 
+    @model_validator(mode="after")
+    def validate_scene_coordinates_and_group(self):
+        if self.foliage is not None and not math.isfinite(self.baseZ + self.foliage.center.z):
+            raise ValueError("Foliage center elevation must be finite after applying baseZ")
+        if self.buildingSpec is not None and not self.id.startswith(f"{self.buildingSpec.id}--"):
+            raise ValueError("Generated object ID must begin with its building recipe ID followed by '--'.")
+        return self
+
 
 class Transmitter(BaseModel):
     id: str = "tx"
     name: str = "Tx"
     enu: ENUVector
     height: FiniteFloat = 10.0
-    heightReference: Literal["roof", "enu"] = "roof"
+    heightReference: HeightReference = "roof"
     powerDbm: float = 30.0
     antennaArraySize: Tuple[int, int] = (8, 8)  # [horizontal, vertical]
     beamsteeringAzimuth: float = 0.0
@@ -74,7 +147,7 @@ class Receiver(BaseModel):
     name: str = "Rx"
     enu: ENUVector
     height: FiniteFloat = 1.5
-    heightReference: Literal["roof", "enu"] = "roof"
+    heightReference: HeightReference = "roof"
     antennaArraySize: Tuple[int, int] = (1, 1)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
@@ -109,6 +182,8 @@ class ChannelMetrics(BaseModel):
     totalRxPowerDbm: float
     losStatus: Literal["LOS", "NLOS"]
     numPaths: int
+    # Earliest absolute propagation delay over all valid rays, before display truncation.
+    firstArrivalDelayNs: float | None = None
     rmsDelaySpreadNs: float
     # False only when a scalar delay spread is not physically defined (currently
     # non-coherent multi-transmitter power aggregation in mobility mode).
@@ -127,6 +202,7 @@ class RadioMapCell(BaseModel):
     isLos: bool
     sinr: Optional[float] = None      # best-server signal-to-interference-plus-noise [dB]
     servingTx: Optional[int] = None   # index of the serving transmitter
+    sampled: bool = True             # false outside the selected support surface
 
 
 class CoverageStats(BaseModel):
@@ -134,7 +210,7 @@ class CoverageStats(BaseModel):
     metric: str            # "power" | "sinr"
     unit: str              # "dBm" | "dB"
     thresholdDb: float     # served threshold used
-    servedPercent: float   # % of reachable cells at/above the threshold
+    servedPercent: float   # % of sampled cells at/above the threshold
     p5: float
     p50: float
     p95: float
@@ -155,6 +231,45 @@ class RadioMapGrid(BaseModel):
     stats: Optional[CoverageStats] = None
     samplesPerTx: int = 1_000_000
     seed: int = 42
+    solverMethod: Literal["radio_map", "traced_receivers", "direct_receivers"] = "radio_map"
+    traceBatches: int | None = None
+    floorId: str | None = None
+    floorElevationM: float | None = None
+    sceneId: str | None = None
+
+
+class CoverageRegion(BaseModel):
+    """Requested rectangular measurement area in the scene's ENU frame."""
+    minX: FiniteFloat = Field(ge=-100_000, le=100_000)
+    maxX: FiniteFloat = Field(ge=-100_000, le=100_000)
+    minY: FiniteFloat = Field(ge=-100_000, le=100_000)
+    maxY: FiniteFloat = Field(ge=-100_000, le=100_000)
+
+    @model_validator(mode="after")
+    def check_bounds(self):
+        if self.minX >= self.maxX or self.minY >= self.maxY:
+            raise ValueError("Coverage region needs increasing east and north bounds.")
+        return self
+
+
+class CoveragePreflight(BaseModel):
+    solverMethod: Literal["radio_map", "traced_receivers", "direct_receivers"]
+    gridSize: float
+    nx: int
+    ny: int
+    cells: int
+    measuredCells: int | None
+    transmitterCount: int
+    apCells: int
+    maxCells: int
+    maxApCells: int
+    traceBatches: int | None
+    samplesPerBatch: int | None
+    totalSamples: int | None
+    maxSamplesPerBatch: int | None
+    maxTotalSamples: int | None
+    estimatedRasterBytes: int
+    issues: list[str]
 
 
 # ── Request / response envelopes ────────────────────────────────────────────
@@ -186,9 +301,8 @@ class SolverOptions(BaseModel):
 class MaterialConfig(BaseModel):
     """Per-material electromagnetic + scattering overrides applied to the scene.
 
-    `id` matches the frontend material id (e.g. ``itu_concrete``). Scattering
-    fields map to Sionna's RadioMaterial. When permittivity/conductivity are set,
-    a custom RadioMaterial replaces the ITU preset for that id.
+    `id` matches the scene object's material id. ITU presets support individual
+    overrides. A custom material id requires both permittivity and conductivity.
     """
     id: str
     scatteringCoefficient: FiniteFloat = Field(default=0.0, ge=0, le=1)
@@ -234,7 +348,9 @@ class RadioMapRequest(BaseModel):
     metric: Literal["power", "sinr"] = "power"
     bandwidthHz: float = 100e6   # sets scene.bandwidth → thermal noise for SINR
     noiseFigureDb: float = 7.0   # receiver noise figure added to thermal noise
-    coverageThresholdDb: Optional[float] = None  # served threshold (per-metric default)
+    coverageThresholdDb: FiniteFloat | None = None  # served threshold (per-metric default)
+    region: CoverageRegion | None = None
+    floorId: str | None = Field(default=None, min_length=1, max_length=200)
     # Research/reproducibility controls passed directly to RadioMapSolver.
     samplesPerTx: int = Field(default=1_000_000, ge=1_000, le=10_000_000)
     seed: int = Field(default=42, ge=0, le=2_147_483_647)
@@ -335,6 +451,7 @@ class MobilityRequest(BaseModel):
     rx: Receiver
     buildings: List[BuildingFootprint]
     waypoints: List[ENUVector]
+    waypointFrame: WaypointFrame | None = None
     freqGhz: float = 28.0
     speedKmh: float = 30.0
     maxDepth: int = 3
@@ -636,6 +753,8 @@ class ChannelGridRequest(BaseModel):
     # Receiver positions = radio-map cell centers (ENU), sent verbatim so the
     # dataset coordinates match the displayed coverage grid exactly.
     cells: List[ENUVector]
+    # True when the caller has already applied the coverage sampling mask.
+    cellsAreSampled: bool = False
     freqGhz: float = 28.0
     maxDepth: int = 3
     options: SolverOptions = Field(default_factory=SolverOptions)

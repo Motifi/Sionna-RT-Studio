@@ -22,6 +22,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
     private var smokeResult: [String: Any]?
     private var smokeProject: URL?
     private var smokeCsi: URL?
+    private var smokeRunsDirectory: URL?
     private var downloads: [ObjectIdentifier: (stage: URL, destination: URL)] = [:]
     private var checkingProjectBeforeClose = false
     private var terminationPending = false
@@ -176,6 +177,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
         if let logURL { try? fileManager.removeItem(at: logURL) }
         if let smokeProject { try? fileManager.removeItem(at: smokeProject) }
         if let smokeCsi { try? fileManager.removeItem(at: smokeCsi) }
+        if let smokeRunsDirectory { try? fileManager.removeItem(at: smokeRunsDirectory) }
         for entry in downloads.values { try? fileManager.removeItem(at: entry.stage) }
         webView.configuration.userContentController.removeScriptMessageHandler(forName: "studioLocale")
     }
@@ -213,8 +215,11 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
               let python = ProcessInfo.processInfo.environment["SRTS_PYTHON"]
                   ?? bundledPython ?? bundle.object(forInfoDictionaryKey: "StudioPythonPath") as? String,
               fileManager.isExecutableFile(atPath: python) else {
-            startupFailed(text("The Studio Python environment is missing. Rebuild this app from the workspace.",
-                               "找不到 Studio 的 Python 环境，请在工作区重新构建应用。"))
+            startupFailed(bundledPython == nil
+                ? text("The Studio Python environment is missing. Rebuild this app from the workspace.",
+                       "找不到 Studio 的 Python 环境，请在工作区重新构建应用。")
+                : text("The bundled Python environment is missing. Extract the entire Studio ZIP again and reopen the app.",
+                       "找不到应用内的 Python 环境。请重新解压完整的 Studio ZIP，再打开应用。"))
             return
         }
 
@@ -237,6 +242,11 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
         environment["SRTS_DESKTOP_LAUNCH_TOKEN"] = token
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment["PYTHONUNBUFFERED"] = "1"
+        if smokeReport != nil {
+            let directory = fileManager.temporaryDirectory.appendingPathComponent("studio-smoke-runs-\(UUID().uuidString)")
+            smokeRunsDirectory = directory
+            environment["SRTS_RUNS_DIR"] = directory.path
+        }
         process.environment = environment
         let input = Pipe()
         process.standardInput = input
@@ -300,11 +310,15 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
                 try? log.seek(toOffset: length > 3000 ? length - 3000 : 0)
                 if let data = try? log.readToEnd(), let output = String(data: data, encoding: .utf8) {
                     details += "\n\n" + output
+                    if output.contains("ModuleNotFoundError") || output.contains("Library not loaded") {
+                        details += "\n\n" + text("Extract the full Studio ZIP again, or rebuild the app for a source installation.",
+                                                 "请重新解压完整的 Studio ZIP。若从源码安装，请重新构建应用。")
+                    }
                 }
             }
         }
         if smokeReport != nil {
-            finishSmoke(["ok": false, "error": details])
+            finishSmoke(["ok": false, "failureStage": "startup", "error": details])
             return
         }
         let alert = NSAlert()
@@ -443,7 +457,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
                 } else {
                     let project = try JSONSerialization.jsonObject(with: data) as? [String: Any]
                     result["projectExport"] = project?["format"] as? String == "SionnaRTStudio Project" &&
-                        project?["schemaVersion"] as? Int == 3
+                        [3, 4, 5].contains(project?["schemaVersion"] as? Int ?? 0)
                 }
                 smokeResult = result
                 if let projectExport = result["projectExport"] as? Bool, let csiExport = result["csiExport"] as? Bool {
@@ -565,7 +579,8 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
             await waitFor(async () => {
               const saved = await project();
               return navFor('planning').getAttribute('aria-current') === 'page' &&
-                saved?.schemaVersion === 3 &&
+                [3, 4, 5].includes(saved?.schemaVersion) &&
+                (saved.schemaVersion !== 5 || typeof saved.projectId === 'string') &&
                 saved.state.devices.transmitters[0].beamsteeringAzimuth === 37 &&
                 saved.state.devices.transmitters[0].beamsteeringElevation === -12 &&
                 saved.state.mobility.trajectoriesByRxId[oldRxId]?.length === 2 &&
@@ -653,11 +668,26 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
             const runRequests = [];
             const completedRuns = [];
             const originalFetch = window.fetch.bind(window);
+            const pendingCsiJobs = new Set();
             window.fetch = async (input, options) => {
-              const isRun = new URL(input instanceof Request ? input.url : input, location.href).pathname === '/api/csi-runs';
-              if (isRun) runRequests.push(JSON.parse(options.body));
+              const path = new URL(input instanceof Request ? input.url : input, location.href).pathname;
+              const isStart = path === '/api/simulation-jobs/csi';
+              const isPoll = path.startsWith('/api/simulation-jobs/') &&
+                pendingCsiJobs.has(path.split('/').at(-1)) && options?.method !== 'DELETE';
+              if (isStart) runRequests.push(JSON.parse(options.body));
               const response = await originalFetch(input, options);
-              if (isRun && response.ok) completedRuns.push(await response.clone().json());
+              if ((isStart || isPoll) && response.ok) {
+                const job = await response.clone().json();
+                if (job.status === 'succeeded' && job.result) {
+                  pendingCsiJobs.delete(job.jobId);
+                  completedRuns.push(job.result);
+                } else if (job.status === 'failed' || job.status === 'cancelled') {
+                  pendingCsiJobs.delete(job.jobId);
+                  throw new Error('CSI job ended: ' + (job.error || job.status));
+                } else if (isStart) {
+                  pendingCsiJobs.add(job.jobId);
+                }
+              }
               return response;
             };
             const run = async mode => {
@@ -670,10 +700,11 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
               button.click();
               return await waitFor(() => completedRuns.length > before && completedRuns[before], mode + ' CSI run');
             };
-            const extractZip = async (result, fronthaulMbps) => {
-              const response = await originalFetch('/api/csi-runs/' + result.runId + '/export', {
+            const extractZip = async (result, fronthaulMbps, override = true) => {
+              const query = result.projectId ? '?' + new URLSearchParams({projectId: result.projectId}) : '';
+              const response = await originalFetch('/api/csi-runs/' + result.runId + '/export' + query, {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({fronthaulMbpsByTxId: {[apId]: fronthaulMbps}}),
+                body: JSON.stringify(override ? {fronthaulMbpsByTxId: {[apId]: fronthaulMbps}} : {}),
               });
               if (!response.ok) throw new Error('CSI export failed: ' + await response.text());
               const buffer = await response.arrayBuffer();
@@ -695,7 +726,8 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
                   JSON.stringify(manifest.shape) !== JSON.stringify(result.shape)) {
                 throw new Error('CSI ZIP did not match the run or current fronthaul');
               }
-              return {manifest, hash: Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', npz))).join(',')};
+              return {manifest, members: [...entries.keys()],
+                      hash: Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', npz))).join(',')};
             };
 
             await go('preview');
@@ -725,6 +757,29 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
             await waitFor(async () => (await project())?.state.csi.numSubcarriers === 9, 'changed CSI input');
             await go('export');
             if (!document.querySelector('#btn-export-csi-run').disabled) throw new Error('Stale CSI remained exportable');
+            let historyExport = false;
+            if (staticRun.projectId) {
+              await go('preview');
+              const history = await waitFor(() => {
+                const picker = document.querySelector('#select-csi-history');
+                return picker && [...picker.options].some(option => option.value === staticRun.runId) && picker;
+              }, 'saved CSI in project history');
+              history.value = staticRun.runId;
+              history.dispatchEvent(new Event('change', {bubbles: true}));
+              const closeHistory = await waitFor(() => document.querySelector('#btn-close-csi-history'), 'history preview');
+              await go('export');
+              await waitFor(() => !document.querySelector('#btn-export-csi-run').disabled, 'historical CSI export');
+              const historical = await extractZip(staticRun, 25, false);
+              if (historical.hash !== beforeFronthaul.hash ||
+                  !['scene.xml', 'request.json', 'replay_csi.py'].every(member => historical.members.includes(member))) {
+                throw new Error('Historical CSI export changed or cannot be replayed');
+              }
+              historyExport = true;
+              await go('preview');
+              closeHistory.click();
+              await go('export');
+              await waitFor(() => document.querySelector('#btn-export-csi-run').disabled, 'stale current run after leaving history');
+            }
 
             await go('planning');
             const plannedRx = (await savedDevices()).activeRxId;
@@ -802,7 +857,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
             if (!result.ok || solve.metrics?.losStatus !== 'LOS' || solve.metrics?.numPaths !== 1) {
               throw new Error('Studio LOS ray trace failed: ' + JSON.stringify(solve));
             }
-            return {ok: health.ok === true, engine: health.engine, variant: health.variant,
+            return {ok: health.ok === true, engine: health.engine, variant: health.variant, solverRuntime: health,
                     webgl2: Boolean(canvas), initialLanguage: initial, alternateLanguage: alternate,
                     pageTitle: document.title, tracedPaths: solve.metrics.numPaths,
                     receivedPowerDbm: solve.metrics.totalRxPowerDbm, placedReceivers: count + 2,
@@ -811,7 +866,7 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
                     trajectoryCsiShape: trajectoryRun.shape, csiReusedWithFronthaul: true,
                     trajectoryOutput: trajectoryRun.output, trajectoryCfrBytes: denseBytes,
                     trajectoryCirBytes: trajectoryRun.uncompressedBytes, oversizeCfrBlocked: true,
-                    staleCsiBlocked: true, sameCanvasAcrossWorkspaces: true};
+                    staleCsiBlocked: true, historyExport, sameCanvasAcrossWorkspaces: true};
             """
         Task { [self] in
             do {
@@ -846,9 +901,15 @@ final class StudioApp: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNavi
         }
     }
 
-    private func finishSmoke(_ result: Any) {
+    private func finishSmoke(_ result: [String: Any]) {
         smokeResult = nil
-        if let smokeReport, let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]) {
+        var report = result
+        if let info = bundle.url(forResource: "build-info", withExtension: "json"),
+           let data = try? Data(contentsOf: info), let build = try? JSONSerialization.jsonObject(with: data) {
+            report["build"] = build
+        }
+        report["requestedVariant"] = ProcessInfo.processInfo.environment["SRTS_MITSUBA_VARIANT"]
+        if let smokeReport, let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) {
             try? data.write(to: smokeReport, options: .atomic)
         }
         NSApp.terminate(nil)

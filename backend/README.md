@@ -44,12 +44,20 @@ Sionna scene build, no network:
 | Method | Path            | Body                                                          | Returns                  |
 |--------|-----------------|---------------------------------------------------------------|--------------------------|
 | GET    | `/api/health`   | —                                                             | `{ok, variant, gpu, …}`  |
+| POST   | `/api/building-generate` | Building ID, name, footprint center and dimensions, height, and layout | Normalized `{spec, objects}` |
 | POST   | `/api/solve`    | `{tx, rx, buildings, freqGhz, maxDepth, options}`             | `{paths, metrics}`       |
 | POST   | `/api/radiomap` | `{txs, buildings, freqGhz, gridSize, gridHeight, maxDepth, options}` | `RadioMapGrid`    |
+| POST   | `/api/radiomap/preflight` | Coverage request | Grid dimensions, AP–cell count, budgets, and corrections |
+| POST   | `/api/simulation-jobs/csi` | CSI run request, optional UUID query `jobId` | Job status (202) |
+| POST   | `/api/simulation-jobs/coverage` | Coverage request, optional UUID query `jobId` | Job status (202) |
+| GET    | `/api/simulation-jobs/{jobId}` | — | Job status, stage, and completed result |
+| DELETE | `/api/simulation-jobs/{jobId}` | — | Current job status after requesting cancellation |
 | POST   | `/api/mobility` | `{txs, rx, buildings, waypoints, freqGhz, speedKmh, maxDepth, options, combineMode, handover}` | `{steps, execution, handover}` |
-| POST   | `/api/csi-runs` | `{mode, output, txs, rxs, buildings, freqGhz, options, numSubcarriers, subcarrierSpacing, normalizeDelays, …}` | CSI run summary with `runId` |
-| GET    | `/api/csi-runs/{runId}/preview` | Query `txId`, `rxId`, and `sampleIndex` (default 0) | Cached rays, metrics, and channel frequency curve |
-| POST   | `/api/csi-runs/{runId}/export` | `{fronthaulMbpsByTxId}` | ZIP with `csi.npz` and `manifest.json` |
+| POST   | `/api/csi-runs` | Solver settings and optional `projectId` and `fronthaulMbpsByTxId` | CSI run summary with `runId` |
+| GET    | `/api/projects/{projectId}/csi-runs` | — | Run summaries, newest first |
+| GET    | `/api/projects/{projectId}/csi-runs/{runId}` | — | Run, scene and device snapshot, and archived fronthaul |
+| GET    | `/api/csi-runs/{runId}/preview` | Query `txId`, `rxId`, `sampleIndex` (default 0), and optional `projectId` | Stored rays, metrics, and channel frequency curve |
+| POST   | `/api/csi-runs/{runId}/export` | Query `projectId` (optional), body `{}` or `{fronthaulMbpsByTxId}` | CSI replay ZIP |
 | POST   | `/api/cir`      | one/all Tx/Rx + optional OFDM grid + output format           | raw CIR or CIR/CFR `.npz`; single-link CSV |
 | POST   | `/api/cir-bundle` | heterogeneous Tx/Rx arrays + raw-CIR options                | ZIP with per-pair NPZ + manifest |
 | POST   | `/api/linkkpi`  | link request + OFDM grid + noise figure                     | Shannon-capacity KPIs    |
@@ -58,9 +66,14 @@ Sionna scene build, no network:
 | POST   | `/api/channel-grid` | Tx/Rx arrays + receiver cells + OFDM grid               | ray-traced MIMO CFR `.npz` |
 | POST   | `/api/scene-export` | buildings + optional devices + OFDM grid                | ZIP: `scene.xml`, `meshes/*.ply`, `load_scene.py`, manifest |
 
+See [procedural buildings](../docs/scene-package.md#参数化建筑--procedural-buildings) for an example of calling the generator from a script or an agent.
+
 `/api/csi-runs` accepts `mode="static"` for every selected AP and UE, or
-`mode="trajectory"` for one UE and up to 100 `waypoints` with matching
-`timeSeconds`. Trajectory times start at zero and increase strictly. Both modes
+`mode="trajectory"` for one UE and up to 100 `waypoints`. Supply matching
+`timeSeconds` that start at zero and increase strictly, or set
+`deriveTimeFromSpeed: true` and supply a positive `speedKmh` to time the
+trajectory using the resolved 3D distances. CSI velocities use the same
+resolved coordinates and elapsed times. Both modes
 use one `PathSolver` dispatch for rays, link metrics, and unprecoded complex
 channel data. The trajectory axis describes independent geometric snapshots.
 Each side needs uniform antenna array sizes for the dense tensor. For static
@@ -81,13 +94,48 @@ in Hz from the stored `frequencies` axis. The Preview curve shows
 `10 log10(mean(|H|²))` across antenna ports at up to 256 sampled subcarriers.
 `null` marks zero magnitude on that curve.
 
-The two most recent runs remain available until eviction or server shutdown.
-Before compression, CIR + CFR is limited to 256 MiB and CIR-only is limited
-to 512 MiB. CIR-only preview evaluates sampled frequency responses in blocks.
-The nominal dense CFR size does not count toward the CIR output limit. Export copies the exact
-stored NPZ and writes the supplied per-AP fronthaul capacity into the manifest.
-Use `null` for an unset capacity or `0` for an explicit zero. The export call
-does not acquire the solver lock or trace any additional paths.
+Set `cellsAreSampled: true` on `/api/channel-grid` when `cells` contains
+only the sampled centers returned by a coverage run. This retraces those
+exact positions, including floor samples outside the terrain mesh. By
+default, an unfiltered grid uses the terrain mask.
+
+CSI and coverage jobs run in submission order and share the solver lock with
+synchronous requests. Poll the returned `jobId` for its status, including
+`queuePosition` while queued and `stage` while running. After a submission
+timeout, reuse the same client-generated UUID and identical request to recover
+the accepted job. The server returns 409 when that ID belongs to a different
+request and 429 when eight jobs are already waiting. To retry a failed or
+cancelled run, submit its inputs with a new job ID.
+
+A queued job cancels immediately. A running job reports `cancelling` until
+it reaches a safe stopping point, which may require waiting for a native
+ray-tracing call to finish. Once `canCancel` is false, an atomic CSI
+publication may already be in progress. Cancelled jobs have a null result
+and leave no CSI record in project history. The running backend retains up
+to 16 finished jobs, with up to two coverage grids. Archived CSI runs can
+still be opened using their `runId` and `projectId`.
+
+Supply a UUID `projectId` at creation to keep the run across restarts. History,
+preview, and export use the same project ID. Legacy requests that omit it use
+a transient cache of two runs for the life of the server process.
+
+Records are stored under `SionnaRTStudio/csi-runs/<projectId>/<runId>` in
+`~/Library/Application Support` on macOS, `%LOCALAPPDATA%` on Windows, or
+`${XDG_DATA_HOME:-~/.local/share}` on Linux. Set `SRTS_RUNS_DIR` to override
+the CSI history root.
+
+Before compression, CIR + CFR is limited to 256 MiB. The CIR-only limit of
+512 MiB counts the CIR data. CIR-only preview evaluates sampled frequency
+responses in blocks.
+Preview and export read the stored result. Export with `{}` to use the archived
+per-AP fronthaul capacity. Supply `fronthaulMbpsByTxId` to update the ZIP
+manifest. Use `null` for an unset capacity or `0` for an explicit zero.
+
+The ZIP includes the original `csi.npz`, a manifest with SHA-256 checksums,
+`request.json` with resolved positions and velocities, and the solver's
+`scene.xml` and PLY meshes. On a machine with the bundled dependency versions
+and a usable Mitsuba backend, extract the ZIP and run `python replay_csi.py`
+in that directory. It verifies the files and writes `csi-replay.npz` offline.
 
 `options` selects the ray interaction types and both scene arrays.
 

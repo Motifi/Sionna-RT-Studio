@@ -20,13 +20,14 @@ interface TopNavProps {
   onReplaceUnreadableAutosave?: () => void;
   recoveryError?: string;
   projectState: StudioProjectState;
+  projectId: string;
   onImportProject: (text: string) => void;
   onResetProject: () => void;
 }
 
 export function TopNav({
   health, autosaveStatus, onRetryAutosave, onReplaceUnreadableAutosave, recoveryError,
-  projectState, onImportProject, onResetProject,
+  projectState, projectId, onImportProject, onResetProject,
 }: TopNavProps) {
   const { t, locale, setLocale } = useI18n();
   const projectMenu = useRef<HTMLDetailsElement>(null);
@@ -56,7 +57,7 @@ export function TopNav({
   const saveProjectFile = () => {
     try {
       downloadFile(
-        `${JSON.stringify(createProjectDocument(projectState), null, 2)}\n`,
+        `${JSON.stringify(createProjectDocument(projectState, projectId), null, 2)}\n`,
         'sionna_rt_studio_project.json',
         'application/json',
       );
@@ -164,7 +165,12 @@ export function TopNav({
               </div>}
               {health?.activeSolve && <p>{t('Running', '求解中')} · {health.activeSolve.operation}</p>}
               <p>{t('Last solve', '最近一次求解')} · {health?.lastSolve
-                ? (health.lastSolve.status === 'succeeded' ? t('Succeeded', '已通过') : t('Failed', '失败'))
+                ? ({
+                    running: t('Running', '求解中'),
+                    succeeded: t('Succeeded', '已通过'),
+                    failed: t('Failed', '失败'),
+                    cancelled: t('Cancelled', '已取消'),
+                  }[health.lastSolve.status])
                 : t('Awaiting a real solve', '等待真实求解验证')}</p>
               {health?.lastSolve && <p className="break-words">
                 {health.lastSolve.operation} · {new Date(health.lastSolve.finishedAt ?? health.lastSolve.startedAt).toLocaleString()}

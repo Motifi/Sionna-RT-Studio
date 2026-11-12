@@ -6,6 +6,8 @@ Core endpoints (camelCase JSON, matching src/types.ts):
   POST /api/radiomap  {tx, buildings, freqGhz, gridSize, gridHeight} -> RadioMapGrid
   POST /api/mobility  {txs, rx, buildings, waypoints, ...} -> {steps, execution}
   POST /api/csi-runs  static or trajectory inputs -> immutable CSI run summary
+  POST /api/simulation-jobs/{csi|coverage}  -> queued simulation job
+  GET/DELETE /api/simulation-jobs/{jobId}  -> job status or cancellation
   GET  /api/csi-runs/{runId}/preview -> cached link paths and frequency response
   POST /api/csi-runs/{runId}/export  -> saved CSI + current fronthaul metadata
   POST /api/cir       link + OFDM grid -> CIR/CFR file
@@ -14,15 +16,18 @@ Core endpoints (camelCase JSON, matching src/types.ts):
   GET  /api/phyber/{jobId}  poll a running sweep -> progress/result
   POST /api/channel-grid  tx + receiver cells + OFDM grid -> ray-traced CFR file
   POST /api/scene-export  buildings + devices -> standalone Sionna RT scene ZIP
+  POST /api/building-generate  building recipe -> editable floor-tagged meshes
 
 Sionna RT runs on CUDA, Metal, or LLVM. Solves are serialized with a lock
 because the Sionna/Mitsuba runtime is not re-entrant.
 """
 from __future__ import annotations
 
-import io
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from hashlib import sha256
+import io
 import json
 import os
 from pathlib import Path
@@ -32,6 +37,7 @@ import threading
 import time
 import traceback
 from typing import Literal
+from uuid import UUID
 import zipfile
 
 # Homebrew LLVM is keg-only. Configure Dr.Jit before importing Mitsuba so
@@ -94,15 +100,20 @@ print(f"[startup] Ray tracing via {mi.variant()!r}.")
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
+from pydantic_core import to_json
 from starlette.background import BackgroundTask
 from starlette.concurrency import run_in_threadpool
 
+from .building_generator import GeneratedBuilding, generate_building
 from .csi_runs import CsiExportRequest, CsiRun, CsiRunRequest, solve_csi_run
+from .csi_store import ArchivedCsiRun, CsiRunStore, csi_runs_dir
 from .linklevel import compute_link_kpis
 from .linkphy import phy_available, run_pusch_ber_sweep
 from .models import (
     BuildingFootprint,
+    BuildingSpec,
     CIRRequest,
+    CoveragePreflight,
     ChannelGridRequest,
     LinkKpiRequest,
     LinkKpiResponse,
@@ -121,10 +132,16 @@ from .models import (
 from .scene_build import inspect_roofs, inspect_scene
 from .scene_export import scene_export_zip
 from .scene_import import MAX_UPLOAD, import_meshes
+from .scene_package import read_scene_package
+from .simulation_jobs import (
+    JobKind, SimulationCancelled, SimulationJobConflict, SimulationJobContext, SimulationJobQueue,
+    SimulationQueueFull,
+)
 from .solver_runtime import package_version, solver_runtime
 from .version import APP_VERSION
 from .solver import (
     _notebook_tau_shape,
+    preflight_radiomap,
     solve_channel_grid,
     solve_cir,
     solve_link,
@@ -143,29 +160,38 @@ app.add_middleware(
 
 # Sionna/Mitsuba is single-threaded; serialize solves.
 _solve_lock = threading.Lock()
+_simulation_jobs = SimulationJobQueue(_solve_lock)
 _last_solve: dict | None = None
 _active_solve: dict | None = None
 
 
 @contextmanager
-def _solve_operation(operation: str):
+def _track_solve(operation: str):
+    """Record the operation while the caller owns the solver lock."""
     global _last_solve, _active_solve
-    with _solve_lock:
-        started = time.perf_counter()
-        _active_solve = {"operation": operation, "status": "running",
-                         "startedAt": datetime.now(timezone.utc).isoformat()}
-        status, error = "succeeded", None
-        try:
-            yield
-        except Exception as exc:
-            status, error = "failed", str(exc)
-            raise
-        finally:
-            _last_solve = {**_active_solve, "status": status, "error": error,
-                           "finishedAt": datetime.now(timezone.utc).isoformat(),
-                           "durationMs": (time.perf_counter() - started) * 1000}
-            _active_solve = None
+    started = time.perf_counter()
+    _active_solve = {"operation": operation, "status": "running",
+                     "startedAt": datetime.now(timezone.utc).isoformat()}
+    status, error = "succeeded", None
+    try:
+        yield
+    except SimulationCancelled:
+        status = "cancelled"
+        raise
+    except Exception as exc:
+        status, error = "failed", str(exc)
+        raise
+    finally:
+        _last_solve = {**_active_solve, "status": status, "error": error,
+                       "finishedAt": datetime.now(timezone.utc).isoformat(),
+                       "durationMs": (time.perf_counter() - started) * 1000}
+        _active_solve = None
 
+
+@contextmanager
+def _solve_operation(operation: str):
+    with _solve_lock, _track_solve(operation):
+        yield
 
 
 def _solve_error(exc: Exception, label: str) -> HTTPException:
@@ -208,6 +234,11 @@ def api_scene_roofs(buildings: list[BuildingFootprint]) -> list[dict]:
     return inspect_roofs(buildings)
 
 
+@app.post("/api/building-generate", response_model_exclude_none=True)
+def api_generate_building(spec: BuildingSpec) -> GeneratedBuilding:
+    return generate_building(spec)
+
+
 @app.post("/api/mesh-import")
 async def api_mesh_import(request: Request, filename: str = Query(max_length=255),
                           axes: Literal["enu", "y-up"] = "enu",
@@ -224,6 +255,19 @@ async def api_mesh_import(request: Request, filename: str = Query(max_length=255
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/scene-package")
+async def api_scene_package(request: Request) -> dict:
+    payload = bytearray()
+    async for chunk in request.stream():
+        if len(payload) + len(chunk) > MAX_UPLOAD:
+            raise HTTPException(status_code=413, detail="Scene package exceeds 32 MiB.")
+        payload.extend(chunk)
+    try:
+        return await run_in_threadpool(read_scene_package, bytes(payload))
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/solve", response_model=SolveResponse)
 def api_solve(req: SolveRequest) -> SolveResponse:
     try:
@@ -232,6 +276,14 @@ def api_solve(req: SolveRequest) -> SolveResponse:
         return SolveResponse(paths=paths, metrics=metrics)
     except Exception as exc:  # surface a clean error to the UI
         raise _solve_error(exc, "Link solve failed") from exc
+
+
+@app.post("/api/radiomap/preflight", response_model=CoveragePreflight)
+def api_radiomap_preflight(req: RadioMapRequest) -> CoveragePreflight:
+    try:
+        return preflight_radiomap(req)
+    except Exception as exc:
+        raise _solve_error(exc, "Coverage preflight failed") from exc
 
 
 @app.post("/api/radiomap", response_model=RadioMapGrid)
@@ -255,14 +307,26 @@ def api_mobility(req: MobilityRequest) -> MobilityResponse:
         raise _solve_error(exc, "Mobility solve failed") from exc
 
 
-# Small process-local cache. A fetched run owns its temporary file until all
-# concurrent preview and export requests using the record have finished.
+# Requests without a project ID retain the small process-local cache.
 _csi_runs: dict[str, CsiRun] = {}
 _csi_runs_lock = threading.Lock()
 _MAX_CACHED_CSI_RUNS = 2
+_csi_store = CsiRunStore(csi_runs_dir())
 
 
-def _get_csi_run(run_id: str) -> CsiRun:
+def _get_archived_run(project_id: UUID, run_id: str) -> ArchivedCsiRun:
+    try:
+        run = _csi_store.get(project_id, run_id)
+    except (OSError, ValueError) as exc:
+        raise _solve_error(RuntimeError(str(exc)), "CSI history could not be read") from exc
+    if run is None:
+        raise HTTPException(status_code=404, detail="CSI run was not found in this project's local history")
+    return run
+
+
+def _get_csi_run(run_id: str, project_id: UUID | None) -> CsiRun | ArchivedCsiRun:
+    if project_id is not None:
+        return _get_archived_run(project_id, run_id)
     with _csi_runs_lock:
         run = _csi_runs.get(run_id)
     if run is None:
@@ -270,36 +334,138 @@ def _get_csi_run(run_id: str) -> CsiRun:
     return run
 
 
+def _create_csi_run(req: CsiRunRequest, context: SimulationJobContext | None = None) -> dict:
+    checkpoint = context.checkpoint if context else None
+    if req.projectId is not None:
+        try:
+            project_dir = _csi_store.prepare(req.projectId)
+            run = solve_csi_run(req, staging_parent=project_dir, checkpoint=checkpoint)
+            _csi_store.publish(req.projectId, run, checkpoint=checkpoint,
+                               before_publish=context.commit if context else None)
+        except OSError as exc:
+            raise RuntimeError(f"CSI run could not be saved to project history: {exc.strerror or exc}") from exc
+    else:
+        run = solve_csi_run(req, checkpoint=checkpoint)
+        try:
+            if context is not None:
+                context.commit()
+        except SimulationCancelled:
+            run.directory.cleanup()
+            raise
+        with _csi_runs_lock:
+            _csi_runs[run.summary["runId"]] = run
+            if len(_csi_runs) > _MAX_CACHED_CSI_RUNS:
+                _csi_runs.pop(next(iter(_csi_runs)))
+    return run.summary
+
+
 @app.post("/api/csi-runs")
 def api_csi_run(req: CsiRunRequest) -> dict:
     try:
         with _solve_operation("csi"):
-            run = solve_csi_run(req)
-            with _csi_runs_lock:
-                _csi_runs[run.summary["runId"]] = run
-                if len(_csi_runs) > _MAX_CACHED_CSI_RUNS:
-                    _csi_runs.pop(next(iter(_csi_runs)))
+            return _create_csi_run(req)
     except Exception as exc:
         raise _solve_error(exc, "CSI calculation failed") from exc
-    return run.summary
+
+
+def _submit_simulation_job(kind: JobKind, req: CsiRunRequest | RadioMapRequest, job_id: UUID | None,
+                           calculate: Callable[[SimulationJobContext], object]) -> dict:
+    def run(context: SimulationJobContext) -> object:
+        with _track_solve(kind):
+            return calculate(context)
+
+    fingerprint = sha256(req.model_dump_json().encode()).hexdigest() if job_id else None
+    try:
+        return _simulation_jobs.submit(kind, run, job_id=job_id, fingerprint=fingerprint)
+    except SimulationQueueFull as exc:
+        raise HTTPException(status_code=429, detail="Simulation queue is full. Wait for a job to finish or cancel a queued job.") from exc
+    except SimulationJobConflict as exc:
+        raise HTTPException(status_code=409, detail="This job ID already belongs to a different simulation request.") from exc
+
+
+_JOB_RESPONSE_HEADERS = {"Cache-Control": "no-store"}
+
+
+def _encode_simulation_job(job: dict, status_code: int = 200) -> Response:
+    return Response(content=to_json(job), status_code=status_code, media_type="application/json",
+                    headers=_JOB_RESPONSE_HEADERS)
+
+
+@app.post("/api/simulation-jobs/csi", status_code=202)
+def api_start_csi_job(req: CsiRunRequest, jobId: UUID | None = None) -> Response:
+    job = _submit_simulation_job("csi", req, jobId, lambda context: _create_csi_run(req, context))
+    return _encode_simulation_job(job, status_code=202)
+
+
+@app.post("/api/simulation-jobs/coverage", status_code=202)
+def api_start_coverage_job(req: RadioMapRequest, jobId: UUID | None = None) -> Response:
+    def calculate(context: SimulationJobContext) -> RadioMapGrid:
+        result = solve_radiomap(req, checkpoint=context.checkpoint)
+        context.commit()
+        return result
+
+    job = _submit_simulation_job("coverage", req, jobId, calculate)
+    return _encode_simulation_job(job, status_code=202)
+
+
+async def _simulation_job_response(job: dict | None) -> Response:
+    if job is None:
+        raise HTTPException(status_code=404, detail="Simulation job was not found or has expired.",
+                            headers=_JOB_RESPONSE_HEADERS)
+    if job["result"] is None:
+        return _encode_simulation_job(job)
+    # A completed coverage grid may contain 250,000 cells. Encode the entire
+    # body off the event loop so other polls and cancellation remain responsive.
+    return await run_in_threadpool(_encode_simulation_job, job)
+
+
+@app.get("/api/simulation-jobs/{job_id}")
+async def api_simulation_job_status(job_id: UUID) -> Response:
+    return await _simulation_job_response(_simulation_jobs.get(str(job_id)))
+
+
+@app.delete("/api/simulation-jobs/{job_id}")
+async def api_simulation_job_cancel(job_id: UUID) -> Response:
+    return await _simulation_job_response(_simulation_jobs.cancel(str(job_id)))
+
+
+@app.get("/api/projects/{project_id}/csi-runs")
+def api_csi_history(project_id: UUID) -> list[dict]:
+    try:
+        return _csi_store.list(project_id)
+    except (OSError, ValueError) as exc:
+        raise _solve_error(RuntimeError(str(exc)), "CSI history could not be read") from exc
+
+
+@app.get("/api/projects/{project_id}/csi-runs/{run_id}")
+def api_csi_history_detail(project_id: UUID, run_id: str) -> dict:
+    run = _get_archived_run(project_id, run_id)
+    try:
+        return run.detail()
+    except (OSError, ValueError) as exc:
+        raise _solve_error(RuntimeError(str(exc)), "CSI run snapshot could not be read") from exc
 
 
 @app.get("/api/csi-runs/{run_id}/preview")
-def api_csi_preview(run_id: str, txId: str, rxId: str, sampleIndex: int = 0) -> dict:
-    run = _get_csi_run(run_id)
+def api_csi_preview(run_id: str, txId: str, rxId: str, sampleIndex: int = 0,
+                    projectId: UUID | None = None) -> dict:
+    run = _get_csi_run(run_id, projectId)
     try:
         return run.preview(sampleIndex, txId, rxId)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except (OSError, zipfile.BadZipFile, KeyError) as exc:
+        raise _solve_error(exc, "CSI run preview could not be read") from exc
 
 
 @app.post("/api/csi-runs/{run_id}/export")
-def api_csi_export(run_id: str, req: CsiExportRequest) -> FileResponse:
-    run = _get_csi_run(run_id)
+def api_csi_export(run_id: str, req: CsiExportRequest, projectId: UUID | None = None) -> FileResponse:
+    run = _get_csi_run(run_id, projectId)
     directory = TemporaryDirectory(prefix="srts_csi_export_")
     archive = Path(directory.name) / "run.zip"
     try:
-        run.write_export(archive, req.fronthaulMbpsByTxId)
+        fronthaul = req.fronthaulMbpsByTxId if "fronthaulMbpsByTxId" in req.model_fields_set else None
+        run.write_export(archive, fronthaul)
     except Exception as exc:
         directory.cleanup()
         raise _solve_error(exc, "CSI export failed") from exc

@@ -8,7 +8,9 @@ import { Activity, List, RadioTower, Settings2, SlidersHorizontal, Waves } from 
 import { GeoAnchor, Transmitter, Receiver, BuildingFootprint, PropagationPath, RadioMapGrid, ChannelMetrics, MatrixCell, SolverOptions, DEFAULT_SOLVER_OPTIONS, MaterialConfig, CoverageMetric, MobilityCombineMode, TrajectoryPoint, defaultMaterialConfig } from './types';
 import { ColormapName } from './lib/colormaps';
 import { antennaPortCount, FULL_CSI_SIZE_LIMIT, estimateCsiSize } from './lib/csiSize';
+import { isRadioSurface, terrainHeight } from './lib/sceneGeometry';
 import { MeshImportPanel } from './components/MeshImportPanel';
+import { BuildingGeneratorDialog } from './components/BuildingGeneratorDialog';
 import { SceneInspector, SceneObjectList, SceneToolbar } from './components/SceneWorkbench';
 import { physicalSceneInputs, useSceneEditor, withFootprint } from './sceneEditor';
 import { ThreeStudio } from './components/ThreeStudio';
@@ -20,24 +22,27 @@ import { LinkPanel } from './components/LinkPanel';
 import { CoverageLegend, CoveragePanel } from './components/CoveragePanel';
 import { FronthaulControl, RouteControls, TrajectorySimulationControls } from './components/PlanningControls';
 import { CsiPreviewPanel } from './components/CsiPreviewPanel';
+import { CsiHistoryPicker, useCsiHistory } from './components/CsiHistory';
 import { GeographyPanel } from './components/GeographyPanel';
 import { AnalysisPanel } from './components/AnalysisPanel';
 import { ExportPanel } from './components/ExportPanel';
 import { SimulationDownloads } from './components/SimulationDownloads';
 import { DevicePanel } from './components/DevicePanel';
-import type { PlacementMode, ENUVector, SolverRoof } from './types';
+import type { BuildingSpec, PlacementMode, ENUVector, SceneVisual, SolverRoof, CoveragePreflight, CoverageRegion } from './types';
 import { useI18n, type LocalizedText } from './i18n';
 import {
   createIdSuffix,
   latLonToENU,
   enuToLatLon,
   fetchOSMBuildings,
+  getWaypointPosition,
 } from './utils';
-import { ApiRequestError, solveLink, solveRadioMap, readBackendHealth, inspectScene, createCsiRun, inspectCsiLink, readSolverRoofs } from './api';
-import type { BackendHealth, SceneInspection, CsiRun, CsiRunMode, CsiRunOutput, CsiSelection, CsiLinkPreview, HandoverConfig } from './api';
+import { ApiRequestError, solveLink, readCoveragePreflight, readBackendHealth, inspectScene, inspectCsiLink, importScenePackage, readSolverRoofs, generateBuilding } from './api';
+import type { BackendHealth, SceneInspection, CsiRun, CsiRunMode, CsiRunOutput, CsiSelection, CsiLinkPreview, CsiRunRequest, CoverageJobRequest, HandoverConfig } from './api';
 import {
   clearAutosavedProject,
   loadAutosavedProject,
+  newProjectId,
   parseProjectDocument,
   replaceUnreadableAutosave,
   saveAutosavedProject,
@@ -46,7 +51,17 @@ import {
   FutureAutosaveError,
   UnreadableAutosaveError,
 } from './project';
-import type { ProjectAutosaveStatus, StudioWorkspace } from './project';
+import type { ProjectAutosaveStatus, StudioProjectDocument, StudioWorkspace } from './project';
+import { STARTER_ANCHOR, STARTER_AP, STARTER_BUILDINGS, STARTER_ROUTE, STARTER_UE } from './starterScene';
+import { URBAN_DEMO, urbanDeployment } from './urbanDemo';
+import { deviceAtRunPosition, sampleTrajectory, trajectorySampling } from './lib/trajectory';
+import { compareCoverage, type CoverageSnapshot } from './lib/coverageComparison';
+import { startCsiJob, startCoverageJob, type SimulationJob } from './lib/simulationJobs';
+import { useSimulationTask } from './lib/useSimulationTask';
+import { ExperimentPresets } from './components/ExperimentPresets';
+import { SimulationJobStatus } from './components/SimulationJobStatus';
+import { starterExperiment, type ExperimentPreset } from './lib/experimentPresets';
+import type { WaypointFrame } from './types';
 
 const EMPTY_METRICS: ChannelMetrics = {
   totalRxPowerDbm: -200,
@@ -60,6 +75,18 @@ const EMPTY_METRICS: ChannelMetrics = {
 
 const EMPTY_TRACK: TrajectoryPoint[] = [];
 const EMPTY_PATHS: PropagationPath[] = [];
+type CoverageSceneSnapshot = CoverageSnapshot & {
+  anchor: GeoAnchor;
+  scene: {
+    buildings: BuildingFootprint[];
+    txs: Transmitter[];
+    rxs: Receiver[];
+    visual?: SceneVisual;
+    name?: string;
+    roofs?: SolverRoof[];
+  };
+};
+
 type SimulationTask = 'csi' | 'coverage' | 'diagnostics';
 type CompactDock = 'objects' | 'inspector' | 'closed';
 
@@ -69,161 +96,17 @@ const SIMULATION_TASKS = [
   { id: 'diagnostics', en: 'Link diagnostics', zh: '链路诊断', icon: Activity },
 ] as const;
 
-function sampleTrajectory(points: TrajectoryPoint[], intervalMs: number, speedKmh: number, absolute: boolean) {
-  const arc = [0];
-  for (let i = 1; i < points.length; i++) {
-    const a = points[i - 1].enu;
-    const b = points[i].enu;
-    arc.push(arc[i - 1] + Math.hypot(b.x - a.x, b.y - a.y, absolute ? b.z - a.z : 0));
-  }
-  const length = arc[arc.length - 1];
-  const speed = speedKmh / 3.6;
-  if (length < 1e-6 || speed <= 0 || intervalMs <= 0) return { waypoints: [], timeSeconds: [] };
-  const segments = Math.min(99, Math.max(1, Math.ceil(length / Math.max(speed * intervalMs / 1000, 0.05))));
-  const waypoints: ENUVector[] = [];
-  const timeSeconds: number[] = [];
-  let edge = 1;
-  for (let i = 0; i <= segments; i++) {
-    const distance = length * i / segments;
-    while (edge < arc.length - 1 && arc[edge] < distance) edge++;
-    const fraction = (distance - arc[edge - 1]) / Math.max(arc[edge] - arc[edge - 1], 1e-9);
-    const a = points[edge - 1].enu;
-    const b = points[edge].enu;
-    waypoints.push({ x: a.x + fraction * (b.x - a.x), y: a.y + fraction * (b.y - a.y), z: a.z + fraction * (b.z - a.z) });
-    timeSeconds.push(distance / speed);
-  }
-  return { waypoints, timeSeconds };
-}
-
-const INITIAL_ANCHOR: GeoAnchor = {
-  latitude: 38.9226,
-  longitude: -77.0194, // Howard University, Washington DC
-};
-
 function positionDevice<T extends Transmitter | Receiver>(device: T, enu: ENUVector, anchor: GeoAnchor): T {
   const { lat, lon } = enuToLatLon(enu, anchor);
   return { ...device, enu, latitude: lat, longitude: lon };
 }
 
-function nextDeviceName(devices: (Transmitter | Receiver)[], prefix: 'Tx' | 'Rx') {
+function nextDeviceName(devices: (Transmitter | Receiver)[], prefix: 'AP' | 'UE') {
   const names = new Set(devices.map(device => device.name));
   let index = devices.length + 1;
   while (names.has(`${prefix} ${index}`)) index += 1;
   return `${prefix} ${index}`;
 }
-
-// Lightweight procedural starter scene; replace it with live OSM features for
-// site-specific studies.
-const PRELOADED_BUILDINGS: BuildingFootprint[] = [
-  {
-    id: 'pre_skyscraper_1',
-    points: [],
-    enuPoints: [
-      { x: -60, y: -70, z: 0 },
-      { x: -10, y: -70, z: 0 },
-      { x: -10, y: -20, z: 0 },
-      { x: -60, y: -20, z: 0 },
-    ],
-    height: 46.0,
-    category: 'building',
-    type: 'commercial',
-    material: 'itu_glass',
-  },
-  {
-    id: 'pre_office_2',
-    points: [],
-    enuPoints: [
-      { x: 45, y: -80, z: 0 },
-      { x: 95, y: -80, z: 0 },
-      { x: 95, y: -30, z: 0 },
-      { x: 45, y: -30, z: 0 },
-    ],
-    height: 26.5,
-    category: 'building',
-    type: 'office',
-    material: 'itu_concrete',
-  },
-  {
-    id: 'pre_apartment_3',
-    points: [],
-    enuPoints: [
-      { x: -90, y: 35, z: 0 },
-      { x: -40, y: 35, z: 0 },
-      { x: -40, y: 85, z: 0 },
-      { x: -90, y: 85, z: 0 },
-    ],
-    height: 18.0,
-    category: 'building',
-    type: 'apartments',
-    material: 'itu_brick',
-  },
-  {
-    id: 'pre_skytower_4',
-    points: [],
-    enuPoints: [
-      { x: 40, y: 40, z: 0 },
-      { x: 90, y: 40, z: 0 },
-      { x: 90, y: 90, z: 0 },
-      { x: 40, y: 90, z: 0 },
-    ],
-    height: 54.0,
-    category: 'building',
-    type: 'office',
-    material: 'itu_glass',
-  },
-  {
-    id: 'pre_road_major_1',
-    points: [],
-    enuPoints: [
-      { x: -200, y: -5, z: 0 },
-      { x: 200, y: -5, z: 0 },
-    ],
-    height: 0.1,
-    category: 'infrastructure',
-    type: 'primary',
-    material: 'itu_dry_ground',
-  },
-  {
-    id: 'pre_road_major_2',
-    points: [],
-    enuPoints: [
-      { x: -5, y: -200, z: 0 },
-      { x: -5, y: 200, z: 0 },
-    ],
-    height: 0.1,
-    category: 'infrastructure',
-    type: 'primary',
-    material: 'itu_dry_ground',
-  },
-  {
-    id: 'pre_park_green_1',
-    points: [],
-    enuPoints: [
-      { x: -180, y: 15, z: 0 },
-      { x: -110, y: 15, z: 0 },
-      { x: -110, y: 85, z: 0 },
-      { x: -180, y: 85, z: 0 },
-    ],
-    height: 0.05,
-    category: 'terrain',
-    type: 'park',
-    material: 'itu_dry_ground',
-  },
-  {
-    id: 'pre_park_green_2',
-    points: [],
-    enuPoints: [
-      { x: 110, y: -180, z: 0 },
-      { x: 180, y: -180, z: 0 },
-      { x: 180, y: -110, z: 0 },
-      { x: 110, y: -110, z: 0 },
-    ],
-    height: 0.05,
-    category: 'terrain',
-    type: 'grass',
-    material: 'itu_dry_ground',
-  },
-];
 
 function warnUnsavedProject(event: BeforeUnloadEvent) {
   event.preventDefault();
@@ -232,7 +115,7 @@ function warnUnsavedProject(event: BeforeUnloadEvent) {
 
 export default function App() {
   const { t } = useI18n();
-  const [initialProject, setInitialProject] = useState<StudioProjectState | null | undefined>();
+  const [initialProject, setInitialProject] = useState<StudioProjectDocument | null | undefined>();
   const [loadFailure, setLoadFailure] = useState<'unreadable' | 'future' | 'storage' | null>(null);
   const [loadAttempt, setLoadAttempt] = useState(0);
   const [temporary, setTemporary] = useState(false);
@@ -240,7 +123,7 @@ export default function App() {
   useEffect(() => {
     let current = true;
     loadAutosavedProject().then(project => {
-      if (current) setInitialProject(project?.state ?? null);
+      if (current) setInitialProject(project);
     }).catch(error => {
       if (!current) return;
       console.warn('Could not restore the autosaved SionnaRTStudio project.', error);
@@ -251,7 +134,7 @@ export default function App() {
   }, [loadAttempt]);
 
   if (initialProject !== undefined || temporary) {
-    return <StudioApp initialProject={initialProject ?? null} startTemporary={temporary}
+    return <StudioApp initialProject={initialProject?.state ?? null} initialProjectId={initialProject?.projectId} startTemporary={temporary}
       unreadableAutosave={loadFailure === 'unreadable'} />;
   }
 
@@ -275,15 +158,17 @@ export default function App() {
   );
 }
 
-function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
+function StudioApp({ initialProject, initialProjectId, startTemporary, unreadableAutosave }: {
   initialProject: StudioProjectState | null;
+  initialProjectId?: string;
   startTemporary: boolean;
   unreadableAutosave: boolean;
 }) {
   const { t } = useI18n();
   const [temporary, setTemporary] = useState(startTemporary);
+  const [projectId, setProjectId] = useState(() => initialProjectId ?? newProjectId());
   const [anchor, setAnchor] = useState<GeoAnchor>(
-    () => initialProject?.scene.anchor ?? INITIAL_ANCHOR,
+    () => initialProject?.scene.anchor ?? STARTER_ANCHOR,
   );
   const [mapAnchor, setMapAnchor] = useState(anchor);
 
@@ -291,36 +176,13 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   // The arrays hold every device; `activeTxId`/`activeRxId` mark the one the
   // sliders, map drag and 3D drag currently edit. `tx`/`rx` below are derived
   // from those, so all single-device UI keeps working on the active device.
-  const [txs, setTxs] = useState<Transmitter[]>(() => initialProject?.devices.transmitters ?? [
-    {
-      id: 'tx_1',
-      name: 'Tx 1',
-      latitude: INITIAL_ANCHOR.latitude + 0.0003,
-      longitude: INITIAL_ANCHOR.longitude - 0.0004,
-      height: 12.0,
-      enu: latLonToENU(INITIAL_ANCHOR.latitude + 0.0003, INITIAL_ANCHOR.longitude - 0.0004, INITIAL_ANCHOR),
-      powerDbm: 30,
-      antennaArraySize: [8, 8],
-      beamsteeringAzimuth: 145,
-      beamsteeringElevation: 5,
-    },
-  ]);
-  const [rxs, setRxs] = useState<Receiver[]>(() => initialProject?.devices.receivers ?? [
-    {
-      id: 'rx_1',
-      name: 'Rx 1',
-      latitude: INITIAL_ANCHOR.latitude - 0.0003,
-      longitude: INITIAL_ANCHOR.longitude + 0.0004,
-      height: 1.5,
-      enu: latLonToENU(INITIAL_ANCHOR.latitude - 0.0003, INITIAL_ANCHOR.longitude + 0.0004, INITIAL_ANCHOR),
-      antennaArraySize: [1, 1],
-    },
-  ]);
+  const [txs, setTxs] = useState<Transmitter[]>(() => initialProject?.devices.transmitters ?? [STARTER_AP]);
+  const [rxs, setRxs] = useState<Receiver[]>(() => initialProject?.devices.receivers ?? [STARTER_UE]);
   const [activeTxId, setActiveTxId] = useState(
-    () => initialProject?.devices.activeTxId ?? 'tx_1',
+    () => initialProject?.devices.activeTxId ?? STARTER_AP.id,
   );
   const [activeRxId, setActiveRxId] = useState(
-    () => initialProject?.devices.activeRxId ?? 'rx_1',
+    () => initialProject?.devices.activeRxId ?? STARTER_UE.id,
   );
   const [fronthaulMbpsByTxId, setFronthaul] = useState<Record<string, number | null>>(
     () => initialProject?.devices.fronthaulMbpsByTxId ?? {},
@@ -330,8 +192,25 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   const rx = rxs.find((r) => r.id === activeRxId) ?? rxs[0];
 
   const [buildings, setBuildings] = useState<BuildingFootprint[]>(
-    () => initialProject?.scene.buildings ?? PRELOADED_BUILDINGS,
+    () => initialProject?.scene.buildings ?? STARTER_BUILDINGS,
   );
+  const [sceneVisual, setSceneVisual] = useState<SceneVisual | undefined>(() => initialProject?.scene.visual);
+  const [sceneName, setSceneName] = useState<string | undefined>(() => initialProject?.scene.name);
+  const [sceneFloor, setSceneFloor] = useState<string>();
+  const [packageLoading, setPackageLoading] = useState(false);
+  const [presetsOpen, setPresetsOpen] = useState(!initialProject);
+  const [selectedPreset, setSelectedPreset] = useState<ExperimentPreset | null>(null);
+  const [presetMode, setPresetMode] = useState<{ mode: CsiRunMode }>();
+  const [packageError, setPackageError] = useState('');
+  const [buildingDialog, setBuildingDialog] = useState<{ spec: BuildingSpec; editing: boolean }>();
+  const [buildingBusy, setBuildingBusy] = useState(false);
+  const [buildingError, setBuildingError] = useState('');
+  const buildingRequest = useRef(0);
+  const sceneFloors = React.useMemo(() => {
+    const floors = new Set<string>();
+    for (const object of buildings) if (object.floor) floors.add(object.floor);
+    return Array.from(floors).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  }, [buildings]);
   const [freqGhz, setFreqGhz] = useState(
     () => initialProject?.solver.carrierFrequencyGhz ?? 28.0,
   ); // Default to mmWave
@@ -366,6 +245,8 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   const [simulationTask, setSimulationTask] = useState<SimulationTask>(
     () => initialProject?.display.activeMode === 'heatmap' ? 'coverage' : 'csi',
   );
+  const simulationSidebar = useRef<HTMLElement>(null);
+  const simulationScrollPositions = useRef<Partial<Record<SimulationTask, number>>>({});
   const activeMode = simulationTask === 'coverage' ? 'heatmap' : 'link';
   const [visitedDiagnostics, setVisitedDiagnostics] = useState(false);
   const [downloadTask, setDownloadTask] = useState<'coverage' | 'diagnostics' | null>(null);
@@ -383,12 +264,16 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   ); // overlay rays on coverage
 
   // Coverage Map State
-  const [loadingHeatmap, setLoadingHeatmap] = useState(false);
   const [coverageIssue, setCoverageIssue] = useState<LocalizedText | null>(null);
   // Interference-aware coverage controls (Sionna RadioMapSolver rss/sinr).
   const [coverageMetric, setCoverageMetric] = useState<CoverageMetric>(
     () => initialProject?.coverage.metric ?? 'power',
   );
+  const [coverageRegion, setCoverageRegion] = useState<CoverageRegion | null>(() => initialProject?.coverage.region ?? null);
+  const [coverageFloorId, setCoverageFloorId] = useState<string | null>(() => initialProject?.coverage.floorId ?? null);
+  const [coverageThreshold, setCoverageThreshold] = useState<number | null>(() => initialProject?.coverage.thresholdDb ?? null);
+  const [coverageBaseline, setCoverageBaseline] = useState<CoverageSceneSnapshot | null>(null);
+  const [coverageView, setCoverageView] = useState<'baseline' | 'current'>('current');
   const [coverageBandwidthMhz, setCoverageBandwidthMhz] = useState(
     () => initialProject?.coverage.bandwidthMhz ?? 100,
   );
@@ -413,12 +298,14 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     () => initialProject?.solver.materialConfigs ?? {},
   );
   const materialIds = React.useMemo(
-    () => Array.from(new Set(['itu_concrete', ...buildings.filter(b => b.category === 'building').map(b => b.material)])).sort(),
-    [buildings],
+    () => Array.from(new Set(['itu_concrete', ...buildings.filter(isRadioSurface).map(b => b.material),
+      ...Object.keys(materialConfigs)])).sort(),
+    [buildings, materialConfigs],
   );
-  const materialIdsKey = materialIds.join('\u001f');
+  const materialIdsKey = JSON.stringify(materialIds);
   const materialList = React.useMemo<MaterialConfig[]>(
-    () => materialIdsKey.split('\u001f').map(id => materialConfigs[id] ?? defaultMaterialConfig(id)),
+    () => (JSON.parse(materialIdsKey) as string[]).map(id => Object.hasOwn(materialConfigs, id)
+      ? materialConfigs[id] : defaultMaterialConfig(id)),
     [materialIdsKey, materialConfigs],
   );
   const updateMaterial = (cfg: MaterialConfig) => {
@@ -434,10 +321,22 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
 
   // Trajectory points state
   const [trajectoriesByRxId, setTrajectories] = useState<Record<string, TrajectoryPoint[]>>(
-    () => initialProject?.mobility.trajectoriesByRxId ?? {},
+    () => initialProject?.mobility.trajectoriesByRxId ?? { [STARTER_UE.id]: STARTER_ROUTE },
+  );
+  const [waypointFrameByRxId, setWaypointFrames] = useState<Record<string, WaypointFrame>>(
+    () => initialProject?.mobility.waypointFrameByRxId ?? {},
   );
   const trajectoryPoints = Object.hasOwn(trajectoriesByRxId, rx.id) ? trajectoriesByRxId[rx.id] : EMPTY_TRACK;
-  const setTrajectoryPoints = (points: TrajectoryPoint[]) => setTrajectories(prev => ({ ...prev, [rx.id]: points }));
+  const setTrajectoryPoints = (points: TrajectoryPoint[], frame?: WaypointFrame) => {
+    setTrajectories(prev => ({ ...prev, [rx.id]: points }));
+    setWaypointFrames(prev => {
+      if (frame) return { ...prev, [rx.id]: frame };
+      if (!Object.hasOwn(prev, rx.id)) return prev;
+      const next = { ...prev };
+      delete next[rx.id];
+      return next;
+    });
+  };
 
   // PROPAGATION LINK PHYSICS SOLVER — real Sionna RT on the backend, run on demand.
   const [paths, setPaths] = useState<PropagationPath[]>([]);
@@ -582,21 +481,23 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     else handleSelectPair(activeTxId, id);
   };
 
-  const placeDevice = (mode: Exclude<PlacementMode, 'none'>, enu: ENUVector) => {
+  const placeDevice = (mode: Exclude<PlacementMode, 'none'>, enu: ENUVector, absoluteHeight?: number) => {
+    const place = <T extends Receiver | Transmitter>(device: T): T => positionDevice(absoluteHeight === undefined
+      ? device : { ...device, heightReference: 'enu', height: absoluteHeight }, enu, anchor);
     if (mode === 'move-tx' || mode === 'move-rx') {
-      if (mode === 'move-tx') handleTxUpdate(positionDevice(tx, enu, anchor));
-      else handleRxUpdate(positionDevice(rx, enu, anchor));
+      if (mode === 'move-tx') handleTxUpdate(place(tx));
+      else handleRxUpdate(place(rx));
       setPlacementMode('none');
       return;
     }
     const suffix = createIdSuffix();
     if (mode === 'add-tx') {
-      const added = positionDevice({ ...tx, id: `tx_${suffix}`, name: nextDeviceName(txs, 'Tx') }, enu, anchor);
+      const added = place({ ...tx, id: `tx_${suffix}`, name: nextDeviceName(txs, 'AP') });
       setTxs(prev => [...prev, added]);
       setActiveTxId(added.id);
       setDeploymentSelection('tx');
     } else {
-      const added = positionDevice({ ...rx, id: `rx_${suffix}`, name: nextDeviceName(rxs, 'Rx') }, enu, anchor);
+      const added = place({ ...rx, id: `rx_${suffix}`, name: nextDeviceName(rxs, 'UE') });
       setRxs(prev => [...prev, added]);
       setActiveRxId(added.id);
       setDeploymentSelection('rx');
@@ -614,6 +515,7 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     const remaining = rxs.filter((r) => r.id !== id);
     setRxs(remaining);
     setTrajectories(prev => Object.fromEntries(Object.entries(prev).filter(([key]) => key !== id)));
+    setWaypointFrames(prev => Object.fromEntries(Object.entries(prev).filter(([key]) => key !== id)));
     if (activeRxId === id) setActiveRxId(remaining[0].id);
   };
 
@@ -637,7 +539,86 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
 
   const sceneEditRevision = useRef(buildings);
   sceneEditRevision.current = buildings;
-  const editor = useSceneEditor(buildings, anchor, setBuildings, handleAnchorChange, initialProject?.scene.hiddenLayers);
+  const startBuilding = (first: ENUVector, opposite: ENUVector) => {
+    const east = Number(((first.x + opposite.x) / 2).toFixed(2));
+    const north = Number(((first.y + opposite.y) / 2).toFixed(2));
+    const baseZ = Number((terrainHeight({ x: east, y: north }, buildings) ?? 0).toFixed(3));
+    setBuildingError('');
+    setBuildingDialog({ editing: false, spec: {
+      id: `building-${createIdSuffix()}`, name: t('New building', '新建建筑'), east, north, baseZ,
+      length: Number(Math.abs(first.x - opposite.x).toFixed(2)),
+      width: Number(Math.abs(first.y - opposite.y).toFixed(2)), height: 12, rotationDeg: 0, layout: 'office',
+    } });
+  };
+  const editor = useSceneEditor(buildings, anchor, setBuildings, handleAnchorChange, initialProject?.scene.hiddenLayers, startBuilding);
+  const closeBuildingDialog = () => {
+    buildingRequest.current++;
+    setBuildingDialog(undefined);
+    setBuildingBusy(false);
+    setBuildingError('');
+  };
+  const editGeneratedBuilding = (spec: BuildingSpec) => {
+    setBuildingError('');
+    setBuildingDialog({ editing: true, spec });
+  };
+  const removeGeneratedBuilding = (id: string) => {
+    editor.commit(buildings.filter(object => object.buildingSpec?.id !== id));
+    editor.select(null);
+    editor.chooseTool('select');
+    setFocusObject(undefined);
+  };
+  const applyBuilding = async (spec: BuildingSpec) => {
+    if (buildingBusy) return;
+    const request = ++buildingRequest.current;
+    setBuildingBusy(true);
+    setBuildingError('');
+    try {
+      const generated = await generateBuilding(spec);
+      if (request !== buildingRequest.current) return;
+      if (sceneEditRevision.current !== buildings) {
+        setBuildingError('The scene changed. Apply again to use the current scene.');
+        return;
+      }
+      const previous = new Map<string, BuildingFootprint>(buildings
+        .filter(object => object.buildingSpec?.id === spec.id).map(object => [object.id, object]));
+      const otherObjects = buildings.filter(object => object.buildingSpec?.id !== spec.id);
+      const otherIds = new Set(otherObjects.map(object => object.id));
+      if (generated.objects.some(object => otherIds.has(object.id))) {
+        setBuildingError('A generated object ID conflicts with the current scene.');
+        return;
+      }
+      const objects = generated.objects.map(object => {
+        const old = previous.get(object.id);
+        const materialOverride = old?.materialSource === 'manual'
+          ? { material: old.material, materialSource: 'manual' as const } : {};
+        return withFootprint({ ...object, ...materialOverride, buildingSpec: generated.spec }, object.enuPoints, anchor);
+      });
+      const nextFloor = buildingDialog?.editing && objects.some(object => object.floor === sceneFloor) ? sceneFloor : undefined;
+      const selected = objects.find(object => object.id === editor.selected?.id && (!nextFloor || object.floor === nextFloor))
+        ?? objects.find(object => object.type === 'generated_facade' && (!nextFloor || object.floor === nextFloor))
+        ?? objects.find(object => !nextFloor || object.floor === nextFloor);
+      const retainedBindings = sceneVisual?.bindings.filter(binding => !previous.has(binding.id));
+      const replaceVisual = sceneVisual && retainedBindings && retainedBindings.length < sceneVisual.bindings.length;
+      editor.commit([...otherObjects, ...objects], anchor, () => {
+        setSceneFloor(sceneFloor);
+        if (replaceVisual) setSceneVisual(sceneVisual);
+        editor.setHiddenLayers(editor.hiddenLayers);
+      });
+      if (replaceVisual) setSceneVisual(retainedBindings.length ? { ...sceneVisual, bindings: retainedBindings } : undefined);
+      editor.chooseTool('select');
+      editor.setSolverMesh(false);
+      editor.setTop(false);
+      editor.setHiddenLayers(editor.hiddenLayers.filter(layer => layer !== 'building'));
+      editor.select(selected?.id ?? null);
+      setSceneFloor(nextFloor);
+      setFocusObject(selected ? { id: selected.id } : undefined);
+      closeBuildingDialog();
+    } catch (error) {
+      if (request === buildingRequest.current) setBuildingError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (request === buildingRequest.current) setBuildingBusy(false);
+    }
+  };
   const selectedSceneObjectId = editor.selected?.id;
   useEffect(() => {
     if (selectedSceneObjectId) setSceneDock('inspector');
@@ -675,17 +656,34 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     const timer = window.setTimeout(() => {
       inspectScene(inspectionInput.buildings, inspectionInput.freqGhz, inspectionInput.materialList).then(
         result => { if (!cancelled) setInspection({ input: inspectionInput, result }); },
-        error => { if (!cancelled) setInspectionIssue(String(error)); },
+        error => { if (!cancelled) setInspectionIssue(error instanceof Error ? error.message : String(error)); },
       );
     }, 180);
     return () => { cancelled = true; window.clearTimeout(timer); };
   }, [backendOnline, workspace, inspectionInput]);
 
+  const replaceSceneGeometry = (objects: BuildingFootprint[], nextAnchor = anchor, restore?: () => void) => {
+    closeBuildingDialog();
+    editor.commit(objects, nextAnchor, () => {
+      setSceneVisual(sceneVisual);
+      setSceneName(sceneName);
+      setSceneFloor(sceneFloor);
+      setCoverageFloorId(coverageFloorId);
+      restore?.();
+    });
+    setCoverageFloorId(null);
+    setSceneVisual(undefined);
+    setSceneName(undefined);
+    setSceneFloor(undefined);
+  };
+
   const openBlankScene = () => {
     gisRequest.current++;
     setGisLoading(false);
+    setPackageLoading(false);
+    setPackageError('');
     setDownloadProgress(['', '']);
-    editor.commit([]);
+    replaceSceneGeometry([]);
     editor.select(null);
     editor.chooseTool('select');
     editor.setSolverMesh(false);
@@ -693,11 +691,13 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     setFocusObject(undefined);
   };
 
-  const useStarterScene = () => {
+  const useStarterScene = (restore?: () => void) => {
     gisRequest.current++;
     setGisLoading(false);
+    setPackageLoading(false);
+    setPackageError('');
     setDownloadProgress(['', '']);
-    editor.commit(PRELOADED_BUILDINGS.map(object => ({ ...object, source: 'template' })), INITIAL_ANCHOR);
+    replaceSceneGeometry(STARTER_BUILDINGS, STARTER_ANCHOR, restore);
     editor.select(null);
     editor.chooseTool('select');
     editor.setSolverMesh(false);
@@ -716,6 +716,7 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     const object = buildings.find(building => building.id === id);
     if (object) {
       editor.setHiddenLayers(editor.hiddenLayers.filter(layer => layer !== object.category));
+      if (sceneFloor && object.floor && object.floor !== sceneFloor) setSceneFloor(object.floor);
       setFocusObject({ id });
     }
   };
@@ -733,6 +734,8 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   const handleDownloadOSM = async (bounds: L.LatLngBounds) => {
     const request = ++gisRequest.current;
     const selectedAnchor = mapAnchor;
+    setPackageLoading(false);
+    setPackageError('');
     setGisLoading(true);
     setDownloadProgress(['Sending the area query to Overpass…', '正在向 Overpass 查询所选区域…']);
     try {
@@ -769,7 +772,7 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
         setDownloadProgress([`Merged ${added.length} new map features.`, `已合并 ${added.length} 个新地图要素。`]);
         return;
       }
-      editor.commit(loadedBuildings, selectedAnchor);
+      replaceSceneGeometry(loadedBuildings, selectedAnchor);
       editor.select(null);
       editor.chooseTool('select');
       setDownloadProgress([`Imported ${loadedBuildings.length} map features.`, `已导入 ${loadedBuildings.length} 个地图要素。`]);
@@ -808,7 +811,7 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   const [recoveryError, setRecoveryError] = useState<LocalizedText | null>(null);
 
   const projectState = React.useMemo<StudioProjectState>(() => ({
-    scene: { coordinateFrame: 'ENU_m', anchor, buildings, hiddenLayers: editor.hiddenLayers },
+    scene: { coordinateFrame: 'ENU_m', anchor, buildings, hiddenLayers: editor.hiddenLayers, name: sceneName, visual: sceneVisual },
     devices: {
       transmitters: txs,
       receivers: rxs,
@@ -825,6 +828,7 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     },
     coverage: {
       metric: coverageMetric,
+      region: coverageRegion, floorId: coverageFloorId, thresholdDb: coverageThreshold,
       bandwidthMhz: coverageBandwidthMhz,
       noiseFigureDb: coverageNoiseFigureDb,
       heightM: coverageHeight,
@@ -834,6 +838,7 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     },
     mobility: {
       trajectoriesByRxId,
+      waypointFrameByRxId,
       combineMode: mobilityCombineMode,
       handover: handoverConfig,
       speedKmh: mobilitySpeedKmh,
@@ -850,10 +855,10 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
       radioMapVmax: rmVmax,
     },
   }), [
-    anchor, buildings, editor.hiddenLayers, txs, rxs, activeTxId, activeRxId, fronthaulMbpsByTxId, csiSettings, freqGhz, maxDepth,
-    solverOptions, materialConfigs, coverageMetric, coverageBandwidthMhz,
+    anchor, buildings, editor.hiddenLayers, sceneName, sceneVisual, txs, rxs, activeTxId, activeRxId, fronthaulMbpsByTxId, csiSettings, freqGhz, maxDepth,
+    solverOptions, materialConfigs, coverageMetric, coverageRegion, coverageFloorId, coverageThreshold, coverageBandwidthMhz,
     coverageNoiseFigureDb, coverageHeight, coverageRes, coverageSamplesPerTx,
-    radioMapSeed, trajectoriesByRxId, mobilityCombineMode, handoverConfig,
+    radioMapSeed, trajectoriesByRxId, waypointFrameByRxId, mobilityCombineMode, handoverConfig,
     mobilitySpeedKmh, mobilityIntervalMs, workspace, activeMode, showOutlines,
     showRaysOnHeatmap, rmColormap, rmAutoRange, rmVmin, rmVmax,
   ]);
@@ -870,7 +875,7 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     const save = () => {
       if (started || resettingRef.current) return;
       started = true;
-      saveAutosavedProject(projectState).then(() => {
+      saveAutosavedProject(projectState, projectId).then(() => {
         if (!current || resettingRef.current) return;
         lastSavedProject.current = projectState;
         setAutosaveStatus('saved');
@@ -897,7 +902,7 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
       document.removeEventListener('visibilitychange', flushWhenHidden);
       window.removeEventListener('sionna-studio-flush-project', save);
     };
-  }, [projectState, saveAttempt, temporary]);
+  }, [projectState, projectId, saveAttempt, temporary]);
 
   const projectChanged = projectState !== lastSavedProject.current;
   const projectSaveState = autosaveStatus === 'disabled'
@@ -926,7 +931,7 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     document.documentElement.dataset.projectSaveState = 'saving';
     setAutosaveStatus('saving');
     try {
-      const replaced = await replaceUnreadableAutosave(projectState);
+      const replaced = await replaceUnreadableAutosave(projectState, projectId);
       if (!replaced) {
         setRecoveryError(['The local autosave changed. Export this temporary project before reopening Studio.',
           '本地自动存档已变更。请先导出临时项目，再重新打开实验台。']);
@@ -992,21 +997,32 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
 
 
   const handleImportProject = (text: string) => {
-    const imported = parseProjectDocument(text).state;
+    const document = parseProjectDocument(text);
+    const imported = document.state;
+    setProjectId(document.projectId);
+    closeBuildingDialog();
     saveImportedProject();
-    csiRequest.current++;
-    setCsiRunning(null);
+    simulationScrollPositions.current = {};
+    if (simulationSidebar.current) simulationSidebar.current.scrollTop = 0;
+    csiTask.reset();
     setCsiResult(null);
-    setCsiSelection(null);
+    setLiveCsiSelection(null);
+    setHistorySelection(undefined);
+    history.close();
     setCsiIssue(null);
     setCsiReceiverId(null);
     setExpiredRunId(null);
     gisRequest.current++;
     setGisLoading(false);
+    setPackageLoading(false);
+    setPackageError('');
     setDownloadProgress(['', '']);
     setAnchor(imported.scene.anchor);
     setMapAnchor(imported.scene.anchor);
     setBuildings(imported.scene.buildings);
+    setSceneVisual(imported.scene.visual);
+    setSceneName(imported.scene.name);
+    setSceneFloor(undefined);
     editor.reset();
     editor.setSolverMesh(false);
     editor.setTop(false);
@@ -1026,6 +1042,12 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     setSolverOptions(imported.solver.options);
     setMaterialConfigs(imported.solver.materialConfigs);
     setCoverageMetric(imported.coverage.metric);
+    setCoverageRegion(imported.coverage.region ?? null);
+    setCoverageFloorId(imported.coverage.floorId ?? null);
+    setCoverageThreshold(imported.coverage.thresholdDb ?? null);
+    setCoverageBaseline(null);
+    setCoverageView('current');
+    setSelectedPreset(null);
     setCoverageBandwidthMhz(imported.coverage.bandwidthMhz);
     setCoverageNoiseFigureDb(imported.coverage.noiseFigureDb);
     setCoverageHeight(imported.coverage.heightM);
@@ -1033,6 +1055,7 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     setCoverageSamplesPerTx(imported.coverage.samplesPerTx);
     setRadioMapSeed(imported.coverage.seed);
     setTrajectories(imported.mobility.trajectoriesByRxId);
+    setWaypointFrames(imported.mobility.waypointFrameByRxId ?? {});
     setMobilityCombineMode(imported.mobility.combineMode);
     setHandoverConfig(imported.mobility.handover);
     setMobilitySpeedKmh(imported.mobility.speedKmh);
@@ -1053,24 +1076,128 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     setMetrics(EMPTY_METRICS);
     setMatrix({});
     setMatrixRaysVisible(false);
-    coverageRequest.current++;
+    coverageTask.reset();
     setCoverageResult(null);
     setCoverageIssue(null);
-    setLoadingHeatmap(false);
     setSolveError(null);
   };
 
-  const [csiResult, setCsiResult] = useState<{ run: CsiRun; key: string } | null>(null);
+  const restoreExperimentInputs = (before: StudioProjectState) => {
+    setTxs(before.devices.transmitters);
+    setRxs(before.devices.receivers);
+    setActiveTxId(before.devices.activeTxId);
+    setActiveRxId(before.devices.activeRxId);
+    setFronthaul(before.devices.fronthaulMbpsByTxId);
+    setTrajectories(before.mobility.trajectoriesByRxId);
+    setWaypointFrames(before.mobility.waypointFrameByRxId ?? {});
+    setMobilitySpeedKmh(before.mobility.speedKmh);
+    setMobilityIntervalMs(before.mobility.intervalMs);
+    setFreqGhz(before.solver.carrierFrequencyGhz);
+    setMaxDepth(before.solver.maxDepth);
+    setSolverOptions(before.solver.options);
+    setCsiSettings(before.csi);
+    setCoverageMetric(before.coverage.metric);
+    setCoverageHeight(before.coverage.heightM);
+    setCoverageRes(before.coverage.gridStepM);
+    setCoverageSamplesPerTx(before.coverage.samplesPerTx);
+    setCoverageRegion(before.coverage.region ?? null);
+    setCoverageFloorId(before.coverage.floorId ?? null);
+    setCoverageThreshold(before.coverage.thresholdDb ?? null);
+    setSelectedPreset(null);
+  };
+
+  const loadScenePackage = async (file?: File) => {
+    const request = ++gisRequest.current;
+    setGisLoading(false);
+    setDownloadProgress(['', '']);
+    setPackageLoading(true);
+    setPackageError('');
+    try {
+      let source: Blob;
+      if (file) {
+        source = file;
+      } else {
+        const response = await fetch(URBAN_DEMO);
+        if (!response.ok) throw new Error('The bundled urban scene could not be read.');
+        source = await response.blob();
+      }
+      const imported = await importScenePackage(source);
+      if (request !== gisRequest.current) return false;
+      if (sceneEditRevision.current !== buildings) {
+        setPackageError('The scene changed during import. Open the package again.');
+        return false;
+      }
+      const before = latestProjectState.current;
+      const objects = imported.objects.map(object => withFootprint(object, object.enuPoints, imported.anchor));
+      closeBuildingDialog();
+      saveImportedProject();
+      editor.commit(objects, imported.anchor, () => {
+        setSceneName(before.scene.name);
+        setSceneVisual(before.scene.visual);
+        setSceneFloor(sceneFloor);
+        editor.setHiddenLayers(before.scene.hiddenLayers ?? []);
+        setMaterialConfigs(before.solver.materialConfigs);
+        if (!file) restoreExperimentInputs(before);
+        else setCoverageFloorId(before.coverage.floorId ?? null);
+      });
+      setSceneName(imported.name);
+      setSceneVisual(imported.visual);
+      setSceneFloor(undefined);
+      setCoverageFloorId(null);
+      setMaterialConfigs(Object.fromEntries(imported.materials.map(material => [material.id, material])));
+      editor.setHiddenLayers([]);
+      editor.select(null);
+      editor.chooseTool('select');
+      editor.setSolverMesh(false);
+      editor.setTop(false);
+      setSceneDock('objects');
+      setFocusObject(undefined);
+      if (!file) {
+        const { aps, ue, route } = urbanDeployment(imported.anchor);
+        setTxs(aps);
+        setRxs([ue]);
+        setActiveTxId(aps[0].id);
+        setActiveRxId(ue.id);
+        setFronthaul({});
+        setTrajectories({ [ue.id]: route });
+        setWaypointFrames({});
+        setMobilitySpeedKmh(5);
+        setMobilityIntervalMs(500);
+        setFreqGhz(28);
+        setMaxDepth(3);
+        setSolverOptions({ ...DEFAULT_SOLVER_OPTIONS, refraction: true, pathSamplesPerSource: 100_000 });
+        setCsiSettings(DEFAULT_CSI_SETTINGS);
+        setCoverageHeight(1.5);
+        setCoverageRes(8);
+        setCoverageSamplesPerTx(100_000);
+        setCoverageRegion(null);
+        setCoverageThreshold(null);
+      }
+      return true;
+    } catch (error) {
+      if (request === gisRequest.current) setPackageError(error instanceof Error ? error.message : String(error));
+      return false;
+    } finally {
+      if (request === gisRequest.current) setPackageLoading(false);
+    }
+  };
+
+  const [csiResult, setCsiResult] = useState<{ run: CsiRun; key: string; projectId?: string } | null>(null);
+  const history = useCsiHistory(projectId, backendOnline && !temporary);
+  const [historySelection, setHistorySelection] = useState<{ runId: string; selection: CsiSelection }>();
   const [csiOutput, setCsiOutput] = useState<CsiRunOutput>('cir_cfr');
-  const [csiRunning, setCsiRunning] = useState<CsiRunMode | null>(null);
+  const csiTask = useSimulationTask<CsiRunRequest, CsiRun>(startCsiJob);
+  const [submittedCsiMode, setSubmittedCsiMode] = useState<CsiRunMode>('static');
+  const csiRunning = csiTask.busy ? submittedCsiMode : null;
   const [csiIssue, setCsiIssue] = useState<LocalizedText | null>(null);
   const [csiReceiverId, setCsiReceiverId] = useState<string | null>(null);
   const [expiredRunId, setExpiredRunId] = useState<string | null>(null);
-  const [csiSelection, setCsiSelection] = useState<CsiSelection | null>(null);
-  const [csiLink, setCsiLink] = useState<CsiLinkPreview | null>(null);
+  const [liveCsiSelection, setLiveCsiSelection] = useState<CsiSelection | null>(null);
+  const [loadedCsiLink, setLoadedCsiLink] = useState<{
+    runId: string; selection: CsiSelection; link: CsiLinkPreview;
+  } | null>(null);
   const [csiLinkLoading, setCsiLinkLoading] = useState(false);
   const [csiLinkError, setCsiLinkError] = useState('');
-  const csiRequest = useRef(0);
 
   const csiGrid = React.useMemo(() => ({
     numSubcarriers: csiSettings.numSubcarriers,
@@ -1091,24 +1218,37 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     : sharedCsiKey + JSON.stringify([
         rxs.find(device => device.id === rxId),
         Object.hasOwn(trajectoriesByRxId, rxId) ? trajectoriesByRxId[rxId] : EMPTY_TRACK,
-        mobilitySpeedKmh, mobilityIntervalMs, mobilityCombineMode, handoverConfig,
+        waypointFrameByRxId[rxId], mobilitySpeedKmh, mobilityIntervalMs, mobilityCombineMode, handoverConfig,
       ]);
   const currentCsiKey = useRef(keyForCsi);
   currentCsiKey.current = keyForCsi;
-  const csiRun = csiResult?.run ?? null;
-  const csiStale = !!csiResult && csiResult.key !== keyForCsi(csiResult.run.mode, csiResult.run.rxIds[0]);
+  const historicalRun = history.selected?.run;
+  const csiRun = historicalRun ?? csiResult?.run ?? null;
+  const csiProjectId = historicalRun ? projectId : csiResult?.projectId;
+  const csiSelection = React.useMemo(() => {
+    if (!historicalRun) return liveCsiSelection;
+    if (historySelection?.runId === historicalRun.runId) return historySelection.selection;
+    return { txId: historicalRun.txIds[0], rxId: historicalRun.rxIds[0], sampleIndex: 0 };
+  }, [historicalRun, historySelection, liveCsiSelection]);
+  const selectCsiSample = React.useCallback((selection: CsiSelection) => {
+    if (historicalRun) setHistorySelection({ runId: historicalRun.runId, selection });
+    else setLiveCsiSelection(selection);
+  }, [historicalRun]);
+  const csiStale = !historicalRun && !!csiResult && csiResult.key !== keyForCsi(csiResult.run.mode, csiResult.run.rxIds[0]);
   const csiExpired = !!csiRun && csiRun.runId === expiredRunId;
   const currentRunId = csiStale || csiExpired ? null : csiRun?.runId;
 
+  const csiLink = loadedCsiLink && loadedCsiLink.runId === currentRunId && loadedCsiLink.selection === csiSelection
+    ? loadedCsiLink.link : null;
   useEffect(() => {
-    setCsiLink(null);
+    setLoadedCsiLink(null);
     setCsiLinkError('');
     setCsiLinkLoading(false);
     if (!currentRunId || !csiSelection) return;
     let current = true;
     setCsiLinkLoading(true);
-    inspectCsiLink(currentRunId, csiSelection).then(
-      link => { if (current) setCsiLink(link); },
+    inspectCsiLink(currentRunId, csiSelection, csiProjectId).then(
+      link => { if (current) setLoadedCsiLink({ runId: currentRunId, selection: csiSelection, link }); },
       error => {
         if (!current) return;
         if (error instanceof ApiRequestError && error.status === 404) setExpiredRunId(currentRunId);
@@ -1116,7 +1256,7 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
       },
     ).finally(() => { if (current) setCsiLinkLoading(false); });
     return () => { current = false; };
-  }, [currentRunId, csiSelection]);
+  }, [currentRunId, csiSelection, csiProjectId]);
 
   const sameArrays = (devices: (Receiver | Transmitter)[]) =>
     devices.every(device => device.antennaArraySize.every((value, i) => value === devices[0].antennaArraySize[i]));
@@ -1129,10 +1269,15 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   );
   const trajectoryReceiver = rxs.find(device => device.id === csiReceiverId) ?? rx;
   const simulationRoute = Object.hasOwn(trajectoriesByRxId, trajectoryReceiver.id) ? trajectoriesByRxId[trajectoryReceiver.id] : EMPTY_TRACK;
-  const route = React.useMemo(
-    () => sampleTrajectory(simulationRoute, mobilityIntervalMs, mobilitySpeedKmh, trajectoryReceiver.heightReference === 'enu'),
-    [simulationRoute, mobilityIntervalMs, mobilitySpeedKmh, trajectoryReceiver.heightReference],
-  );
+  const routeFrame = Object.hasOwn(waypointFrameByRxId, trajectoryReceiver.id) ? waypointFrameByRxId[trajectoryReceiver.id] : undefined;
+  const route = React.useMemo(() => {
+    const absolute = routeFrame === 'ENU_m' || trajectoryReceiver.heightReference === 'enu';
+    return sampleTrajectory(simulationRoute, mobilityIntervalMs, mobilitySpeedKmh, absolute,
+      absolute ? undefined : point => getWaypointPosition(point, trajectoryReceiver, buildings, solverRoofs));
+  }, [simulationRoute, mobilityIntervalMs, mobilitySpeedKmh, routeFrame, trajectoryReceiver, buildings, solverRoofs]);
+  const trajectoryTimes = !historicalRun && !csiStale && !csiExpired
+    && csiRun?.mode === 'trajectory' && csiRun.rxIds[0] === trajectoryReceiver.id
+    ? csiRun.timeSeconds : route.timeSeconds;
   const txPorts = antennaPortCount(tx.antennaArraySize, solverOptions.txPolarization);
   const rxPorts = antennaPortCount(rx.antennaArraySize, solverOptions.rxPolarization);
   const staticEstimate = txArraysMatch && rxArraysMatch
@@ -1155,88 +1300,115 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     ? t('Draw a route with at least two distinct points for this UE.', '请为这个 UE 绘制至少包含两个不同控制点的轨迹。')
     : tooLargeReason(trajectoryEstimate?.cfrBytes));
 
-  const handleCsiRun = async (mode: CsiRunMode) => {
-    if (csiRunning || (mode === 'static' ? staticDisabledReason : trajectoryDisabledReason)) return;
-    const request = ++csiRequest.current;
+  const handleCsiRun = (mode: CsiRunMode) => {
+    if (csiTask.busy || (mode === 'static' ? staticDisabledReason : trajectoryDisabledReason)) return;
     const receiver = mode === 'trajectory' ? trajectoryReceiver : rx;
     const key = keyForCsi(mode, receiver.id);
-    setCsiRunning(mode);
+    const runProjectId = temporary ? undefined : projectId;
+    history.close();
+    setSubmittedCsiMode(mode);
     setCsiIssue(null);
-    try {
-      const run = await createCsiRun({
-        ...csiCommon, mode, output: csiOutput, rxs: mode === 'static' ? rxs : [receiver],
-        ...(mode === 'trajectory' ? {
-          ...route, speedKmh: mobilitySpeedKmh, combineMode: mobilityCombineMode, handover: handoverConfig,
-        } : {}),
-      });
-      if (request !== csiRequest.current) return;
+    const input: CsiRunRequest = {
+      ...csiCommon, projectId: runProjectId, fronthaulMbpsByTxId: currentFronthaul,
+      mode, output: csiOutput, rxs: mode === 'static' ? rxs : [receiver],
+      ...(mode === 'trajectory' ? {
+        waypoints: route.waypoints, waypointFrame: routeFrame, deriveTimeFromSpeed: true,
+        speedKmh: mobilitySpeedKmh, combineMode: mobilityCombineMode, handover: handoverConfig,
+      } : {}),
+    };
+    void csiTask.run(input, run => {
+      if (runProjectId) history.refresh();
       if (key !== currentCsiKey.current(mode, receiver.id)) {
-        setCsiIssue(['Inputs changed during tracing. Run CSI again with the current settings.', '追踪期间输入已改变，请使用当前配置重新计算 CSI。']);
+        setCsiIssue(runProjectId
+          ? ['Inputs changed during tracing. The completed run is in CSI run history.', '追踪期间输入已改变，已完成的结果可在 CSI 运行历史中查看。']
+          : ['Inputs changed during tracing. Run CSI again with the current settings.', '追踪期间输入已改变，请使用当前配置重新计算 CSI。']);
         return;
       }
-      setCsiResult({ run, key });
+      setCsiResult({ run, key, projectId: runProjectId });
       setExpiredRunId(null);
-      setCsiSelection({ txId: run.txIds.includes(tx.id) ? tx.id : run.txIds[0], rxId: run.rxIds.includes(receiver.id) ? receiver.id : run.rxIds[0], sampleIndex: 0 });
-    } catch (error) {
-      if (request !== csiRequest.current) return;
-      const detail = error instanceof Error ? error.message : String(error);
-      setCsiIssue([`CSI calculation failed (${detail})`, `CSI 计算失败（${detail}）`]);
-    } finally {
-      if (request === csiRequest.current) setCsiRunning(null);
-    }
+      setLiveCsiSelection({ txId: run.txIds.includes(tx.id) ? tx.id : run.txIds[0], rxId: run.rxIds.includes(receiver.id) ? receiver.id : run.rxIds[0], sampleIndex: 0 });
+    });
   };
 
-  const coverageInputs = React.useMemo(() => ({
-    txs, geometryKey, anchor, freqGhz, maxDepth, solverOptions, materialList,
-    coverageMetric, coverageBandwidthMhz, coverageNoiseFigureDb, coverageHeight, coverageRes,
-    coverageSamplesPerTx, radioMapSeed,
+  const coverageInput = React.useMemo<CoverageJobRequest>(() => ({
+    txs, buildings, freqGhz, gridSize: coverageRes, gridHeight: coverageHeight, maxDepth,
+    options: solverOptions, materials: materialList, metric: coverageMetric,
+    bandwidthHz: coverageBandwidthMhz * 1e6, noiseFigureDb: coverageNoiseFigureDb,
+    samplesPerTx: coverageSamplesPerTx, seed: radioMapSeed,
+    region: coverageRegion, floorId: coverageFloorId, coverageThresholdDb: coverageThreshold,
   }), [
-    txs, geometryKey, anchor, freqGhz, maxDepth, solverOptions, materialList,
-    coverageMetric, coverageBandwidthMhz, coverageNoiseFigureDb, coverageHeight, coverageRes,
-    coverageSamplesPerTx, radioMapSeed,
+    txs, buildings, freqGhz, maxDepth, solverOptions, materialList, coverageMetric, coverageBandwidthMhz,
+    coverageNoiseFigureDb, coverageHeight, coverageRes, coverageSamplesPerTx, radioMapSeed,
+    coverageRegion, coverageFloorId, coverageThreshold,
   ]);
-  const currentCoverageInputs = useRef(coverageInputs);
-  currentCoverageInputs.current = coverageInputs;
-  const coverageRequest = useRef(0);
-  const [coverageResult, setCoverageResult] = useState<{ input: typeof coverageInputs; grid: RadioMapGrid } | null>(null);
-  const coverageStale = !!coverageResult && coverageResult.input !== coverageInputs;
-  const radioMap = coverageStale ? null : coverageResult?.grid ?? null;
+  const currentCoverageInput = useRef(coverageInput);
+  currentCoverageInput.current = coverageInput;
+  const coverageTask = useSimulationTask<CoverageJobRequest, RadioMapGrid>(startCoverageJob);
+  const [coverageResult, setCoverageResult] = useState<{ input: CoverageJobRequest; snapshot: CoverageSceneSnapshot } | null>(null);
+  const [coveragePlan, setCoveragePlan] = useState<{ input: CoverageJobRequest; data: CoveragePreflight | null; error?: string }>();
+  const preflightForInput = coveragePlan?.input === coverageInput ? coveragePlan : undefined;
+  const preflight = preflightForInput?.data ?? null;
+  const validCoverageRegion = !coverageRegion || (coverageRegion.minX < coverageRegion.maxX && coverageRegion.minY < coverageRegion.maxY);
+  const coverageSnapshot = coverageResult?.snapshot ?? null;
+  const coverageStale = !!coverageResult && coverageResult.input !== coverageInput;
+  const radioMap = coverageStale ? null : coverageSnapshot?.grid ?? null;
 
-  // Coverage uses RadioMapSolver and the strongest server across all Tx.
-  const handleRunHeatmap = async (resolution: number, height: number, samplesPerTx: number, seed: number) => {
-    if (loadingHeatmap || !backendOnline) return;
-    const request = ++coverageRequest.current;
-    setLoadingHeatmap(true);
-    setCoverageIssue(null);
-    try {
-      const grid = await solveRadioMap(
-        txs, buildings, freqGhz, resolution, height, maxDepth, solverOptions, materialList,
-        {
-          metric: coverageMetric,
-          bandwidthHz: coverageBandwidthMhz * 1e6,
-          noiseFigureDb: coverageNoiseFigureDb,
-          samplesPerTx,
-          seed,
-        },
+  useEffect(() => {
+    if (!backendOnline || workspace !== 'preview' || simulationTask !== 'coverage' || !validCoverageRegion) return;
+    let active = true;
+    const timer = window.setTimeout(() => {
+      readCoveragePreflight(coverageInput).then(
+        data => { if (active) setCoveragePlan({ input: coverageInput, data }); },
+        error => { if (active) setCoveragePlan({ input: coverageInput, data: null, error: error instanceof Error ? error.message : String(error) }); },
       );
-      if (request !== coverageRequest.current) return;
-      if (coverageInputs !== currentCoverageInputs.current) {
-        setCoverageIssue(['Inputs changed during calculation. Run coverage again with the current settings.',
-          '计算期间输入已变化，请用当前设置重新计算覆盖。']);
-        return;
+    }, 180);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [backendOnline, workspace, simulationTask, coverageInput, validCoverageRegion]);
+
+  const handleRunHeatmap = () => {
+    if (coverageTask.busy || !backendOnline || !preflight || preflight.issues.length) return;
+    setCoverageIssue(null);
+    const { buildings: _objects, ...settings } = coverageInput;
+    const provenance = { ...settings, sceneName, anchor };
+    const scene = { buildings, txs, rxs, visual: sceneVisual, name: sceneName, roofs: solverRoofs };
+    void coverageTask.run(coverageInput, grid => {
+      if (currentCoverageInput.current !== coverageInput) {
+        setCoverageIssue(['Inputs changed during calculation. Showing the completed coverage snapshot.',
+          '计算期间输入已变化，当前显示已完成的覆盖快照。']);
       }
-      setCoverageResult({ input: coverageInputs, grid });
-    } catch (error) {
-      if (request !== coverageRequest.current || coverageInputs !== currentCoverageInputs.current) return;
-      const detail = error instanceof Error ? ` (${error.message})` : '';
-      setCoverageIssue([`Coverage map failed${detail}`, `覆盖图求解失败${detail}`]);
-    } finally {
-      if (request === coverageRequest.current) setLoadingHeatmap(false);
+      setCoverageResult({ input: coverageInput, snapshot: { grid, anchor, scene, provenance: { ...provenance, sceneId: grid.sceneId } } });
+      setCoverageView('current');
+    });
+  };
+
+  const comparison = React.useMemo(() => {
+    if (!coverageBaseline || !coverageSnapshot || coverageBaseline === coverageSnapshot) return null;
+    const a = coverageBaseline.anchor;
+    const b = coverageSnapshot.anchor;
+    if (a && b && (a.latitude !== b.latitude || a.longitude !== b.longitude ||
+        a.elevation !== b.elevation || a.verticalDatum !== b.verticalDatum)) return null;
+    const threshold = coverageThreshold ?? coverageSnapshot.grid.stats?.thresholdDb ??
+      (coverageSnapshot.grid.metric === 'sinr' ? 0 : -90);
+    return compareCoverage(coverageBaseline.grid, coverageSnapshot.grid, threshold);
+  }, [coverageBaseline, coverageSnapshot, coverageThreshold]);
+  const shownCoverageSnapshot = (coverageView === 'baseline' ? coverageBaseline : null) ?? coverageSnapshot;
+  const shownCoverageMap = shownCoverageSnapshot?.grid ?? null;
+  const floorForCoverage = shownCoverageMap?.floorId
+    ? shownCoverageSnapshot?.scene.buildings.find(object => object.id === shownCoverageMap.floorId)?.floor : undefined;
+  const coverageRange = comparison?.range;
+  const coverageAutoRange = coverageRange ? false : shownCoverageMap?.metric === 'sinr' || rmAutoRange;
+  const coverageVmin = coverageRange?.min ?? rmVmin;
+  const coverageVmax = coverageRange?.max ?? rmVmax;
+
+  const rememberSimulationScroll = () => {
+    if (workspace === 'preview' && simulationSidebar.current) {
+      simulationScrollPositions.current[simulationTask] = simulationSidebar.current.scrollTop;
     }
   };
 
   const openWorkspace = (next: StudioWorkspace) => {
     if (next === workspace) return;
+    rememberSimulationScroll();
     if (workspace === 'scene') editor.chooseTool('select');
     setPlacementMode('none');
     setDownloadTask(null);
@@ -1244,10 +1416,53 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   };
 
   const openSimulation = (task: SimulationTask, openDownloads = false) => {
+    if (task !== simulationTask) rememberSimulationScroll();
     openWorkspace('preview');
     setSimulationTask(task);
     if (task === 'diagnostics') setVisitedDiagnostics(true);
     setDownloadTask(openDownloads && task !== 'csi' ? task : null);
+  };
+
+  const loadExperimentPreset = async (id: ExperimentPreset) => {
+    history.close();
+    setSelectedPreset(null);
+    if (id === 'trajectory') {
+      if (!await loadScenePackage()) return;
+      setCsiSettings({ ...DEFAULT_CSI_SETTINGS, numSubcarriers: 64, normalizeDelays: false });
+      setPresetMode({ mode: 'trajectory' });
+    } else {
+      const before = latestProjectState.current;
+      useStarterScene(() => {
+        restoreExperimentInputs(before);
+        setMaterialConfigs(before.solver.materialConfigs);
+        editor.setHiddenLayers(before.scene.hiddenLayers ?? []);
+      });
+      const setup = starterExperiment(id);
+      setMaterialConfigs({});
+      editor.setHiddenLayers([]);
+      setTxs([setup.tx]);
+      setRxs([setup.rx]);
+      setActiveTxId(setup.tx.id);
+      setActiveRxId(setup.rx.id);
+      setFronthaul({});
+      setTrajectories({});
+      setWaypointFrames({});
+      setFreqGhz(setup.frequencyGhz);
+      setMaxDepth(setup.maxDepth);
+      setSolverOptions(setup.options);
+      setCsiSettings(setup.csi);
+      setCoverageMetric('power');
+      setCoverageRegion(setup.coverageRegion);
+      setCoverageThreshold(setup.coverageThresholdDb);
+      setCoverageHeight(1.5);
+      setCoverageRes(setup.coverageGridM);
+      setCoverageSamplesPerTx(100_000);
+      setPresetMode({ mode: 'static' });
+    }
+    setCsiOutput('cir_cfr');
+    setCsiReceiverId(null);
+    setSelectedPreset(id);
+    openSimulation(id === 'coverage' ? 'coverage' : 'csi');
   };
 
   const openDeploymentRoute = () => {
@@ -1264,17 +1479,43 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
   const csiPaths = currentRunId ? csiLink?.paths ?? EMPTY_PATHS : EMPTY_PATHS;
   const hasDiagnosticRays = matrixPaths.length > 0 || paths.length > 0;
   const hasSavedRays = hasDiagnosticRays || csiPaths.length > 0;
-  const overlayCsi = showingCoverage && !!radioMap && showRaysOnHeatmap && !hasDiagnosticRays && csiPaths.length > 0;
+  const liveCoverageView = showingCoverage && coverageView === 'current' && !!radioMap;
+  const overlayCsi = !historicalRun && liveCoverageView && showRaysOnHeatmap && !hasDiagnosticRays && csiPaths.length > 0;
   const showingCsiSelection = (showingCsi || overlayCsi) && currentRunId ? csiSelection : null;
   const selectedTrajectorySample = !!showingCsiSelection && csiRun?.mode === 'trajectory';
   const trajectoryView = showingCsi && selectedTrajectorySample;
-  const previewPosition = selectedTrajectorySample && showingCsiSelection
-    ? csiRun?.rxPositions[showingCsiSelection.sampleIndex]?.[0] : undefined;
-  const viewedTx = txs.find(device => device.id === showingCsiSelection?.txId) ?? tx;
-  const viewedRx = rxs.find(device => device.id === showingCsiSelection?.rxId) ?? rx;
+  const previewPositions = selectedTrajectorySample ? csiRun?.rxPositions : undefined;
+  const previewIndex = showingCsiSelection?.sampleIndex ?? 0;
+  const previewPosition = previewPositions?.[previewIndex]?.[0];
+  const nextPosition = previewPositions?.[previewIndex + 1]?.[0];
+  const headingStart = nextPosition ? previewPosition : previewPositions?.[previewIndex - 1]?.[0];
+  const headingEnd = nextPosition ?? previewPosition;
+  const headingEast = headingStart && headingEnd ? headingEnd[0] - headingStart[0] : 0;
+  const headingNorth = headingStart && headingEnd ? headingEnd[1] - headingStart[1] : 0;
+  const previewHeading = headingEast || headingNorth ? Math.atan2(headingEast, -headingNorth) : 0;
+  const historicalSnapshot = showingCsi ? history.selected : undefined;
+  const coverageViewport = showingCoverage ? shownCoverageSnapshot : null;
+  const archivedBuildings = React.useMemo(() => historicalSnapshot?.snapshot.buildings
+    .map(object => ({ ...object, points: object.points ?? [] })), [historicalSnapshot]);
+  const viewedAnchor = historicalSnapshot ? historicalSnapshot.snapshot.anchor ?? STARTER_ANCHOR : coverageViewport?.anchor ?? anchor;
+  const positionedRun = showingCsiSelection ? csiRun : null;
+  const inputTxs = historicalSnapshot?.snapshot.txs ?? coverageViewport?.scene.txs ?? txs;
+  const inputRxs = historicalSnapshot?.snapshot.rxs ?? coverageViewport?.scene.rxs ?? rxs;
+  const viewedTxs = React.useMemo(() => positionedRun
+    ? inputTxs.map(device => deviceAtRunPosition(device, positionedRun.txPositions[positionedRun.txIds.indexOf(device.id)]))
+    : inputTxs, [inputTxs, positionedRun]);
+  const viewedRxs = React.useMemo(() => positionedRun
+    ? inputRxs.map(device => deviceAtRunPosition(device, positionedRun.rxPositions[0]?.[positionedRun.rxIds.indexOf(device.id)]))
+    : inputRxs, [inputRxs, positionedRun]);
+  const sampledTrack = React.useMemo(() => positionedRun?.mode === 'trajectory'
+    ? positionedRun.rxPositions.map(([[x, y, z]]) => {
+      const enu = { x, y, z };
+      return { enu, ...enuToLatLon(enu, viewedAnchor) };
+    }) : EMPTY_TRACK, [positionedRun, viewedAnchor]);
+  const viewedTx = viewedTxs.find(device => device.id === (showingCsiSelection?.txId ?? tx.id)) ?? viewedTxs[0];
+  const viewedRx = viewedRxs.find(device => device.id === (showingCsiSelection?.rxId ?? rx.id)) ?? viewedRxs[0];
   const shownPaths = showingCsiSelection ? csiPaths
-    : showingDiagnostics || showingCoverage ? paths : EMPTY_PATHS;
-  const selectedDevice = deploymentSelection === 'tx' ? tx : rx;
+    : showingDiagnostics || liveCoverageView ? paths : EMPTY_PATHS;
   const currentFronthaul = Object.fromEntries(txs.map(({ id }) =>
     [id, Object.hasOwn(fronthaulMbpsByTxId, id) ? fronthaulMbpsByTxId[id] : null]));
   const downloadProps = { tx, rx, txs, rxs, buildings, paths, radioMap, freqGhz, maxDepth, solverOptions,
@@ -1296,29 +1537,64 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
     </div>
   );
 
-  const simulationSidebar = useRef<HTMLElement>(null);
   useLayoutEffect(() => {
-    simulationSidebar.current?.scrollTo({ top: 0 });
-  }, [simulationTask]);
+    if (previewing && simulationSidebar.current) {
+      simulationSidebar.current.scrollTop = simulationScrollPositions.current[simulationTask] ?? 0;
+    }
+  }, [previewing, simulationTask]);
+
+  const renderTaskStatus = (task: {
+    job: SimulationJob<unknown> | null;
+    cancel: () => void;
+    retry: () => void;
+    canRetry: boolean;
+    reconnecting: boolean;
+    error: string;
+  }) => (
+    <>
+      <SimulationJobStatus job={task.job} onCancel={task.cancel} onRetry={task.canRetry ? task.retry : undefined} />
+      {task.reconnecting && <p role="status" className="text-xs text-slate-600">
+        {t('Reconnecting to the same task…', '正在重新连接同一个任务…')}
+      </p>}
+      {task.error && <div role="alert" className="space-y-1 text-xs text-red-700">
+        <p>{task.error}</p>
+        {task.canRetry && <button type="button" onClick={task.retry} className="underline">
+          {t('Retry with the same inputs', '使用相同输入重试')}
+        </button>}
+      </div>}
+    </>
+  );
 
   return (
     <div id="sionna-rt-studio-app-frame" className="studio-frame text-[var(--text-hi)]">
       <TopNav health={health} autosaveStatus={autosaveStatus} onRetryAutosave={retryAutosave}
-        projectState={projectState} onImportProject={handleImportProject} onResetProject={handleResetProject}
+        projectState={projectState} projectId={projectId} onImportProject={handleImportProject} onResetProject={handleResetProject}
         onReplaceUnreadableAutosave={unreadableAutosave ? handleReplaceUnreadableAutosave : undefined}
         recoveryError={recoveryError ? t(...recoveryError) : undefined} />
       <main className="studio-main" data-workspace={workspace} data-dock={activeDock}>
         {editingScene && <>
           <div className="studio-toolbar">
             <SceneToolbar editor={editor} onOpenBlank={openBlankScene} onUseStarter={useStarterScene}
+              onUseUrbanDemo={() => void loadScenePackage()} onOpenExperiments={() => {
+                setPresetsOpen(true);
+                openSimulation('csi');
+              }} onImportPackage={file => void loadScenePackage(file)}
+              packageBusy={packageLoading} packageError={packageError} sceneName={sceneName} sceneObjects={buildings}
+              floors={sceneFloors} sceneFloor={sceneFloors.includes(sceneFloor ?? '') ? sceneFloor : undefined}
+              onSelectFloor={setSceneFloor}
               compactControls={compactControls} onToggleInspection={toggleSceneInspection}
               osmImport={<MapSelector anchor={mapAnchor} setAnchor={setMapAnchor} onDownloadOSM={handleDownloadOSM}
                 mode={osmMode} onModeChange={setOsmMode} isLoading={gisLoading} downloadProgress={downloadProgress} />}
               meshImport={<MeshImportPanel online={backendOnline} onImport={(objects, replace) => {
                 if (!replace && objects.length === 0) return;
+                gisRequest.current++;
+                setGisLoading(false);
+                setPackageLoading(false);
+                setPackageError('');
                 const imported = objects.map(object => withFootprint(object, object.enuPoints, anchor));
                 saveImportedProject();
-                editor.commit(replace ? imported : [...buildings, ...imported]);
+                if (replace) replaceSceneGeometry(imported);
+                else editor.commit([...buildings, ...imported]);
                 selectSceneObject(imported[0]?.id ?? null);
               }} />} />
           </div>
@@ -1330,7 +1606,8 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
               inspectionError={!backendOnline
                 ? t('The solver is offline. Scene editing is available.', '求解器离线，仍可继续编辑场景。')
                 : inspectionIssue}
-              onLocate={locateSceneObject}
+              onLocate={locateSceneObject} onEditGeneratedBuilding={editGeneratedBuilding}
+              onRemoveGeneratedBuilding={removeGeneratedBuilding} materialIds={materialIds}
               materialLibrary={<GeographyPanel materialIds={materialIds} materialConfigs={materialList} onMaterialChange={updateMaterial} />} />
           </aside>
         </>}
@@ -1350,16 +1627,14 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
               onRemoveTx={removeTx} onRemoveRx={removeRx} />
           </aside>
           <aside className="studio-inspector space-y-2" aria-label={t('Selected device properties', '所选设备属性')}>
-            <DeviceRfControls tx={tx} rx={rx} onTxUpdate={handleTxUpdate} onRxUpdate={handleRxUpdate} kind={deploymentSelection} />
-            <p className="px-2 text-xs text-slate-600 readout">
-              {t('Position EN (m)', '位置 东 / 北（米）')} · {selectedDevice.enu.x.toFixed(1)} / {selectedDevice.enu.y.toFixed(1)}
-            </p>
+            <DeviceRfControls tx={tx} rx={rx} onTxUpdate={handleTxUpdate} onRxUpdate={handleRxUpdate} kind={deploymentSelection} buildings={buildings} solverRoofs={solverRoofs} />
             {deploymentSelection === 'tx'
               ? <div key={tx.id}>
                   <FronthaulControl value={currentFronthaul[tx.id]} onChange={value =>
                     setFronthaul(prev => ({ ...prev, [tx.id]: value }))} />
                 </div>
-              : <RouteControls tx={tx} rx={rx} anchor={anchor} trajectoryPoints={trajectoryPoints} onTrajectoryChange={setTrajectoryPoints} />}
+              : <RouteControls tx={tx} rx={rx} anchor={anchor} trajectoryPoints={trajectoryPoints}
+                  waypointFrame={Object.hasOwn(waypointFrameByRxId, rx.id) ? waypointFrameByRxId[rx.id] : undefined} onTrajectoryChange={setTrajectoryPoints} />}
           </aside>
         </>}
 
@@ -1373,19 +1648,26 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
                 </button>
               ))}
             </div>
-            <details className="relative ml-auto">
-              <summary id="simulation-settings-trigger" className="studio-tool list-none [&::-webkit-details-marker]:hidden">
-                <Settings2 aria-hidden="true" className="h-4 w-4" />
-                {t('Shared settings', '共享设置')}
-                <span className="readout ml-1 text-xs font-normal text-slate-600">{freqGhz} GHz · {coverageBandwidthMhz} MHz</span>
-              </summary>
-              <div className="absolute right-0 z-20 mt-1 max-h-[65dvh] w-[min(380px,calc(100vw-28px))] overflow-y-auto rounded-xl bg-white shadow-lg">
-                <SolverControls freqGhz={freqGhz} setFreqGhz={setFreqGhz} maxDepth={maxDepth} setMaxDepth={setMaxDepth}
-                  solverOptions={solverOptions} setSolverOptions={setSolverOptions}
-                  bandwidthMhz={coverageBandwidthMhz} onBandwidthChange={setCoverageBandwidthMhz}
-                  noiseFigureDb={coverageNoiseFigureDb} onNoiseFigureChange={setCoverageNoiseFigureDb} />
-              </div>
-            </details>
+            {showingCsi && historicalRun ? (
+              <p id="csi-history-radio-settings" className="ml-auto readout text-xs text-slate-600">
+                {t('Saved settings', '归档设置')} · {historicalRun.carrierFrequencyGhz} GHz
+                {historicalRun.systemBandwidthMhz != null && ` · ${historicalRun.systemBandwidthMhz} MHz`}
+              </p>
+            ) : (
+              <details className="relative ml-auto">
+                <summary id="simulation-settings-trigger" className="studio-tool list-none [&::-webkit-details-marker]:hidden">
+                  <Settings2 aria-hidden="true" className="h-4 w-4" />
+                  {t('Shared settings', '共享设置')}
+                  <span className="readout ml-1 text-xs font-normal text-slate-600">{freqGhz} GHz · {coverageBandwidthMhz} MHz</span>
+                </summary>
+                <div className="absolute right-0 z-20 mt-1 max-h-[65dvh] w-[min(380px,calc(100vw-28px))] overflow-y-auto rounded-xl bg-white shadow-lg">
+                  <SolverControls freqGhz={freqGhz} setFreqGhz={setFreqGhz} maxDepth={maxDepth} setMaxDepth={setMaxDepth}
+                    solverOptions={solverOptions} setSolverOptions={setSolverOptions}
+                    bandwidthMhz={coverageBandwidthMhz} onBandwidthChange={setCoverageBandwidthMhz}
+                    noiseFigureDb={coverageNoiseFigureDb} onNoiseFigureChange={setCoverageNoiseFigureDb} />
+                </div>
+              </details>
+            )}
           </div>
         )}
 
@@ -1394,12 +1676,18 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
             sceneEditor={editingScene ? editor : undefined}
             onSelectSceneObject={selectSceneObject} focusObject={editingScene ? focusObject : undefined}
             physicalMeshes={editingScene && editor.solverMesh ? currentInspection?.meshes : undefined}
-            solverRoofs={solverRoofs}
-            buildings={buildings} anchor={anchor} tx={viewedTx} rx={viewedRx} txs={txs} rxs={rxs}
-            activeTxId={viewedTx.id} activeRxId={viewedRx.id}
-            paths={shownPaths} matrixPaths={showingDiagnostics || showingCoverage ? matrixPaths : undefined}
-            showRaysOnHeatmap={showRaysOnHeatmap} radioMap={showingCoverage ? radioMap : null}
-            rmColormap={rmColormap} rmAutoRange={rmAutoRange} rmVmin={rmVmin} rmVmax={rmVmax}
+            solverCheck={editingScene && editor.solverMesh}
+            solverObjects={editingScene && editor.solverMesh ? currentInspection?.objects : undefined}
+            sceneName={historicalSnapshot ? t('Saved CSI scene', 'CSI 运行快照') : coverageViewport ? coverageViewport.scene.name : sceneName}
+            sceneVisual={historicalSnapshot ? undefined : coverageViewport ? coverageViewport.scene.visual : sceneVisual}
+            sceneFloor={showingCoverage && floorForCoverage ? floorForCoverage
+              : !historicalSnapshot && sceneFloors.includes(sceneFloor ?? '') ? sceneFloor : undefined}
+            solverRoofs={historicalSnapshot ? undefined : coverageViewport ? coverageViewport.scene.roofs : solverRoofs}
+            buildings={archivedBuildings ?? coverageViewport?.scene.buildings ?? buildings} anchor={viewedAnchor}
+            tx={viewedTx} rx={viewedRx} txs={viewedTxs} rxs={viewedRxs}
+            paths={shownPaths} matrixPaths={showingDiagnostics || liveCoverageView ? matrixPaths : undefined}
+            showRaysOnHeatmap={showRaysOnHeatmap && liveCoverageView} radioMap={showingCoverage ? shownCoverageMap : null}
+            rmColormap={rmColormap} rmAutoRange={coverageAutoRange} rmVmin={coverageVmin} rmVmax={coverageVmax}
             onPlaceDevice={placeDevice} onSelectDevice={selectDevice} deploymentSelection={deploymentSelection}
             editing={deploying} visible={workspace !== 'export'}
             showDevices={!editingScene || showSceneDevices} onToggleSceneDevices={() => setShowSceneDevices(visible => !visible)}
@@ -1407,23 +1695,31 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
             placementMode={deploying ? placementMode : 'none'} setPlacementMode={startPlacement}
             showOutlines={showOutlines} setShowOutlines={setShowOutlines}
             mobilityRxPosition={previewPosition ? { x: previewPosition[0], y: previewPosition[1], z: previewPosition[2] } : null}
-            trajectoryPoints={deploying || trajectoryView
-              ? (Object.hasOwn(trajectoriesByRxId, viewedRx.id) ? trajectoriesByRxId[viewedRx.id] : EMPTY_TRACK) : EMPTY_TRACK}
+            mobilityRxHeading={previewHeading}
+            trajectoryPoints={trajectoryView ? sampledTrack : deploying ? trajectoryPoints : EMPTY_TRACK}
+            waypointFrame={trajectoryView ? 'ENU_m'
+              : Object.hasOwn(waypointFrameByRxId, viewedRx.id) ? waypointFrameByRxId[viewedRx.id] : undefined}
             setTrajectoryPoints={setTrajectoryPoints}
           />
-          {showingCoverage && radioMap && (
+          {showingCoverage && shownCoverageMap && (
             <div className="pointer-events-none absolute bottom-2 right-2 z-10">
-              <CoverageLegend radioMap={radioMap} colormap={rmColormap} autoRange={rmAutoRange} vmin={rmVmin} vmax={rmVmax} />
+              <CoverageLegend radioMap={shownCoverageMap} colormap={rmColormap} autoRange={coverageAutoRange} vmin={coverageVmin} vmax={coverageVmax} />
             </div>
           )}
         </section>
 
         <aside ref={simulationSidebar} className="studio-results" hidden={!previewing}
           aria-label={t('Simulation controls and results', '仿真设置与结果')}>
+          {simulationTask !== 'diagnostics' && <ExperimentPresets open={presetsOpen} setOpen={setPresetsOpen}
+            selected={selectedPreset} busy={packageLoading} disabled={!backendOnline} error={packageError}
+            onLoad={id => void loadExperimentPreset(id)} />}
           <div hidden={simulationTask !== 'csi'}>
+            {!temporary && <CsiHistoryPicker history={history} id="select-csi-history" online={backendOnline} />}
             <CsiPreviewPanel
-              run={csiRun} stale={csiStale} expired={csiExpired} running={csiRunning} active={showingCsi}
+              run={csiRun} stale={csiStale} expired={csiExpired} running={csiRunning} active={showingCsi} historical={!!historicalRun}
               error={csiIssue ? t(...csiIssue) : ''}
+              presetMode={presetMode} jobStatus={renderTaskStatus(csiTask)}
+              sampling={trajectorySampling(trajectoryTimes, mobilityIntervalMs)}
               staticDisabledReason={staticDisabledReason} trajectoryDisabledReason={trajectoryDisabledReason}
               mixedArrays={{ static: !txArraysMatch || !rxArraysMatch, trajectory: !txArraysMatch }}
               staticEstimate={staticEstimate} trajectoryEstimate={trajectoryEstimate}
@@ -1446,7 +1742,7 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
                 setCsiOutput(output);
                 setCsiIssue(null);
               }}
-              onRun={handleCsiRun} selection={csiSelection} onSelect={setCsiSelection}
+              onRun={handleCsiRun} selection={csiSelection} onSelect={selectCsiSample}
               link={csiLink} linkLoading={csiLinkLoading} linkError={csiLinkError}
               onOpenTrajectory={route.waypoints.length < 2 ? openDeploymentRoute : undefined}
               onOpenDiagnostics={() => openSimulation('diagnostics', true)}
@@ -1456,14 +1752,27 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
           <div hidden={simulationTask !== 'coverage'} className="space-y-2">
             <CoveragePanel
               txCount={txs.length} backendOnline={backendOnline}
-              onRunHeatmap={handleRunHeatmap} heatmapLoading={loadingHeatmap} radioMap={radioMap} stale={coverageStale}
-              coverageMetric={coverageMetric} setCoverageMetric={setCoverageMetric}
+              onRunHeatmap={handleRunHeatmap} heatmapLoading={coverageTask.busy} radioMap={shownCoverageMap} stale={coverageStale}
+              buildings={buildings} coverageRegion={coverageRegion} setCoverageRegion={setCoverageRegion}
+              coverageFloorId={coverageFloorId} setCoverageFloorId={setCoverageFloorId}
+              coverageThreshold={coverageThreshold} setCoverageThreshold={setCoverageThreshold}
+              preflight={preflight} preflightLoading={backendOnline && validCoverageRegion && !preflightForInput} preflightError={preflightForInput?.error}
+              coverageSnapshot={coverageSnapshot} coverageBaseline={coverageBaseline} setCoverageBaseline={next => {
+                setCoverageBaseline(next === coverageSnapshot ? coverageSnapshot : null);
+                setCoverageView('current');
+              }}
+              coverageComparison={comparison} coverageView={coverageView} setCoverageView={setCoverageView}
+              jobStatus={renderTaskStatus(coverageTask)}
+              coverageMetric={coverageMetric} setCoverageMetric={metric => {
+                setCoverageMetric(metric);
+                setCoverageThreshold(null);
+              }}
               coverageBandwidthMhz={coverageBandwidthMhz} coverageNoiseFigureDb={coverageNoiseFigureDb}
               coverageHeight={coverageHeight} setCoverageHeight={setCoverageHeight}
               coverageRes={coverageRes} setCoverageRes={setCoverageRes}
               samplesPerTx={coverageSamplesPerTx} setSamplesPerTx={setCoverageSamplesPerTx}
               radioMapSeed={radioMapSeed} setRadioMapSeed={setRadioMapSeed}
-              showRaysOnHeatmap={showRaysOnHeatmap} setShowRaysOnHeatmap={setShowRaysOnHeatmap} hasSavedRays={hasSavedRays}
+              showRaysOnHeatmap={showRaysOnHeatmap} setShowRaysOnHeatmap={setShowRaysOnHeatmap} hasSavedRays={liveCoverageView && hasSavedRays}
               rmColormap={rmColormap} setRmColormap={setRmColormap}
               rmAutoRange={rmAutoRange} setRmAutoRange={setRmAutoRange}
               rmVmin={rmVmin} setRmVmin={setRmVmin} rmVmax={rmVmax} setRmVmax={setRmVmax}
@@ -1493,12 +1802,17 @@ function StudioApp({ initialProject, startTemporary, unreadableAutosave }: {
 
         <section className="studio-export" hidden={workspace !== 'export'}>
           <ExportPanel {...downloadProps} anchor={anchor}
+            historyPicker={!temporary && <CsiHistoryPicker history={history} id="select-export-csi-history" online={backendOnline} />}
+            csiProjectId={csiProjectId} historical={!!historicalRun}
             csiRun={csiRun} csiStale={csiStale} csiExpired={csiExpired} onCsiExpired={setExpiredRunId}
             fronthaulMbpsByTxId={currentFronthaul} onOpenPreview={() => openSimulation('csi')}
             onOpenDiagnostics={() => openSimulation('diagnostics', true)} onOpenCoverage={() => openSimulation('coverage', true)} />
         </section>
       </main>
       <WorkflowNav activeWorkspace={workspace} onSelect={openWorkspace} />
+      {buildingDialog && <BuildingGeneratorDialog
+        initial={buildingDialog.spec} editing={buildingDialog.editing} busy={buildingBusy} error={buildingError}
+        onApply={spec => void applyBuilding(spec)} onCancel={closeBuildingDialog} />}
     </div>
   );
 }
