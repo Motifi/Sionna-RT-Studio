@@ -275,13 +275,12 @@ impl Session {
                 .zip(session.origin())
                 .is_some_and(|(url, origin)| is_studio_page(&url, &origin));
             if !on_studio_page || wait_for_project_save(&window) {
-                session.exit(&window);
+                session.exit(&window, 0);
                 return;
             }
             if session.acceptance().is_some() {
                 session.write_acceptance_error("Project did not finish saving before close.");
-                session.approved.store(true, Ordering::Release);
-                window.app_handle().exit(1);
+                session.exit(&window, 1);
                 return;
             }
 
@@ -299,7 +298,7 @@ impl Session {
                 .parent(&window)
                 .show_with_result(move |result| {
                     if discard_requested(&result) {
-                        session.exit(&dialog_window);
+                        thread::spawn(move || session.exit(&dialog_window, 0));
                     } else {
                         session.closing.store(false, Ordering::Release);
                     }
@@ -307,9 +306,10 @@ impl Session {
         });
     }
 
-    fn exit(&self, window: &WebviewWindow) {
+    fn exit(&self, window: &WebviewWindow, code: i32) {
+        self.downloads.finish_saves_before_exit();
         self.approved.store(true, Ordering::Release);
-        window.app_handle().exit(0);
+        window.app_handle().exit(code);
     }
 }
 

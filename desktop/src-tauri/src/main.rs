@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod downloads;
+#[cfg(target_os = "windows")]
+mod instance;
 mod lifecycle;
 mod navigation;
 mod solver;
@@ -25,6 +27,37 @@ type StudioResult<T> = Result<T, Box<dyn Error>>;
 const WINDOW: &str = "studio";
 const ACCEPTANCE_SCRIPT: &str = include_str!("../../tauri_acceptance.js");
 const EXTERNAL_LINK_SCRIPT: &str = include_str!("external_links.js");
+
+#[cfg(target_os = "macos")]
+fn install_quit_menu(app: &tauri::AppHandle) -> StudioResult<()> {
+    use tauri::menu::{Menu, MenuItem, MenuItemKind};
+
+    const QUIT: &str = "studio-quit";
+    let menu = Menu::default(app)?;
+    let Some(MenuItemKind::Submenu(application)) = menu.items()?.into_iter().next() else {
+        return Err("The macOS application menu is missing.".into());
+    };
+    let items = application.items()?;
+    // Tauri's default application menu ends with the native terminate: action.
+    let Some(MenuItemKind::Predefined(native_quit)) = items.last() else {
+        return Err("The macOS Quit item is missing.".into());
+    };
+    let quit = MenuItem::with_id(app, QUIT, native_quit.text()?, true, Some("Cmd+Q"))?;
+    application.remove(native_quit)?;
+    application.append(&quit)?;
+    app.set_menu(menu)?;
+    app.on_menu_event(|app, event| {
+        if event.id() == QUIT {
+            if let (Some(session), Some(window)) = (
+                app.try_state::<Arc<Session>>(),
+                app.get_webview_window(WINDOW),
+            ) {
+                session.inner().request_close(&window);
+            }
+        }
+    });
+    Ok(())
+}
 
 fn acceptance_directory() -> StudioResult<Option<PathBuf>> {
     let mut args = std::env::args_os().skip(1);
@@ -141,11 +174,33 @@ fn main() {
             std::process::exit(2);
         }
     };
+    #[cfg(target_os = "windows")]
+    let _instance = if acceptance.is_none() {
+        match instance::acquire() {
+            Ok(Some(guard)) => Some(guard),
+            Ok(None) => {
+                instance::show_startup_error(
+                    "Sionna RT Studio is already open.\nSionna RT Studio 已打开。",
+                );
+                std::process::exit(1);
+            }
+            Err(error) => {
+                instance::show_startup_error(&format!(
+                    "Could not check for another Studio instance.\n无法检查其他实验台实例。\n\n{error}"
+                ));
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
     let startup_acceptance = acceptance.clone();
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
             let handle = app.handle();
+            #[cfg(target_os = "macos")]
+            install_quit_menu(handle)?;
             let session = Arc::new(Session::new(handle, acceptance)?);
             app.manage(Arc::clone(&session));
             match open_window(handle, &session) {
