@@ -6,9 +6,9 @@ The Windows 11 x64 app opens in its own WebView2 window and manages its local Si
 
 ## 安装 · Install
 
-在 **Windows PowerShell** 中运行。构建需要 x64 的 Python 3.12、Node.js 22.12 或更新版本、.NET 8 SDK，以及 Microsoft Edge WebView2 Runtime。安装脚本会检查依赖，并在缺少时给出安装命令。建议先确认 `nvidia-smi` 能看到显卡及驱动。CUDA/OptiX 所需的驱动版本以 [Mitsuba 要求](https://github.com/mitsuba-renderer/mitsuba3#requirements)为准。
+在 **Windows PowerShell** 中运行。构建需要 x64 的 Python 3.12、Node.js 22.12 或更新版本、Rust 的 MSVC 工具链、Visual Studio C++ Build Tools（勾选「使用 C++ 的桌面开发」）和 Microsoft Edge WebView2 Runtime。用 `nvidia-smi` 检查显卡及驱动。 [Tauri 构建环境](https://v2.tauri.app/start/prerequisites/) · [Mitsuba 驱动要求](https://github.com/mitsuba-renderer/mitsuba3#requirements)
 
-Use **Windows PowerShell** with x64 Python 3.12, Node.js 22.12 or newer, the .NET 8 SDK, and the Microsoft Edge WebView2 Runtime. The installer prints commands for missing prerequisites. Check `nvidia-smi` for the GPU and driver. See [Mitsuba's requirements](https://github.com/mitsuba-renderer/mitsuba3#requirements) for the CUDA/OptiX driver requirement.
+Use **Windows PowerShell** with x64 Python 3.12, Node.js 22.12 or newer, the Rust MSVC toolchain, Visual Studio Build Tools with the Desktop development with C++ workload, and the Microsoft Edge WebView2 Runtime. Check `nvidia-smi` for the GPU and driver. [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) · [Mitsuba driver requirements](https://github.com/mitsuba-renderer/mitsuba3#requirements)
 
 ```powershell
 git clone https://github.com/Motifi/Sionna-RT-Studio.git
@@ -54,10 +54,10 @@ For startup or solve failures, give Codex `report.json`, `studio.log`, and the o
 
 ## 便携候选包 · Portable candidates
 
-候选 ZIP 解压后直接运行 `SionnaRTStudio.exe`。它自带 Python 和 .NET，不需要克隆仓库或安装开发工具。仍需 WebView2，以及支持 CUDA/OptiX 的 NVIDIA 驱动或用于 CPU 求解的 x64 LLVM。完整解压后可以移动整个文件夹。用同一候选提交的验收脚本传入 `-InstallDirectory` 指向解压目录，报告会记录包内 `build-info.json` 和实际使用的求解后端。
+候选 ZIP 解压后直接运行 `SionnaRTStudio.exe`。包内含 Tauri 应用和 Python 环境。系统需提供 WebView2，以及支持 CUDA/OptiX 的 NVIDIA 驱动或用于 CPU 求解的 x64 LLVM。完整解压后可以移动整个文件夹。用同一候选提交的验收脚本传入 `-InstallDirectory` 指向解压目录，报告会记录包内 `build-info.json` 和实际使用的求解后端。
 
 Extract the candidate ZIP and open `SionnaRTStudio.exe`. The package includes
-Python and .NET. It requires WebView2 and either an NVIDIA CUDA/OptiX driver
+the Tauri app and Python. It requires WebView2 and either an NVIDIA CUDA/OptiX driver
 or x64 LLVM. Move the whole extracted folder together. Run the verifier from
 the matching checkout with `-InstallDirectory` pointing to the extracted
 directory. The report captures `build-info.json` and the actual solver backend.

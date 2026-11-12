@@ -9,6 +9,7 @@ import platform
 import re
 import runpy
 import subprocess
+import tomllib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -59,8 +60,14 @@ def main():
     package = json.loads((ROOT / "package.json").read_bytes())
     lock_bytes = (ROOT / "package-lock.json").read_bytes()
     lock = json.loads(lock_bytes)
-    if any(value != version for value in (package["version"], lock["version"], lock["packages"][""]["version"])):
-        raise ValueError("Studio app, frontend, and lockfile versions disagree.")
+    shell = ROOT / "desktop" / "src-tauri"
+    with (shell / "Cargo.toml").open("rb") as manifest:
+        rust_version = tomllib.load(manifest)["package"]["version"]
+    config = json.loads((shell / "tauri.conf.json").read_bytes())
+    versions = (package["version"], lock["version"], lock["packages"][""]["version"],
+                rust_version, config.get("version", rust_version))
+    if any(value != version for value in versions):
+        raise ValueError("Studio backend, frontend, and desktop shell versions disagree.")
     info = {
         "schemaVersion": 1, "appVersion": version, "kind": args.kind, **source_revision(),
         "prebuiltFrontend": args.prebuilt_frontend, "frontendLockSha256": sha256(lock_bytes).hexdigest(),

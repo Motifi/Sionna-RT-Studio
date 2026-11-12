@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack
 from datetime import datetime, timezone
-from hashlib import sha256
+from hashlib import file_digest, sha256
 import io
 import json
 import os
@@ -24,7 +24,7 @@ import zipfile
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from verify_scene_workbench import runtime_packages, source_revision, verify, write_json
 
 
@@ -178,7 +178,7 @@ def wait_ready(child, folder, token):
             if ready.exists():
                 result = json.loads(ready.read_text(encoding="utf-8-sig"))
                 require(result.get("uiReady") is True and result.get("webgl2") is True,
-                        "Windows desktop did not render the Studio UI and WebGL2 canvas")
+                        "Desktop window did not render the Studio UI and WebGL2 canvas")
                 return result
         if child.poll() is not None:
             raise RuntimeError(f"Studio exited before readiness (exit code {child.returncode}). Check studio.log.")
@@ -209,6 +209,46 @@ def stop(child, folder, origin):
             pass
 
 
+def verify_desktop_downloads(folder, ready):
+    exports = ready.get("exports", [])
+    require(len(exports) == 2, "Expected the desktop project and CSI exports")
+    downloads = folder / "downloads"
+    error_report = folder / "desktop-error.json"
+    verified = set()
+    for entry in exports:
+        filename = entry["filename"]
+        suffix = Path(filename).suffix
+        require(suffix in {".json", ".zip"} and suffix not in verified, "Unexpected desktop export type")
+        deadline = time.monotonic() + 15
+        artifact = None
+        while artifact is None and time.monotonic() < deadline:
+            if error_report.is_file():
+                raise RuntimeError(json.loads(error_report.read_text(encoding="utf-8-sig"))["error"])
+            # WebViews may add a numeric suffix if the suggested name exists in Downloads.
+            for candidate in downloads.glob(f"*{suffix}"):
+                if candidate.is_file() and candidate.stat().st_size == entry["bytes"]:
+                    with candidate.open("rb") as stream:
+                        if file_digest(stream, "sha256").hexdigest() == entry["sha256"]:
+                            artifact = candidate
+                            break
+            if artifact is not None:
+                break
+            time.sleep(0.1)
+        require(artifact is not None, f"Desktop download is missing or differs from its renderer export: {filename}")
+        data = artifact.read_bytes()
+        if suffix == ".json":
+            project = json.loads(data)
+            require(project["format"] == "SionnaRTStudio Project" and project["projectId"] == ready["projectId"],
+                    "Desktop download contains the wrong project")
+        else:
+            manifest, _ = read_archive(data)
+            require(manifest["runId"] == ready["runId"] and manifest["projectId"] == ready["projectId"],
+                    "Desktop download contains the wrong CSI run")
+        verified.add(suffix)
+    require(verified == {".json", ".zip"}, "Desktop downloads must include a project and CSI archive")
+    return exports
+
+
 def nvidia_diagnostics():
     tool = shutil.which("nvidia-smi")
     if tool is None:
@@ -226,17 +266,22 @@ def nvidia_diagnostics():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     launcher = parser.add_mutually_exclusive_group(required=True)
-    launcher.add_argument("--app", type=Path, help="Installed Windows desktop executable")
+    launcher.add_argument("--app", type=Path, help="Packaged Studio desktop executable")
     launcher.add_argument("--headless", action="store_true", help="Start installed Python server for CI")
-    parser.add_argument("--runtime", type=Path, required=True, help="Installed runtime containing backend and desktop")
+    parser.add_argument("--runtime", type=Path, required=True, help="Installed runtime or macOS Contents/Resources")
     parser.add_argument("--report-directory", type=Path, required=True, help="Parent folder for the report and ZIPs")
-    parser.add_argument("--allow-cpu", action="store_true", help="Permit compatibility verification without CUDA")
+    parser.add_argument("--allow-cpu", action="store_true", help="Permit compatibility verification without a GPU")
+    parser.add_argument("--expected-variant", help="Require this Mitsuba variant")
     args = parser.parse_args()
+    expected_variant = args.expected_variant
+    if expected_variant is None and not args.allow_cpu:
+        expected_variant = "metal_ad_mono_polarized" if sys.platform == "darwin" else "cuda_ad_mono_polarized"
     started = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     folder = args.report_directory.resolve() / f"{started}-{uuid4().hex[:8]}"
     folder.mkdir(parents=True)
     print(f"Studio verification files: {folder}", flush=True)
-    report = {"ok": False, "cudaPassed": False, "requireCuda": not args.allow_cpu,
+    report = {"ok": False, "cudaPassed": False, "requireCuda": expected_variant == "cuda_ad_mono_polarized",
+              "expectedVariant": expected_variant,
               "mode": "headless" if args.headless else "desktop", "results": {},
               "startedAtUtc": datetime.now(timezone.utc).isoformat(), "verificationPython": runtime_packages()}
     child, origin = None, None
@@ -255,14 +300,19 @@ def main():
                 token = secrets.token_hex(32)
                 env.update(SRTS_DESKTOP_LAUNCH_TOKEN=token, SRTS_DESKTOP_PORT_FILE=str(directory / "server-port.txt"))
                 log = stack.enter_context((directory / "studio.log").open("wb"))
+                desktop_module = "studio_server" if (args.runtime / "studio_server.py").is_file() else "desktop.studio_server"
                 trace_startup = (
                     "import faulthandler, runpy; faulthandler.dump_traceback_later(45); "
-                    "runpy.run_module('desktop.studio_server', run_name='__main__', alter_sys=True)"
+                    f"runpy.run_module({desktop_module!r}, run_name='__main__', alter_sys=True)"
                 )
                 child = subprocess.Popen([sys.executable, "-B", "-u", "-X", "faulthandler", "-c", trace_startup, "0"],
                                          cwd=args.runtime.resolve(), env=env, stdin=subprocess.PIPE,
                                          stdout=log, stderr=subprocess.STDOUT)
             else:
+                if sys.platform == "darwin":
+                    profile_home = directory / "profile-home"
+                    profile_home.mkdir()
+                    env["CFFIXED_USER_HOME"] = str(profile_home)
                 child = subprocess.Popen([str(args.app.resolve()), "--acceptance", str(directory)], env=env)
             ready = wait_ready(child, directory, token)
             origin = ready["origin"].rstrip("/")
@@ -279,7 +329,9 @@ def main():
 
         try:
             report["nvidiaSmi"] = nvidia_diagnostics()
-            metadata = args.runtime.resolve().parent / "build-info.json"
+            metadata = args.runtime.resolve() / "build-info.json"
+            if not metadata.is_file():
+                metadata = args.runtime.resolve().parent / "build-info.json"
             build = json.loads(metadata.read_text(encoding="utf-8")) if metadata.is_file() else None
             report["build"] = build if build is not None else source_revision()
             ready = launch(folder)
@@ -290,14 +342,22 @@ def main():
             if not args.headless:
                 report["workspaceNavigation"] = ready.get("workspaceNavigation")
                 report["projectAutosave"] = ready.get("projectAutosave")
+                report["projectResetConfirmation"] = ready.get("projectResetConfirmation")
                 require(report["workspaceNavigation"] is True and report["projectAutosave"] is True,
-                        "Studio did not finish workspace navigation and autosave in WebView2")
+                        "Studio did not finish workspace navigation and autosave in the desktop window")
+                require(report["projectResetConfirmation"] is True, "Desktop project reset could not be canceled")
+                report["desktopDownloads"] = verify_desktop_downloads(folder, ready)
             report["backendPid"] = ready["backendPid"]
             require(health.get("ok") is True and health.get("engine") == "Sionna RT", "Studio solver is unhealthy")
             if build:
                 require(health.get("appVersion") == build["appVersion"], "Installed app version differs from build-info.json")
             require(b'id="root"' in request(origin, "/"), "The packaged Studio interface is missing")
             is_cuda = health.get("gpu") is True and health.get("variant") == "cuda_ad_mono_polarized"
+            if expected_variant is not None:
+                require(health.get("variant") == expected_variant,
+                        f"Expected {expected_variant}. Studio used {health['variant']}.")
+                if expected_variant.startswith(("metal_", "cuda_")):
+                    require(health.get("gpu") is True, f"Studio did not report a GPU for {expected_variant}.")
             print(f"Tracing with {health['variant']}", flush=True)
 
             static = fixture()
@@ -319,8 +379,6 @@ def main():
             report["results"]["sceneWorkbench"] = "scene-workbench/verification.json"
             require(workbench["ok"], f"Scene workbench failed: {workbench.get('failure')}")
             report["cudaPassed"] = is_cuda
-            require(is_cuda or args.allow_cpu,
-                    f"CUDA acceptance requires an NVIDIA-backed solve. Studio used {health['variant']}.")
         except Exception as exc:
             report["error"] = str(exc)
             report["failureStage"] = "verification" if "health" in report else "startup"

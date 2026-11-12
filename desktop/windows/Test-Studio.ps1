@@ -18,7 +18,7 @@ if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     throw "Studio Python was not found at $python. Run Install-Studio.ps1 first."
 }
 
-$verify = Join-Path $PSScriptRoot 'verify_studio.py'
+$verify = Join-Path $PSScriptRoot '..\verify_studio.py'
 $verifyArgs = @('-B', $verify, '--runtime', $runtime, '--report-directory', $ReportDirectory)
 if ($Headless) {
     $verifyArgs += '--headless'

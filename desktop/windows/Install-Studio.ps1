@@ -64,15 +64,15 @@ function Test-WebView2Runtime {
 $python = Find-Python312
 $node = Get-Command node.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 $npm = Get-Command npm.cmd -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-$dotnet = Get-Command dotnet.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+$cargo = Get-Command cargo.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 $nodeVersion = if ($node) { & $node.Source -p "process.arch === 'x64' ? process.versions.node : '0.0.0'" } else { '0.0.0' }
 $missing = @()
 if (-not $python) { $missing += 'winget install --exact --id Python.Python.3.12 --architecture x64' }
 if (-not $npm -or [Version]$nodeVersion -lt [Version]'22.12.0') {
     $missing += 'winget install --exact --id OpenJS.NodeJS.22 --architecture x64'
 }
-if (-not $dotnet -or -not ((& $dotnet.Source --list-sdks) -match '^8\.0\.\d+\s')) {
-    $missing += 'winget install --exact --id Microsoft.DotNet.SDK.8 --architecture x64'
+if (-not $cargo) {
+    $missing += 'Install Rust via https://rustup.rs/ with the x86_64-pc-windows-msvc toolchain.'
 }
 if (-not $SkipWebView2Check -and -not (Test-WebView2Runtime)) {
     $missing += 'winget install --exact --id Microsoft.EdgeWebView2Runtime --architecture x64'
@@ -96,6 +96,9 @@ $folderName = Split-Path -Leaf $InstallDirectory
 $markerName = '.sionna-rt-studio-win-x64'
 $exeName = 'SionnaRTStudio.exe'
 $exe = Join-Path $InstallDirectory $exeName
+$tauriManifest = Join-Path $source 'desktop\src-tauri\Cargo.toml'
+$rustTarget = 'x86_64-pc-windows-msvc'
+$rustOutput = Join-Path $source 'build\tauri'
 
 function Assert-ReplaceableInstall {
     if (Test-Path -LiteralPath $InstallDirectory) {
@@ -142,14 +145,18 @@ try {
         Invoke-CheckedCommand $npm.Source @('ci', '--no-audit', '--no-fund')
         $vite = Join-Path $source 'node_modules\vite\bin\vite.js'
         Invoke-CheckedCommand $node.Source @($vite, 'build', '--outDir', $site, '--emptyOutDir')
+        try {
+            Invoke-CheckedCommand $cargo.Source @('build', '--release', '--locked', '--target', $rustTarget,
+                '--manifest-path', $tauriManifest, '--target-dir', $rustOutput)
+        } catch {
+            throw ('The Tauri shell could not be built. Install the MSVC x64 Rust target ' +
+                "(rustup target add $rustTarget) and the Desktop development with C++ workload " +
+                'including a Windows SDK in Visual Studio Build Tools. ' + $_.Exception.Message)
+        }
     } finally {
         Pop-Location
     }
-    $project = Join-Path $PSScriptRoot 'app\SionnaRTStudio.csproj'
-    $versionFile = Join-Path $source 'backend\version.py'
-    $releaseVersion = & $python '-I' '-c' 'import runpy, sys; print(runpy.run_path(sys.argv[1])[sys.argv[2]])' $versionFile APP_VERSION
-    if ($LASTEXITCODE -ne 0 -or $releaseVersion -notmatch '^\d+\.\d+\.\d+$') { throw 'Could not read the Studio version.' }
-    Invoke-CheckedCommand $dotnet.Source @('publish', $project, '-c', 'Release', '-r', 'win-x64', '--self-contained', 'true', "-p:Version=$releaseVersion", '-o', $payload)
+    Copy-Item -LiteralPath (Join-Path $rustOutput "$rustTarget\release\$exeName") -Destination $payload
     if (-not (Test-Path -LiteralPath (Join-Path $payload $exeName) -PathType Leaf) -or
         -not (Test-Path -LiteralPath (Join-Path $site 'index.html') -PathType Leaf)) {
         throw 'Build output is missing the Studio executable or interface.'

@@ -1,7 +1,7 @@
 # Desktop release candidates
 
-Build both candidates from the same clean checkout. The backend version in
-`backend/version.py` must match `package.json` and `package-lock.json`. Set the
+Build both Tauri desktop candidates from the same clean checkout. The backend version in
+`backend/version.py` must match the frontend package and lockfile, plus the Tauri crate and configuration. Set the
 release version after the P0–P2 work is complete. Each package contains
 `build-info.json` with its app version, Git commit, source status, frontend
 lockfile hash and solver dependency versions. Archive the package SHA-256 with
@@ -38,7 +38,7 @@ requires LLVM and can use `DRJIT_LIBLLVM_PATH` to point to `libLLVM.dylib`.
 ### Windows x64
 
 Use the Windows workflow's portable ZIP from a pull request or manual
-workflow run. The workflow builds a self-contained .NET app and copies the
+workflow run. The workflow builds the Tauri executable and copies the
 base CPython 3.12 interpreter and installed wheels into the payload. It
 extracts the ZIP into a different path with spaces and runs the installed
 headless LLVM verifier. For a local build, use the developer installer, then
@@ -77,8 +77,9 @@ resources="$app/Contents/Resources"
 env -u SRTS_PYTHON SRTS_MITSUBA_VARIANT=metal_ad_mono_polarized \
   "$resources/python/bin/python3.12" -B scripts/verify_scene_workbench.py \
   http://127.0.0.1:8011 "$out/metal" --mac-runtime "$resources"
-env -u SRTS_PYTHON SRTS_MITSUBA_VARIANT=metal_ad_mono_polarized SRTS_DESKTOP_TEST_PORT=43111 \
-  "$app/Contents/MacOS/SionnaRTStudio" --smoke-report "$out/macos.json"
+env -u SRTS_PYTHON SRTS_MITSUBA_VARIANT=metal_ad_mono_polarized \
+  "$resources/python/bin/python3.12" -B desktop/verify_studio.py \
+  --app "$app/Contents/MacOS/SionnaRTStudio" --runtime "$resources" --report-directory "$out/macos"
 ```
 
 On Windows, use the matching checkout and point the verifier to the extracted
@@ -90,10 +91,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\desktop\windows\Test-S
   -InstallDirectory $extracted -ReportDirectory $report
 ```
 
-Check the macOS report for `ok`, `webgl2`, `projectExport`, `csiExport`,
-`historyExport` and the Metal variant. Check the Windows report for `ok`,
-`cudaPassed`, `backendStopped`, `workspaceNavigation`, `projectAutosave`
-and `webgl2`. Both platforms also need a manual pass with the normal GUI.
+Check each desktop report for `ok`, `webgl2`, `backendStopped`,
+`workspaceNavigation`, `projectAutosave` and the project JSON and CSI ZIP in
+`desktopDownloads`. Confirm the Metal variant on macOS and `cudaPassed` on
+Windows. Both platforms also need a manual pass with the normal GUI.
 Save a project and CSI ZIP through the native dialogs, quit, reopen the project,
 and find and re-export the same history entry. Extract a CSI ZIP on an offline
 machine with the listed solver dependencies, run `python replay_csi.py`, and
