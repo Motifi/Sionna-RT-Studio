@@ -1,5 +1,9 @@
 # Sionna RT Studio desktop app
 
+macOS 和 Windows 共用 Tauri 桌面壳，使用相同的 Studio 界面和本地 Python 求解服务。
+
+The macOS and Windows apps share a Tauri desktop shell, the Studio interface and the local Python solver.
+
 Windows 11 x64 用户请参阅 [Windows 安装与验收](windows/README.md)。
 
 For Windows 11 x64, see [Windows installation and acceptance](windows/README.md).
@@ -14,11 +18,17 @@ For Windows 11 x64, see [Windows installation and acceptance](windows/README.md)
 
 ## Rebuild
 
-Run `./setup.sh` and then `./desktop/build.sh` from the Studio checkout. The build requires the macOS Command Line Tools. By default it uses the repository's `.venv` and `.node`, or the Node.js binary on `PATH`. Use `SRTS_PYTHON` and `SRTS_NODE` to select existing installations. The app uses a stable loopback address on port `43110` for project and language storage.
+Run `./setup.sh` and then `./desktop/build.sh` from the Studio checkout. The build requires the macOS Command Line Tools and Rust/Cargo. By default it uses the repository's `.venv` and `.node`, or the Node.js binary on `PATH`. Use `SRTS_PYTHON`, `SRTS_NODE` and `SRTS_CARGO` to select existing installations. The app uses a stable loopback address on port `43110` for project and language storage. [Build prerequisites](https://v2.tauri.app/start/prerequisites/)
 
 Quit the old app before opening the new build. Use the bottom bar to visit Scene, Deployment, Simulation, and Export. Solve all static links or one UE trajectory in Simulation, then save that run's CSI ZIP with the macOS save dialog in Export. Use the Project menu to save editable settings and control points.
 
-For a development smoke check, launch the bundle executable with `--smoke-report /path/to/report.json`. Set `SRTS_DESKTOP_TEST_PORT` to use a separate loopback port and inspect the resulting JSON report.
+For a desktop check, run the verifier with the Python used for the build. It starts a separate window and server, verifies autosave, CSI exports and solver shutdown, and saves a report.
+
+```sh
+app="$PWD/build/SionnaRTStudio.app"
+.venv/bin/python -B desktop/verify_studio.py --app "$app/Contents/MacOS/SionnaRTStudio" \
+  --runtime "$app/Contents/Resources" --report-directory "$PWD/build/desktop-acceptance"
+```
 
 ## Portable candidates
 

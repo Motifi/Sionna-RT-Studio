@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Sionna RT Studio",
+  "version": "0.1.2",
+  "identifier": "org.radioworld.sionna-studio",
+  "build": {"frontendDist": "bootstrap"},
+  "app": {"windows": []},
+  "bundle": {
+    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "macOS": {"minimumSystemVersion": "14.0"}
+  }
+}

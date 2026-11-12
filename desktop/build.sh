@@ -8,13 +8,21 @@ node="${SRTS_NODE:-$studio/.node/bin/node}"
 if [[ ! -x "$node" && -z "${SRTS_NODE:-}" ]]; then
   node="$(command -v node || true)"
 fi
+cargo="$(command -v "${SRTS_CARGO:-cargo}" || true)"
+cargo_target_dir="${CARGO_TARGET_DIR:-$studio/build/desktop-cargo}"
 [[ "$python" = /* ]] || python="$PWD/$python"
 [[ -z "$node" || "$node" = /* ]] || node="$PWD/$node"
+[[ -z "$cargo" || "$cargo" = /* ]] || cargo="$PWD/$cargo"
+[[ "$cargo_target_dir" = /* ]] || cargo_target_dir="$PWD/$cargo_target_dir"
 destination="${1:-$studio/build/SionnaRTStudio.app}"
 bundle_id="org.radioworld.sionna-studio"
 
 if [[ ! -x "$python" ]]; then
   echo "Missing Studio Python environment at $python" >&2
+  exit 1
+fi
+if [[ ! -x "$cargo" ]]; then
+  echo 'Rust and Cargo are required to build the Studio desktop app. Install Rust with rustup or set SRTS_CARGO.' >&2
   exit 1
 fi
 mkdir -p "$(dirname "$destination")"
@@ -74,6 +82,7 @@ PY
 else
   metadata_python="$python"
   package_kind="macos-arm64-development"
+  printf '%s\n' "$python" > "$resources/python-path.txt"
 fi
 build_info_args=("$resources/build-info.json" "$package_kind")
 if [[ -n "${SRTS_DESKTOP_ASSETS:-}" ]]; then
@@ -125,14 +134,20 @@ with open(sys.argv[1], "wb") as info:
     }, info)
 PY
 /usr/bin/plutil -lint "$contents/Info.plist"
-cache="${SRTS_SWIFT_CACHE:-$studio/build/studio-swift-cache}"
-mkdir -p "$cache"
-xcrun swiftc -swift-version 5 -target arm64-apple-macos14.0 -parse-as-library -O \
-  -module-cache-path "$cache" "$desktop/Studio.swift" \
-  -o "$contents/MacOS/SionnaRTStudio"
+target="aarch64-apple-darwin"
+if ! (cd "$studio" && MACOSX_DEPLOYMENT_TARGET=14.0 "$cargo" build --release --locked \
+  --manifest-path "$desktop/src-tauri/Cargo.toml" --target "$target" --target-dir "$cargo_target_dir"); then
+  echo 'The Studio desktop build failed. Check the Cargo output and the macOS Command Line Tools.' >&2
+  exit 1
+fi
+/usr/bin/install -m 755 "$cargo_target_dir/$target/release/SionnaRTStudio" "$contents/MacOS/SionnaRTStudio"
 /usr/bin/codesign --force --sign - "$bundle"
 /usr/bin/codesign --verify --strict "$bundle"
 
+if [[ -L "$destination" ]]; then
+  echo "Refusing to replace a symbolic link at $destination" >&2
+  exit 1
+fi
 if [[ -e "$destination" ]]; then
   current_id="$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$destination/Contents/Info.plist" 2>/dev/null || true)"
   if [[ "$current_id" != "$bundle_id" ]]; then

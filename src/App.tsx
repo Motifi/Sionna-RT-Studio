@@ -15,6 +15,7 @@ import { SceneInspector, SceneObjectList, SceneToolbar } from './components/Scen
 import { physicalSceneInputs, useSceneEditor, withFootprint } from './sceneEditor';
 import { ThreeStudio } from './components/ThreeStudio';
 import { TopNav } from './components/TopNav';
+import { ProjectConfirmation } from './components/ProjectConfirmation';
 import { WorkflowNav } from './components/WorkflowNav';
 import { MapSelector } from './components/MapSelector';
 import { CsiGridControls, DeviceRfControls, SolverControls } from './components/SolverControls';
@@ -808,6 +809,7 @@ function StudioApp({ initialProject, initialProjectId, startTemporary, unreadabl
   const saveImmediately = useRef(false);
   const resettingRef = useRef(false);
   const replacingAutosave = useRef(false);
+  const [projectPrompt, setProjectPrompt] = useState<'replace' | 'reset' | 'reset-failed' | null>(null);
   const [recoveryError, setRecoveryError] = useState<LocalizedText | null>(null);
 
   const projectState = React.useMemo<StudioProjectState>(() => ({
@@ -919,12 +921,9 @@ function StudioApp({ initialProject, initialProjectId, startTemporary, unreadabl
     setSaveAttempt(attempt => attempt + 1);
   };
 
-  const handleReplaceUnreadableAutosave = async () => {
-    if (!temporary || !unreadableAutosave || replacingAutosave.current) return;
-    if (!window.confirm(t(
-      'Replace the unreadable autosave with this project and resume autosaving?',
-      '用当前项目替换无法读取的自动存档，并恢复自动保存？',
-    ))) return;
+  const confirmReplaceUnreadableAutosave = async () => {
+    if (!temporary || !unreadableAutosave || replacingAutosave.current || resettingRef.current) return;
+    setProjectPrompt(null);
     replacingAutosave.current = true;
     setRecoveryError(null);
     window.addEventListener('beforeunload', warnUnsavedProject);
@@ -963,20 +962,9 @@ function StudioApp({ initialProject, initialProjectId, startTemporary, unreadabl
     }
   };
 
-  const handleResetProject = async () => {
+  const confirmResetProject = async () => {
     if (resettingRef.current || replacingAutosave.current) return;
-    const confirmed = window.confirm(temporary ? t(
-      'Discard this temporary project and reopen Studio?',
-      '放弃当前临时项目并重新打开实验台？',
-    ) : t(
-      'Reset the studio to its defaults?\n\n'
-      + 'This discards the autosaved project: scene geometry, every transmitter '
-      + 'and receiver, solver and material settings, trajectory, and coverage '
-      + 'controls. Exported files are not affected.\n\n'
-      + 'Export the project first if you want to keep it.',
-      '恢复实验台默认设置？\n\n这会清除自动保存的场景、收发设备、求解和材质设置、轨迹及覆盖参数。已导出的文件仍可使用。\n\n如需保留当前项目，请先导出。',
-    ));
-    if (!confirmed) return;
+    setProjectPrompt(null);
     if (temporary) {
       window.removeEventListener('beforeunload', warnUnsavedProject);
       window.location.reload();
@@ -991,7 +979,7 @@ function StudioApp({ initialProject, initialProjectId, startTemporary, unreadabl
       console.warn('Could not clear the autosaved SionnaRTStudio project.', error);
       resettingRef.current = false;
       retryAutosave();
-      window.alert(t('Could not reset the local project.', '无法重置本地项目。'));
+      setProjectPrompt('reset-failed');
     }
   };
 
@@ -1568,9 +1556,29 @@ function StudioApp({ initialProject, initialProjectId, startTemporary, unreadabl
   return (
     <div id="sionna-rt-studio-app-frame" className="studio-frame text-[var(--text-hi)]">
       <TopNav health={health} autosaveStatus={autosaveStatus} onRetryAutosave={retryAutosave}
-        projectState={projectState} projectId={projectId} onImportProject={handleImportProject} onResetProject={handleResetProject}
-        onReplaceUnreadableAutosave={unreadableAutosave ? handleReplaceUnreadableAutosave : undefined}
+        projectState={projectState} projectId={projectId} onImportProject={handleImportProject} onResetProject={() => {
+          if (!resettingRef.current && !replacingAutosave.current) setProjectPrompt('reset');
+        }}
+        onReplaceUnreadableAutosave={unreadableAutosave ? () => {
+          if (temporary && !replacingAutosave.current && !resettingRef.current) setProjectPrompt('replace');
+        } : undefined}
         recoveryError={recoveryError ? t(...recoveryError) : undefined} />
+      {projectPrompt === 'replace' && <ProjectConfirmation
+        title={t('Replace the unreadable autosave with this project and resume autosaving?', '用当前项目替换无法读取的自动存档，并恢复自动保存？')}
+        cancelLabel={t('Cancel', '取消')} onCancel={() => setProjectPrompt(null)}
+        confirm={{ label: t('Replace autosave', '替换自动存档'), onClick: confirmReplaceUnreadableAutosave }} />}
+      {projectPrompt === 'reset' && <ProjectConfirmation
+        title={temporary ? t('Discard this temporary project and reopen Studio?', '放弃当前临时项目并重新打开实验台？')
+          : t('Reset the studio to its defaults?', '恢复实验台默认设置？')}
+        message={temporary ? undefined : t(
+          'This discards the autosaved scene geometry, transmitters and receivers, solver and material settings, trajectory, and coverage controls. Exported files remain available.\n\nExport the project first if you want to keep it.',
+          '这会清除自动保存的场景、收发设备、求解和材质设置、轨迹及覆盖参数。已导出的文件仍可使用。\n\n如需保留当前项目，请先导出。',
+        )}
+        cancelLabel={t('Cancel', '取消')} onCancel={() => setProjectPrompt(null)}
+        confirm={{ label: temporary ? t('Discard project', '放弃项目') : t('Reset Studio', '重置实验台'), onClick: confirmResetProject }} />}
+      {projectPrompt === 'reset-failed' && <ProjectConfirmation
+        title={t('Could not reset the local project.', '无法重置本地项目。')}
+        cancelLabel={t('OK', '确定')} onCancel={() => setProjectPrompt(null)} />}
       <main className="studio-main" data-workspace={workspace} data-dock={activeDock}>
         {editingScene && <>
           <div className="studio-toolbar">

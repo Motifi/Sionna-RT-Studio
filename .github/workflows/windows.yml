@@ -25,9 +25,12 @@ jobs:
         with:
           python-version: '3.12'
           architecture: x64
-      - uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: '8.0.x'
+      - name: Prepare the MSVC x64 Rust toolchain
+        run: |
+          $toolchain = 'stable-x86_64-pc-windows-msvc'
+          rustup toolchain install $toolchain --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "RUSTUP_TOOLCHAIN=$toolchain" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Locate LLVM for the CPU smoke test
         run: |
           $llvm = Join-Path $env:ProgramFiles 'LLVM\bin\LLVM-C.dll'
@@ -37,6 +40,8 @@ jobs:
         run: |
           $app = Join-Path $env:RUNNER_TEMP 'Studio Windows Test\app'
           & .\desktop\windows\Install-Studio.ps1 -InstallDirectory $app -PythonPath (Get-Command python.exe).Source -NoShortcut -SkipWebView2Check
+      - name: Test the Tauri shell
+        run: cargo test --release --locked --target x86_64-pc-windows-msvc --manifest-path desktop/src-tauri/Cargo.toml --target-dir build/tauri
       - name: Check the frontend
         run: |
           npm.cmd run lint -- --noUnusedLocals
